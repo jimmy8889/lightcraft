@@ -18,8 +18,9 @@ Use an actual newer release tag when one is available, or `main` to test the
 creator's current branch. The first command fetches and lists incoming commits.
 The second creates a new `updates/*` branch and a sibling candidate worktree,
 merges the requested commit, checks the custom feature inventory and Python
-update regressions, then runs the complete `cargo xtask ci` gate. A merge commit
-is made only after both gates pass. The source custom checkout remains unchanged.
+update regressions, then runs the complete `cargo xtask ci` gate. With CUSTOM-008 present, optional PMRID compilation and calibration/async-host regressions
+also run; a default build alone cannot approve that feature. A merge commit
+is made only after every gate passes. The source custom checkout remains unchanged.
 
 No command pushes, force-updates a branch, deletes a worktree, publishes a
 release, or silently resolves a conflict. An existing candidate directory is

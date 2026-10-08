@@ -72,7 +72,7 @@ fn normalized(raw: &RawImage, x: usize, y: usize, s: usize, range: f32) -> f32 {
 }
 
 /// Reject non-finite data and invalid level models before allocating or touching samples.
-fn validate(raw: &RawImage) -> Result<()> {
+pub(crate) fn validate(raw: &RawImage) -> Result<()> {
     raw.validate()?;
     let count = raw.width.checked_mul(raw.height).and_then(|n| n.checked_mul(raw.cpp)).ok_or(RawError::Limit("RAW denoise dimensions"))?;
     if count > MAX_DENOISE_SAMPLES {

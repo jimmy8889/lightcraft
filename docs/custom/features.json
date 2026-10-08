@@ -168,13 +168,6 @@
       ]
     },
     {
-      "id": "CUSTOM-008",
-      "name": "Optional calibrated PMRID RAW inference with a verified licensed checkpoint",
-      "status": "in-progress",
-      "files": [],
-      "checks": []
-    },
-    {
       "id": "CUSTOM-009",
       "name": "Measured camera colour, lens sharpness and external-editor fidelity",
       "status": "planned",
@@ -192,6 +185,32 @@
         {
           "file": "crates/catalog/src/safe_file.rs",
           "contains": "unsupported_publication_retains_complete_temp_without_creating_destination"
+        }
+      ]
+    },
+    {
+      "id": "CUSTOM-008",
+      "name": "Explicit calibrated PMRID CPU research export",
+      "status": "implemented",
+      "files": [
+        "crates/raw/src/pmrid.rs",
+        "crates/raw/tests/pmrid.rs",
+        "crates/engine/src/cmd/raw_processing.rs",
+        "crates/ui-egui/src/processed_raw.rs",
+        "docs/experimental-pmrid.md"
+      ],
+      "checks": [
+        {
+          "file": "crates/engine/src/cmd/raw_processing.rs",
+          "contains": "processor_from_params"
+        },
+        {
+          "file": "crates/raw/tests/pmrid.rs",
+          "contains": "explicit_noise_profile_matches_camera_and_iso_domain_without_extrapolation"
+        },
+        {
+          "file": "crates/ui-egui/src/processed_raw.rs",
+          "contains": "prepare_processed_dng_with_processor"
         }
       ]
     }

@@ -38,3 +38,11 @@ jobs:
         run: python scripts/check-custom-features.py
       - name: Full upstream and custom Rust checks
         run: cargo xtask ci
+      - name: Compile optional calibrated CPU research backend
+        run: cargo clippy --workspace --all-targets --features lightcraft/pmrid,lightcraft-cli/pmrid -- -D warnings
+      - name: Optional model bounds and calibration checks
+        run: cargo test -p lightcraft-raw --features pmrid --test pmrid
+      - name: Optional RAW command and async-host regressions
+        run: |
+          cargo test --workspace --features lightcraft/pmrid,lightcraft-cli/pmrid raw_processing
+          cargo test --workspace --features lightcraft/pmrid,lightcraft-cli/pmrid processed_raw::tests

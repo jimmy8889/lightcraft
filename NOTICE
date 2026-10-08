@@ -32,3 +32,12 @@ also embed the fonts listed in https://github.com/storytold/craft-fonts/blob/mai
 (the Japanese fonts BIZ UDPGothic, BIZ UDMincho and Shippori Mincho; the web build embeds only BIZ
 UDPGothic Regular), under the SIL Open Font License 1.1. Release packages include each font's
 licence as OFL-<family>.txt.
+
+crates/raw/src/pmrid.rs ports the experimental network architecture published by MegEngine/PMRID
+(https://github.com/MegEngine/PMRID, models/net_torch.py), commit
+8ebb9e8e96559881dee957f34243933c5beb77dd, under the Apache License 2.0. The LightCraft
+contributors modified it (2026): translated Python/PyTorch to pure Rust/Candle; added immutable
+SHA-verified loading, explicit camera calibration, bounded overlapping tiles and cancellation.
+That file is Apache License 2.0 only (LICENSE-APACHE), not under the MIT option. The official
+checkpoint is external, supplied explicitly by the user; no PMRID weights or datasets are
+bundled or automatically downloaded by LightCraft. External datasets retain their own terms.

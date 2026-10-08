@@ -41,6 +41,12 @@ def valid_ref(ref):
     ) and not ref.endswith(("/", ".", ".lock"))
 
 
+def run_check(command, candidate, env, log_path):
+    with log_path.open("w", encoding="utf-8") as log:
+        return subprocess.run(command, cwd=candidate, env=env, stdout=log,
+                              stderr=subprocess.STDOUT, check=False).returncode
+
+
 def prepare(args):
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").stdout.strip())
     branch = git(root, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
@@ -92,11 +98,14 @@ def prepare(args):
         return 2
     inventory = candidate / "docs" / "custom" / "features.json"
     inventory_changed = False
+    data = {}
     if inventory.is_file():
         try:
             data = json.loads(inventory.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("custom inventory must be an object")
+            if not isinstance(data.get("features", []), list):
+                raise ValueError("custom inventory features must be an array")
             previous = (data.get("upstream_base"), data.get("upstream_version"))
             recorded = previous[0]
             older_ref = (isinstance(recorded, str) and bool(re.fullmatch(r"[0-9a-f]{40}", recorded))
@@ -126,10 +135,18 @@ def prepare(args):
     env.setdefault("RUST_TEST_THREADS", "2")
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     checks = [[sys.executable, "scripts/check-custom-features.py"], ["cargo", "xtask", "ci"]]
+    if any(feature.get("id") == "CUSTOM-008" and feature.get("status") == "implemented"
+           for feature in data.get("features", []) if isinstance(feature, dict)):
+        optional = ["--workspace", "--features", "lightcraft/pmrid,lightcraft-cli/pmrid"]
+        checks.extend([
+            ["cargo", "clippy", "--all-targets", *optional, "--", "-D", "warnings"],
+            ["cargo", "test", *optional, "raw_processing"],
+            ["cargo", "test", *optional, "processed_raw::tests"],
+            ["cargo", "test", "-p", "lightcraft-raw", "--features", "pmrid", "--test", "pmrid"],
+        ])
+    report["checks"] = checks
     for number, command in enumerate(checks, 1):
-        with (report_dir / f"check-{number}.log").open("w", encoding="utf-8") as log:
-            result = subprocess.run(command, cwd=candidate, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
-        if result.returncode:
+        if run_check(command, candidate, env, report_dir / f"check-{number}.log"):
             save("checks-failed")
             return 3
     # Repository policy: the integration commit is created only after the complete CI gate.

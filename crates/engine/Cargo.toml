@@ -35,6 +35,8 @@ lightcraft-segment = { workspace = true, optional = true }
 [features]
 # AI masks with SAM 3 (Object / Describe). Off for the web and CLI builds.
 sam = ["dep:lightcraft-segment"]
+# Explicit calibrated experimental RAW derivative export; never enabled by default.
+pmrid = ["lightcraft-raw/pmrid"]
 
 [dev-dependencies]
 lightcraft-tiff = { workspace = true }

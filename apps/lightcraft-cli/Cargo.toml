@@ -29,3 +29,6 @@ dhat = { workspace = true, optional = true }
 # every allocation (live/peak bytes in `library.memory` / `ui.inspect`) and writes dhat-heap.json
 # (open it in DHAT's viewer: allocation sites by bytes at the peak). Slows allocation-heavy work.
 dhat-heap = ["dep:dhat"]
+
+# Research CPU inference; no bundled weights or automatic calibration.
+pmrid = ["lightcraft-engine/pmrid", "lightcraft-ui-egui/pmrid"]

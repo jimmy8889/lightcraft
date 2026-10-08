@@ -30,3 +30,6 @@ lightcraft-codecs = { workspace = true }
 [build-dependencies]
 serde_json = { workspace = true }
 toml = "1"
+
+[features]
+pmrid = ["lightcraft-engine/pmrid"]

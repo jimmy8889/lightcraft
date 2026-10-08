@@ -13,7 +13,7 @@ use lightcraft_raw::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, cmd, has_selection};
+use super::{CommandSpec, always, bad, cmd, has_selection};
 use crate::{Result, Session};
 
 const MAX_SOURCE_BYTES: usize = 1 << 30;
@@ -204,6 +204,19 @@ fn source_stamp(path: &str) -> Option<SourceStamp> {
 
 /// Detached, cancellation-aware preparation for UI/CLI background processing. No catalog
 /// mutation is required on completion, and original bytes are never written.
+#[derive(Clone, Debug)]
+pub enum Processor {
+    Native,
+    /// Requires the optional pmrid feature, pinned official checkpoint and explicit calibration.
+    ExperimentalPmrid {
+        checkpoint: PathBuf,
+        noise_profile: PathBuf,
+        strength: f32,
+        tile_core: usize,
+        halo: usize,
+    },
+}
+
 pub struct ProcessedDngJob {
     pub photo: PhotoId,
     pub source: String,
@@ -212,6 +225,7 @@ pub struct ProcessedDngJob {
     read: Option<crate::merge::ByteReader>,
     expected_source: Option<SourceStamp>,
     options: Options,
+    processor: Processor,
     packet: String,
     settings: lightcraft_develop::DevelopSettings,
 }
@@ -223,6 +237,9 @@ pub struct ProcessedDngResult {
     pub path: PathBuf,
     pub original: String,
     pub report: Report,
+    /// Actual model/calibration/tiling provenance for explicit experimental exports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_details: Option<Value>,
     /// Our fitted colour/tone is embedded separately; other editors use the DNG camera tags.
     pub has_lightcraft_colour: bool,
 }
@@ -230,6 +247,17 @@ pub struct ProcessedDngResult {
 /// Snapshot settings and output name on the UI thread; call [`ProcessedDngJob::run`] elsewhere.
 /// An explicit `path` must be a new `.dng` file; defaults to `Processed/<stem>-Clean.dng`.
 pub fn prepare_processed_dng(s: &Session, id: PhotoId, path: Option<&Path>) -> std::result::Result<ProcessedDngJob, String> {
+    prepare_processed_dng_with_processor(s, id, path, Processor::Native)
+}
+
+/// Prepare a derivative using an explicit processor. Model loading/inference stays off the UI
+/// thread; caller runs the Send job on a worker. Native uses the persistent RAW slider amount.
+pub fn prepare_processed_dng_with_processor(
+    s: &Session,
+    id: PhotoId,
+    path: Option<&Path>,
+    processor: Processor,
+) -> std::result::Result<ProcessedDngJob, String> {
     let photo = s.catalog.photo(id).ok_or("unknown photo")?;
     let Source::File { path: source } = &photo.source else {
         return Err("processed DNG requires a RAW file".into());
@@ -238,7 +266,25 @@ pub fn prepare_processed_dng(s: &Session, id: PhotoId, path: Option<&Path>) -> s
         return Err("processed DNG requires a supported RAW original".into());
     }
     let variant_settings = s.develop_of(id).ok_or("no photo settings")?;
-    let options = crate::files::raw_denoise_options(&variant_settings);
+    let options = match &processor {
+        Processor::Native => crate::files::raw_denoise_options(&variant_settings),
+        Processor::ExperimentalPmrid { checkpoint, noise_profile, strength, tile_core, halo } => {
+            if checkpoint.as_os_str().is_empty() || noise_profile.as_os_str().is_empty() {
+                return Err("experimental PMRID requires explicit checkpoint and noise-profile paths".into());
+            }
+            #[cfg(feature = "pmrid")]
+            lightcraft_raw::pmrid::Options { strength: *strength, tile_core: *tile_core, halo: *halo }.validate().map_err(|e| e.to_string())?;
+            #[cfg(not(feature = "pmrid"))]
+            {
+                let _ = (strength, tile_core, halo);
+                return Err("experimental PMRID is not compiled; build with the optional pmrid feature".into());
+            }
+            #[cfg(feature = "pmrid")]
+            {
+                Options { strength: *strength }
+            }
+        }
+    };
     options.validate().map_err(|e| e.to_string())?;
     if options.strength == 0.0 {
         return Err("enable RAW Denoise before exporting a cleaned DNG".into());
@@ -248,7 +294,11 @@ pub fn prepare_processed_dng(s: &Session, id: PhotoId, path: Option<&Path>) -> s
         Some(p) => p.to_path_buf(),
         None => {
             let stem = source_path.file_stem().ok_or("RAW source has no file name")?.to_string_lossy();
-            source_path.parent().unwrap_or(Path::new(".")).join("Processed").join(format!("{stem}-Clean.dng"))
+            let suffix = match &processor {
+                Processor::Native => "Clean",
+                Processor::ExperimentalPmrid { .. } => "AI-Clean",
+            };
+            source_path.parent().unwrap_or(Path::new(".")).join("Processed").join(format!("{stem}-{suffix}.dng"))
         }
     };
     if !output.extension().is_some_and(|e| e.eq_ignore_ascii_case("dng")) {
@@ -271,6 +321,7 @@ pub fn prepare_processed_dng(s: &Session, id: PhotoId, path: Option<&Path>) -> s
         read: s.media.file_bytes.clone(),
         expected_source: source_stamp(source),
         options,
+        processor,
         packet: crate::sidecar::sidecar_packet(photo, &s.catalog),
         settings,
     })
@@ -354,9 +405,44 @@ impl ProcessedDngJob {
         let mut raw = lightcraft_raw::decode(&bytes).map_err(|e| e.to_string())?;
         let interpretation = source_interpretation(&raw, &bytes);
         drop(bytes);
-        let report = lightcraft_raw::denoise::process(&mut raw, self.options, &self.cancel).map_err(|e| e.to_string())?;
+        let (report, ai_details): (Report, Option<Value>) = match &self.processor {
+            Processor::Native => (lightcraft_raw::denoise::process(&mut raw, self.options, &self.cancel).map_err(|e| e.to_string())?, None),
+            Processor::ExperimentalPmrid { checkpoint, noise_profile, strength, tile_core, halo } => {
+                #[cfg(not(feature = "pmrid"))]
+                {
+                    let _ = (checkpoint, noise_profile, strength, tile_core, halo);
+                    return Err("experimental PMRID is not compiled".into());
+                }
+                #[cfg(feature = "pmrid")]
+                {
+                    let profile = read_noise_profile(noise_profile)?;
+                    let model = lightcraft_raw::pmrid::Model::load(checkpoint).map_err(|e| e.to_string())?;
+                    let ai = lightcraft_raw::pmrid::process(
+                        &mut raw,
+                        &model,
+                        &profile,
+                        lightcraft_raw::pmrid::Options { strength: *strength, tile_core: *tile_core, halo: *halo },
+                        &self.cancel,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let summary = Report {
+                        algorithm: ai.algorithm,
+                        version: ai.version,
+                        mode: "bayer-sensor",
+                        strength: ai.strength,
+                        sigma: Vec::new(),
+                        samples: raw.data.len(),
+                    };
+                    (summary, Some(serde_json::to_value(ai).map_err(|e| e.to_string())?))
+                }
+            }
+        };
         let record = serde_json::to_string(&interpretation).map_err(|e| e.to_string())?;
-        let processing = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+        let mut provenance = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+        if let Some(ai) = &ai_details {
+            provenance.as_object_mut().ok_or("invalid processing report")?.insert("aiDetails".into(), ai.clone());
+        }
+        let processing = serde_json::to_string(&provenance).map_err(|e| e.to_string())?;
         let settings = serde_json::to_string(&self.settings).map_err(|e| e.to_string())?;
         let extra = lightcraft_meta::write_xmp_lc(
             &raw.metadata,
@@ -411,9 +497,70 @@ impl ProcessedDngJob {
             path: self.output,
             original: self.source,
             report,
+            ai_details,
             has_lightcraft_colour: interpretation.look.is_some(),
         })
     }
+}
+
+#[cfg(feature = "pmrid")]
+fn read_noise_profile(path: &Path) -> std::result::Result<lightcraft_raw::pmrid::NoiseProfile, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > 64 << 10 {
+        return Err("noise profile exceeds 64 KiB limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take((64 << 10) + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > 64 << 10 {
+        return Err("noise profile exceeds 64 KiB limit".into());
+    }
+    let profile: lightcraft_raw::pmrid::NoiseProfile = serde_json::from_slice(&bytes).map_err(|e| format!("invalid camera noise profile: {e}"))?;
+    profile.validate().map_err(|e| e.to_string())?;
+    Ok(profile)
+}
+
+/// Shared command/UI parser. Default is native; unknown/malformed modes and model inputs error.
+/// This does no IO or inference and is available even when the optional model is not compiled.
+pub fn processor_from_params(p: &Value) -> Result<Processor> {
+    const C: &str = "photo.exportProcessedDng";
+    if !p.is_object() {
+        return Err(bad(C, "params must be an object"));
+    }
+    Ok(match p.get("mode") {
+        None => Processor::Native,
+        Some(v) => match v.as_str() {
+            Some("native") => Processor::Native,
+            Some("experimental-pmrid") => {
+                let required_path = |name: &str| {
+                    p.get(name)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| bad(C, format!("{name} path is required for experimental PMRID")))
+                };
+                let integer = |name: &str, default: usize| match p.get(name) {
+                    None => Ok(default),
+                    Some(v) => v.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad(C, format!("{name} must be a positive integer"))),
+                };
+                let strength = match p.get("strength") {
+                    None => 100.0,
+                    Some(v) => v.as_f64().ok_or_else(|| bad(C, "strength must be numeric"))?,
+                };
+                if !strength.is_finite() || !(0.0..=100.0).contains(&strength) {
+                    return Err(bad(C, "strength must be within 0..100"));
+                }
+                Processor::ExperimentalPmrid {
+                    checkpoint: required_path("checkpoint")?,
+                    noise_profile: required_path("noiseProfile")?,
+                    strength: strength as f32,
+                    tile_core: integer("tileCore", 128)?,
+                    halo: integer("halo", 64)?,
+                }
+            }
+            _ => return Err(bad(C, "mode must be native or experimental-pmrid")),
+        },
+    })
 }
 
 fn export_processed(s: &mut Session, p: &Value) -> Result<Value> {
@@ -426,7 +573,12 @@ fn export_processed(s: &mut Session, p: &Value) -> Result<Value> {
     if path.is_some() && ids.len() != 1 {
         return Err(bad(C, "an explicit path requires exactly one photo"));
     }
-    let jobs = ids.into_iter().map(|id| prepare_processed_dng(s, id, path)).collect::<std::result::Result<Vec<_>, _>>().map_err(|e| bad(C, e))?;
+    let processor = processor_from_params(p)?;
+    let jobs = ids
+        .into_iter()
+        .map(|id| prepare_processed_dng_with_processor(s, id, path, processor.clone()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| bad(C, e))?;
     let mut names = std::collections::HashSet::new();
     if jobs.iter().any(|job| !names.insert(job.output.clone())) {
         return Err(bad(C, "selected RAW files have colliding output names; export individually with unique paths"));
@@ -440,6 +592,10 @@ fn export_processed(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(query "raw.processingCapabilities", "RAW Processing Capabilities", [], None, "{} — native availability and opt-in experimental model requirements", always, |_, _| {
+            Ok(json!({"native":{"available":true,"ai":false,"modes":["bayer-sensor","linear-rgb","monochrome"]},
+                "experimentalPmrid":{"compiled":cfg!(feature="pmrid"),"enabledByDefault":false,"requires":["pinned official checkpoint","matching measured camera noise profile","ISO inside calibrated domain","Bayer CFA"],"linearRgb":false,"cameraProfilesBundled":false,"weightsBundled":false,"automaticDownload":false}}))
+        }),
         cmd!(
             "photo.rawDenoise",
             "RAW Denoise (Native)",
@@ -454,7 +610,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Processed DNG",
             ["Photo"],
             None,
-            "{ids?, path?:new.dng} — cleaned sensor/linear samples with edits, default Processed/<stem>-Clean.dng; requires RAW Denoise >0; never overwrites → {outputs}",
+            "{ids?, path?:new.dng, mode?:native|experimental-pmrid, checkpoint?, noiseProfile?, strength?, tileCore?, halo?} — native requires RAW Denoise >0; explicit experimental AI requires pmrid build and calibrated Bayer profile. New Processed/<stem>-Clean.dng, never overwrites → {outputs}",
             has_selection,
             export_processed
         ),
@@ -700,6 +856,121 @@ mod tests {
         assert!(job.run().unwrap_err().contains("changed since"));
         assert!(!dir.join("Processed").exists());
         assert_eq!(std::fs::read(dir.join("Shot.dng")).unwrap(), replacement);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raw_capabilities_and_explicit_model_arguments_are_honest() {
+        let (mut s, _, dir, bytes) = setup("capabilities");
+        let caps = s.execute("raw.processingCapabilities", &json!({})).unwrap();
+        assert_eq!(caps["native"]["available"], true);
+        assert_eq!(caps["experimentalPmrid"]["compiled"], cfg!(feature = "pmrid"));
+        assert_eq!(caps["experimentalPmrid"]["automaticDownload"], false);
+        assert_eq!(caps["experimentalPmrid"]["cameraProfilesBundled"], false);
+        assert!(matches!(processor_from_params(&json!({})).unwrap(), Processor::Native));
+        assert!(processor_from_params(&Value::Null).is_err());
+        assert!(processor_from_params(&json!({"mode":123})).is_err());
+        assert!(s.execute("photo.exportProcessedDng", &json!({"mode":"experimental-pmrid"})).unwrap_err().to_string().contains("checkpoint"));
+        assert!(s.execute("photo.exportProcessedDng", &json!({"mode":"pretend-dxo"})).is_err());
+        assert_eq!(std::fs::read(dir.join("Shot.dng")).unwrap(), bytes);
+        assert!(!dir.join("Processed").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(feature = "pmrid"))]
+    #[test]
+    fn experimental_export_is_disabled_without_the_optional_feature() {
+        let (mut s, _, dir, bytes) = setup("no-model-feature");
+        let error = s
+            .execute("photo.exportProcessedDng", &json!({"mode":"experimental-pmrid","checkpoint":"model.ckp","noiseProfile":"camera.json"}))
+            .unwrap_err();
+        assert!(error.to_string().contains("not compiled"));
+        assert_eq!(std::fs::read(dir.join("Shot.dng")).unwrap(), bytes);
+        assert!(!dir.join("Processed").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "pmrid")]
+    #[test]
+    fn profile_file_limits_and_wrong_units_are_rejected() {
+        let dir = crate::tests_xmp::temp_dir("pmrid-profile-input");
+        let file = dir.join("profile.json");
+        std::fs::write(&file, vec![b' '; (64 << 10) + 1]).unwrap();
+        assert!(read_noise_profile(&file).unwrap_err().contains("64 KiB"));
+        std::fs::write(
+            &file,
+            r#"{"schema":1,"camera_model":"Camera","points":[{"iso":1600,"shot":0.001,"read_variance":0.000003}],"units":"phone ADC"}"#,
+        )
+        .unwrap();
+        assert!(read_noise_profile(&file).unwrap_err().contains("invalid camera noise profile"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "pmrid")]
+    #[test]
+    #[ignore = "requires LIGHTCRAFT_PMRID_CHECKPOINT; actual model derivative/export acceptance"]
+    fn calibrated_pmrid_background_job_and_command_write_real_cleaned_dng() {
+        let (mut s, id, dir, bytes) = setup("pmrid-export");
+        let checkpoint = PathBuf::from(std::env::var("LIGHTCRAFT_PMRID_CHECKPOINT").expect("set LIGHTCRAFT_PMRID_CHECKPOINT"));
+        let mut raw = lightcraft_raw::decode(&bytes).unwrap();
+        raw.metadata.model = Some("Calibrated procedural camera".into());
+        raw.metadata.iso = Some(1600);
+        let bytes = lightcraft_raw::write_dng(&raw, &Default::default()).unwrap();
+        std::fs::write(dir.join("Shot.dng"), &bytes).unwrap();
+        let profile = lightcraft_raw::pmrid::NoiseProfile {
+            schema: 1,
+            camera_model: "Calibrated procedural camera".into(),
+            points: vec![lightcraft_raw::pmrid::CalibrationPoint { iso: 1600, shot: 0.0010093132, read_variance: 0.000003239 }],
+        };
+        let profile_path = dir.join("camera-noise.json");
+        std::fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+        let request = Processor::ExperimentalPmrid {
+            checkpoint: checkpoint.clone(),
+            noise_profile: profile_path.clone(),
+            strength: 70.0,
+            tile_core: 16,
+            halo: 16,
+        };
+        let default_job = prepare_processed_dng_with_processor(&s, id, None, request.clone()).unwrap();
+        assert_eq!(default_job.output, dir.join("Processed/Shot-AI-Clean.dng"));
+        let out = dir.join("AI-Clean.dng");
+        let job = prepare_processed_dng_with_processor(&s, id, Some(&out), request.clone()).unwrap();
+        let result = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+        assert_eq!(result.report.algorithm, "experimental-pmrid");
+        assert_eq!(result.ai_details.as_ref().unwrap()["checkpointSha256"], lightcraft_raw::pmrid::CHECKPOINT_SHA256);
+        assert_eq!(s.develop_of(id).unwrap().detail.raw_denoise, 0.0, "AI derivative does not mutate persistent source processing");
+        let model = lightcraft_raw::pmrid::Model::load(&checkpoint).unwrap();
+        let mut expected = lightcraft_raw::decode(&bytes).unwrap();
+        lightcraft_raw::pmrid::process(
+            &mut expected,
+            &model,
+            &profile,
+            lightcraft_raw::pmrid::Options { strength: 70.0, tile_core: 16, halo: 16 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let encoded = std::fs::read(&out).unwrap();
+        let reopened = lightcraft_raw::decode(&encoded).unwrap();
+        assert_eq!(reopened.data, expected.data);
+        assert_ne!(reopened.data, raw.data);
+        let packet = lightcraft_raw::embedded_xmp(&encoded).unwrap();
+        let xmp = lightcraft_meta::parse_xmp(&packet).unwrap();
+        let provenance: Value = serde_json::from_str(&xmp.properties["lc:rawProcessing"][0]).unwrap();
+        assert_eq!(provenance["aiDetails"]["cameraModel"], "Calibrated procedural camera");
+        assert!(prepare_processed_dng_with_processor(&s, id, Some(&out), request.clone()).is_err());
+        let cancel_path = dir.join("Cancelled.dng");
+        let job = prepare_processed_dng_with_processor(&s, id, Some(&cancel_path), request).unwrap();
+        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(job.run().is_err());
+        assert!(!cancel_path.exists());
+        let command = s
+            .execute(
+                "photo.exportProcessedDng",
+                &json!({"mode":"experimental-pmrid","checkpoint":checkpoint,"noiseProfile":profile_path,"strength":70.0,"tileCore":16,"halo":16}),
+            )
+            .unwrap();
+        assert_eq!(command["outputs"][0]["report"]["algorithm"], "experimental-pmrid");
+        assert_eq!(std::fs::read(dir.join("Shot.dng")).unwrap(), bytes);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

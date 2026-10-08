@@ -3019,6 +3019,8 @@ dependencies = [
 name = "lightcraft-raw"
 version = "0.4.0"
 dependencies = [
+ "candle-core",
+ "candle-nn",
  "jpeg-encoder",
  "lightcraft-color",
  "lightcraft-geom",
@@ -3029,7 +3031,9 @@ dependencies = [
  "proptest",
  "rayon",
  "serde",
+ "sha2",
  "thiserror 2.0.21",
+ "zip",
  "zune-core",
  "zune-jpeg",
 ]

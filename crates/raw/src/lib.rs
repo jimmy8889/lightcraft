@@ -32,6 +32,8 @@ pub mod dngwrite;
 pub mod highlight;
 pub mod ljpeg;
 pub mod opcodes;
+#[cfg(feature = "pmrid")]
+pub mod pmrid;
 mod preview;
 mod preview_seek;
 pub mod profile;

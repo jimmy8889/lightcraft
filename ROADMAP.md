@@ -16,7 +16,7 @@ Linux fault and restart tests cover byte preservation and collision refusal; Win
 cross-compile, with native storage/power-loss acceptance still open. Custom feature status and
 upstream integration are tracked in [docs/custom/features.json](docs/custom/features.json).
 The fork also adds full-resolution classical RAW denoising and actual cleaned-sample DNG
-export, verified on eight earlier Sony corpus variants and nine A1 II full-frame/APS-C samples. These do not close the AI denoise or
+export, verified on eight earlier Sony corpus variants and nine A1 II full-frame/APS-C samples. An opt-in PMRID CPU research derivative backend now matches independent tensor/four-CFA reference fixtures, but has no measured A1 II calibration or GPU path. These do not close the AI denoise or
 measured camera-colour gaps. Measured optics now includes six licensed Sony primes, including 14/24/50 GM, with exact capture assertions and content binding. GM II, 300 GM and converter calibration remain absent; TCA is an explicit experimental working-RGB correction. New-file publication refuses unsupported hard-link volumes
 to prevent the prior check-then-rename collision race.
 

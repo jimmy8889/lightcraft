@@ -89,6 +89,12 @@ LightCraft's per-file camera JPEG colour estimate travels in private DNG XMP.
 Other editors use the DNG camera tags; matching external-editor colour has not
 been established. A measured camera calibration database remains required.
 
+An optional [PMRID CPU research backend](../experimental-pmrid.md) exports an
+AI derivative using an explicitly supplied checkpoint and measured camera noise
+profile. It is disabled in default builds, has no bundled A1 II calibration and
+no automatic downloads. It supports Bayer mosaics, not Sony M/S linear RGB.
+Full-photo texture, colour, tile seams and GPU acceleration remain unvalidated.
+
 ## Measured optics
 
 The Optics panel exposes licensed, exact measured profiles for six Sony primes,

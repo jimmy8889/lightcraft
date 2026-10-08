@@ -1,5 +1,7 @@
 """Exercise merge preparation against disposable repositories, including conflicts."""
 
+import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -7,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "upstream-update.py"
@@ -159,6 +162,19 @@ class UpdateSafety(unittest.TestCase):
         self.assertEqual((candidate / "docs/custom/features.json").read_text(), "{invalid inventory")
         self.unchanged()
 
+    def test_non_array_feature_inventory_requires_review(self):
+        inventory = self.source / "docs/custom/features.json"
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text('{"schema":1,"features":null}')
+        self.commit(self.source, "invalid feature array")
+        self.before = self.git(self.source, "rev-parse", "HEAD").stdout.strip()
+        candidate = self.root / "candidate"
+        result = self.invoke("--prepare-only", "--worktree", str(candidate))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads((candidate / "plan/upstream-update/result.json").read_text())
+        self.assertEqual(report["status"], "inventory-needs-review")
+        self.unchanged()
+
     def test_dirty_source_and_revision_expressions_refused(self):
         for ref in ("--upload-pack=bad", "main~1", "main..release", "../main", "main@{1}"):
             result = self.invoke("--plan", "--ref", ref)
@@ -186,6 +202,40 @@ class UpdateSafety(unittest.TestCase):
         result = self.invoke("--plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.git(self.source, "worktree", "list", "--porcelain").stdout.split("worktree ")) - 1, 1)
+        self.unchanged()
+
+    def test_optional_model_compile_failure_blocks_merge_after_default_gates_pass(self):
+        inventory = self.source / "docs/custom/features.json"
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text(json.dumps({"schema": 1, "features": [
+            {"id": "CUSTOM-008", "status": "implemented"}]}))
+        self.commit(self.source, "optional model inventory")
+        self.before = self.git(self.source, "rev-parse", "HEAD").stdout.strip()
+        (self.upstream / "new.txt").write_text("new release\n")
+        self.commit(self.upstream, "upstream release")
+        candidate = self.root / "candidate"
+        spec = importlib.util.spec_from_file_location("lightcraft_update_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        calls = []
+
+        def check(command, *unused):
+            calls.append(command)
+            return 1 if "clippy" in command else 0
+
+        args = argparse.Namespace(ref="main", worktree=str(candidate), plan=False, prepare_only=False)
+        with (mock.patch.object(Path, "cwd", return_value=self.source),
+              mock.patch.dict(os.environ, self.env),
+              mock.patch.object(module, "run_check", side_effect=check),
+              mock.patch("builtins.print")):
+            result = module.prepare(args)
+        self.assertEqual(result, 3)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("lightcraft/pmrid,lightcraft-cli/pmrid", calls[-1])
+        report = json.loads((candidate / "plan/upstream-update/result.json").read_text())
+        self.assertEqual(report["status"], "checks-failed")
+        self.assertEqual(self.git(candidate, "rev-parse", "HEAD").stdout.strip(), self.before)
+        self.git(candidate, "rev-parse", "--verify", "MERGE_HEAD")
         self.unchanged()
 
     def test_failed_gate_leaves_merge_uncommitted(self):

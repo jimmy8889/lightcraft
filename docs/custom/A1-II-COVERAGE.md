@@ -38,6 +38,12 @@ render took approximately 16.3 seconds under build load; no GPU adapter was
 available. Ratings/native settings were saved in XMP. This was a test folder,
 not the user's personal media or hardware.
 
+The integrated optional-backend build also ran the native source-versus-derivative
+render acceptance on all nine files. Reopened preview RGB differences were zero;
+white-balance mode, tone curve and original bytes matched. No file-local camera-JPEG
+look was accepted for these samples. This verifies preservation of LightCraft's
+source interpretation, not measured Sony colour accuracy or DxO output quality.
+
 ## Reproduce native processing
 
 Download the pinned files into a disposable local folder and verify each SHA256

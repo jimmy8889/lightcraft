@@ -304,7 +304,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             {
                 app.toast_error(ui.ctx(), error);
             }
-            ui.label(egui::RichText::new("Source-stage classical processing; not AI or DeepPRIME.").size(11.0).color(Tokens::get(ui.ctx()).text_dim));
+            ui.label(egui::RichText::new("Classical processing on full-resolution sensor samples.").size(11.0).color(Tokens::get(ui.ctx()).text_dim));
+            crate::processed_raw::show_experimental(app, ui, id);
             ui.add_space(8.0);
         }
         sub_title(ui, crate::i18n::tr("Noise Reduction"));
