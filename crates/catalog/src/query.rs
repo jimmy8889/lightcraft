@@ -314,6 +314,46 @@ impl Filter {
     }
 }
 
+/// Case-insensitive natural filename order, without numeric parsing or overflow. Numeric runs
+/// compare by significant length then digits; leading zeros break otherwise equal runs.
+pub fn natural_file_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    while let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) {
+        if x.is_ascii_digit() && y.is_ascii_digit() {
+            let (start_a, start_b) = (i, j);
+            while a.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            while b.get(j).is_some_and(u8::is_ascii_digit) {
+                j += 1;
+            }
+            let (mut sig_a, mut sig_b) = (start_a, start_b);
+            while sig_a < i && a.get(sig_a) == Some(&b'0') {
+                sig_a += 1;
+            }
+            while sig_b < j && b.get(sig_b) == Some(&b'0') {
+                sig_b += 1;
+            }
+            let order =
+                (i - sig_a).cmp(&(j - sig_b)).then_with(|| a.get(sig_a..i).cmp(&b.get(sig_b..j))).then_with(|| (i - start_a).cmp(&(j - start_b)));
+            if order != Ordering::Equal {
+                return order;
+            }
+        } else {
+            let order = x.cmp(&y);
+            if order != Ordering::Equal {
+                return order;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    a.len().saturating_sub(i).cmp(&b.len().saturating_sub(j))
+}
+
 impl Catalog {
     /// Photos matching `filter`, in `sort` order (ties broken by id for stability).
     pub fn query(&self, filter: &Filter, sort: &Sort) -> Vec<PhotoId> {
@@ -323,7 +363,7 @@ impl Catalog {
                 SortKey::CaptureDate => a.date().cmp(b.date()),
                 SortKey::ImportDate => a.imported.cmp(&b.imported),
                 SortKey::EditDate => a.edited.cmp(&b.edited),
-                SortKey::FileName => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
+                SortKey::FileName => natural_file_name_cmp(&a.file_name, &b.file_name),
                 SortKey::Rating => a.rating.cmp(&b.rating),
                 SortKey::FileSize => a.file_size.cmp(&b.file_size),
                 SortKey::Random => shuffle_rank(sort.seed, a.id).cmp(&shuffle_rank(sort.seed, b.id)),
@@ -526,5 +566,35 @@ mod folder_spelling_tests {
     fn ntfs_folder_case_matches_canonical_source_paths() {
         assert!(in_folder(r"\\?\C:\PHOTOS\A.ARW", "c:/photos", false));
         assert!(!in_folder("C:/PHOTOS2/A.ARW", "c:/photos", true));
+    }
+}
+
+#[cfg(test)]
+mod natural_order_tests {
+    use super::natural_file_name_cmp;
+
+    #[test]
+    fn filename_runs_are_numeric_case_insensitive_and_overflow_safe() {
+        let mut names = vec![
+            "IMG_10.ARW",
+            "IMG_02.ARW",
+            "img_2.arw",
+            "IMG_1.ARW",
+            "IMG_999999999999999999999999999999.ARW",
+            "IMG_1000000000000000000000000000000.ARW",
+        ];
+        names.sort_by(|a, b| natural_file_name_cmp(a, b));
+        assert_eq!(
+            names,
+            vec![
+                "IMG_1.ARW",
+                "img_2.arw",
+                "IMG_02.ARW",
+                "IMG_10.ARW",
+                "IMG_999999999999999999999999999999.ARW",
+                "IMG_1000000000000000000000000000000.ARW"
+            ]
+        );
+        assert_eq!(natural_file_name_cmp("Ä2.arw", "ä2.ARW"), std::cmp::Ordering::Equal);
     }
 }

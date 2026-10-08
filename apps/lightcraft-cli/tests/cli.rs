@@ -231,6 +231,24 @@ fn run_cli(args: &[&str], stdin: Option<&str>) -> (bool, Vec<Value>, String) {
 }
 
 #[test]
+fn raw_script_parameters_never_default_explicit_invalid_input_to_selection() {
+    let mut script = String::new();
+    for command in ["photo.rawDenoise", "photo.exportProcessedDng"] {
+        for params in [Value::Null, json!("invalid"), json!([1])] {
+            script.push_str(&json!({"command":command,"params":params}).to_string());
+            script.push('\n');
+        }
+    }
+    let (ok, replies, _) = run_cli(&["--demo", "--keep-going", "--script", "-"], Some(&script));
+    assert!(!ok);
+    assert_eq!(replies.len(), 6);
+    for reply in replies {
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("params must be an object"), "{reply}");
+    }
+}
+
+#[test]
 fn run_subcommand_chains_commands_and_persists_a_library() {
     let input = tmp("run-in.png");
     gradient_png(&input);

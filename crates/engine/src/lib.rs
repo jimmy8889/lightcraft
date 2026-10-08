@@ -36,6 +36,7 @@ pub mod presets;
 pub mod rename;
 pub mod segment;
 pub mod sidecar;
+mod sidecar_guard;
 pub mod smart;
 mod view;
 
@@ -164,6 +165,7 @@ pub struct Session {
     pub library: Option<library::Library>,
     /// XMP sidecar preferences (persisted with the library).
     pub xmp: sidecar::XmpPrefs,
+    pub(crate) sidecars: std::sync::Mutex<sidecar_guard::State>,
     /// Parameters of the last export (`app.export` params, minus targets), persisted in prefs.json.
     pub last_export: Option<serde_json::Value>,
     /// The user's export presets (built-ins: [`export::builtin_presets`]), persisted in prefs.json.
@@ -250,6 +252,7 @@ impl Session {
             active_spot: None,
             library: None,
             xmp: sidecar::XmpPrefs::default(),
+            sidecars: sidecar_guard::new_state(),
             last_export: None,
             export_presets: Vec::new(),
             metadata_presets: Vec::new(),
@@ -286,7 +289,7 @@ impl Session {
         (spec.enabled)(self).map_err(|why| EngineError::Disabled(id.to_string(), why))?;
         let empty = Value::Object(Default::default());
         // RAW commands require an object: do not let malformed explicit input act on selection.
-        let strict_params = matches!(id, "photo.rawDenoise" | "photo.exportProcessedDng");
+        let strict_params = cmd::raw_processing::requires_object_params(id);
         let params = if params.is_null() && !strict_params { &empty } else { params };
         self.run_command(id, spec.journal.then_some(params), |s| (spec.run)(s, params))
     }
@@ -320,10 +323,17 @@ impl Session {
                 self.journal.drain(..1000);
             }
         }
+        let mut sidecar_error = None;
         if self.depth == 0 {
             let skip = std::mem::take(&mut self.skip_auto_write);
-            if r.is_ok() && !skip && self.xmp.auto_write && self.interaction.is_none() && self.pending_log.len() > log_start {
-                self.auto_write_sidecars(&self.pending_log[log_start..]);
+            if r.is_ok()
+                && !skip
+                && self.xmp.auto_write
+                && self.interaction.is_none()
+                && self.pending_log.len() > log_start
+                && let Err(error) = self.auto_write_sidecars(&self.pending_log[log_start..])
+            {
+                sidecar_error = Some(error);
             }
         }
         if self.depth == 0 && self.library.is_some() {
@@ -339,6 +349,16 @@ impl Session {
             {
                 return Err(e);
             }
+        }
+        if self.depth == 0
+            && let Err(error) = self.persist_sidecar_baselines()
+        {
+            sidecar_error = Some(error);
+        }
+        if r.is_ok()
+            && let Some(error) = sidecar_error
+        {
+            return Err(error);
         }
         r
     }

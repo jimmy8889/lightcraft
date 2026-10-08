@@ -586,6 +586,7 @@ struct ReadyFile {
     stored: String,
     info: ProbeInfo,
     sidecar: Option<crate::sidecar::SidecarData>,
+    sidecar_snapshots: Vec<crate::sidecar_guard::Snapshot>,
     placed: Option<crate::import_move::Placed>,
 }
 
@@ -738,9 +739,8 @@ impl ImportJob {
             // the XMP sidecar (or a raw's embedded XMP), read before copying: its capture time files
             // and names the copy when the file itself has none
             let raw = info.kind == MediaKind::Raw;
-            let packet = crate::sidecar::find_sidecar(&path, self.naming)
-                .and_then(|f| std::fs::read_to_string(f).ok())
-                .or_else(|| info.xmp.clone().filter(|_| raw));
+            let (sidecar_snapshots, packet) = crate::sidecar_guard::capture(&path, self.naming);
+            let packet = packet.or_else(|| info.xmp.clone().filter(|_| raw));
             let sidecar = packet.and_then(|x| match crate::sidecar::parse_sidecar(&x, raw) {
                 Ok(sc) => Some(sc),
                 Err(e) => {
@@ -823,7 +823,7 @@ impl ImportJob {
                     Err(e) => log::warn!("import {path}: copy as DNG: {e}"),
                 }
             }
-            out.items.push(PreparedItem::Ready(Box::new(ReadyFile { path, stored, info, sidecar, placed })));
+            out.items.push(PreparedItem::Ready(Box::new(ReadyFile { path, stored, info, sidecar, sidecar_snapshots, placed })));
         }
         out
     }
@@ -858,7 +858,15 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
             PreparedItem::Failed(path, e) => report.failed.push((path, e)),
             PreparedItem::Kept(k) => report.kept.push(k),
             PreparedItem::Ready(r) => {
-                let ReadyFile { path, stored, info, sidecar, placed: pl } = *r;
+                let ReadyFile { path, stored, info, sidecar, sidecar_snapshots, placed: pl } = *r;
+                for snapshot in sidecar_snapshots {
+                    // A verified Move preserves the observed packet at its new path. Carry
+                    // the same fingerprint forward without reading the folder on the UI thread.
+                    if let Some(sidecar) = pl.as_ref().and_then(|placed| placed.sidecars.iter().find(|sidecar| sidecar.src == snapshot.path)) {
+                        s.observe_sidecar(crate::sidecar_guard::Snapshot { path: sidecar.dst.clone(), hash: snapshot.hash.clone() });
+                    }
+                    s.observe_sidecar(snapshot);
+                }
                 placed.extend(pl);
                 let id = s.catalog.alloc_photo_id();
                 if let Some(h) = &info.content_hash {
@@ -948,8 +956,12 @@ fn finish_moves(s: &mut Session, placed: Vec<crate::import_move::Placed>, log0: 
             }
         }
     }
-    if s.pending_log.len() < before && s.interaction.is_none() && !auto.is_empty() {
-        s.auto_write_sidecars(&auto);
+    if s.pending_log.len() < before
+        && s.interaction.is_none()
+        && !auto.is_empty()
+        && let Err(error) = s.auto_write_sidecars(&auto)
+    {
+        log::warn!("move import sidecar: {error}");
     }
 }
 

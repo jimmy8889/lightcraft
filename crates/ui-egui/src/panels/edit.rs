@@ -41,6 +41,26 @@ pub(crate) fn control(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSet
     apply_slider_out(app, spec, out, |app, v| app.run("develop.set", json!({"control": id, "value": v})));
 }
 
+/// RAW source processing is deliberately committed once on release. Showing a draft amount
+/// must not enqueue a full-sensor denoise job for every pointer event.
+fn native_raw_control(app: &mut LightcraftApp, ui: &mut egui::Ui, settings: &DevelopSettings, photo: PhotoId) {
+    let Some(spec) = controls::find("detail.rawDenoise") else { return };
+    let id = egui::Id::new(("raw-denoise-draft", photo.0));
+    let current = controls::get(settings, spec.id).unwrap_or(spec.default);
+    let draft = ui.data(|data| data.get_temp::<f64>(id)).unwrap_or(current);
+    let out = slider(ui, spec, draft, true, None);
+    let value = out.value.unwrap_or(if out.reset { spec.default } else { draft });
+    if out.value.is_some() {
+        ui.data_mut(|data| data.insert_temp(id, value));
+    }
+    if out.drag_stopped || out.reset {
+        ui.data_mut(|data| data.remove::<f64>(id));
+        if let Err(error) = app.run("photo.rawDenoise", json!({"ids": [photo.0], "strength": value})) {
+            app.toast_error(ui.ctx(), error);
+        }
+    }
+}
+
 /// Relative temperature scale for rendered (non-raw) files: −100..100 ↔ Kelvin via mired shift.
 const REL_TEMP: ControlSpec = ControlSpec {
     id: "wb.tempRel",
@@ -271,6 +291,21 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     section(app, ui, &d, "detail", "Detail", |app, ui, d| {
         for c in ["detail.sharpenAmount", "detail.sharpenRadius", "detail.sharpenDetail", "detail.sharpenMasking"] {
             control(app, ui, d, c, c == "detail.sharpenAmount" || d.detail.sharpen_amount > 0.0);
+        }
+        if app.session.catalog.photo(id).is_some_and(|p| p.develops_raw()) && controls::find("detail.rawDenoise").is_some() {
+            sub_title(ui, crate::i18n::tr("RAW Denoise (Native)"));
+            native_raw_control(app, ui, d, id);
+            let response = ui
+                .button("Save Cleaned DNG")
+                .on_hover_text("Creates Processed/<stem>-Clean.dng from the selected RAW. Originals stay unchanged; a taken filename is refused.");
+            register(ui.ctx(), "button:processedDng", response.rect);
+            if response.clicked()
+                && let Err(error) = app.run("photo.exportProcessedDng", json!({"ids": [id.0]}))
+            {
+                app.toast_error(ui.ctx(), error);
+            }
+            ui.label(egui::RichText::new("Source-stage classical processing; not AI or DeepPRIME.").size(11.0).color(Tokens::get(ui.ctx()).text_dim));
+            ui.add_space(8.0);
         }
         sub_title(ui, crate::i18n::tr("Noise Reduction"));
         for c in ["detail.nrLuminance", "detail.nrDetail", "detail.nrContrast", "detail.nrColor", "detail.nrColorDetail", "detail.nrColorSmoothness"]

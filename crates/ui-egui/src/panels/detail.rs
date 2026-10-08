@@ -168,7 +168,17 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     } else {
         24.0
     });
-    let max_edge = app.ui.settings.preview_edge.clamp(512, 8192) as f32;
+    // 100% inspection requests native pixels rather than enlarging a capped preview.
+    let max_edge = if matches!(app.ui.zoom, Zoom::Percent(p) if p >= 100) {
+        photo.width.max(photo.height).min(u32::try_from(ui.input(|i| i.max_texture_side)).unwrap_or(u32::MAX)) as f32
+    } else {
+        app.ui.settings.preview_edge.clamp(512, 8192) as f32
+    };
+    let camera_preview = crate::folder::active(app)
+        && app.ui.zoom == Zoom::Fit
+        && photo.kind == lightcraft_catalog::MediaKind::Raw
+        && lightcraft_engine::import::has_import_look(&photo)
+        && app.ui.before_after == BeforeAfter::Off;
     let native = [photo.width.max(1) as usize, photo.height.max(1) as usize];
     // two views (before, after): side by side or stacked
     let split = matches!(app.ui.before_after, BeforeAfter::SideBySide | BeforeAfter::TopBottom);
@@ -200,7 +210,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // render at the final size: a click-zoom animation only changes how the result is drawn
     let want = (target_rect.width().max(target_rect.height()) * ppp * scale).min(max_edge) as usize;
     let (rw, rh) = if aspect >= 1.0 { (want, (want as f32 / aspect) as usize) } else { ((want as f32 * aspect) as usize, want) };
-    if let Some(job) = app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool) {
+    if !camera_preview && let Some(job) = app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool) {
         let job = if interacting { job.draft() } else { job };
         let job = job.with_overlay(view_overlay(app, &d)).with_proof(app.ui.soft_proof.then_some(app.ui.proof));
         app.renderer.request(Slot::Main, job, 100);
@@ -217,7 +227,11 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     };
     // once this photo is on screen: prepare its neighbours in filmstrip order (source decoded and
     // kept, view render cached) so stepping to them is instant
-    if !interacting && !app.renderer.is_pending(Slot::Main) && app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.photo == id) {
+    if !camera_preview
+        && !interacting
+        && !app.renderer.is_pending(Slot::Main)
+        && app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.photo == id)
+    {
         let ids = app.session.visible_cloned();
         if let Some(i) = ids.iter().position(|p| *p == id) {
             let next = ids.get(i + 1).copied();
@@ -237,7 +251,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         }
     }
     // until the loupe has this photo: show its cached render / embedded preview / a thumbnail
-    if app.renderer.textures.get(&Slot::Main).is_none_or(|t| t.photo != id)
+    if (camera_preview || app.renderer.textures.get(&Slot::Main).is_none_or(|t| t.photo != id))
         && let Some(q) = app.session.quick_view_job(id, want.max(8), !crop_tool)
     {
         app.renderer.request_quick(Slot::Preview, q, 110);
@@ -253,7 +267,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // between photos, and the full render replaces them in place)
     let draw = |slot: Slot, r: Rect| -> &'static str {
         let mine = |s: Slot| app.renderer.textures.get(&s).filter(|t| t.photo == id);
-        let (tex, what) = if let Some(t) = mine(slot) {
+        let (tex, what) = if camera_preview && let Some(t) = mine(Slot::Preview) {
+            (t, t.quick.map(quick_name).unwrap_or("preview"))
+        } else if let Some(t) = mine(slot) {
             (t, "render")
         } else if let Some(t) = mine(Slot::Preview) {
             (t, t.quick.map(quick_name).unwrap_or("preview"))
@@ -311,6 +327,39 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         }
     }
     app.loupe_shown = Some((id, shown));
+    if crate::folder::active(app) && !fullscreen {
+        let quality = if shown == "embedded" {
+            "Camera preview"
+        } else if matches!(shown, "thumb" | "small" | "none") {
+            "Loading preview"
+        } else if photo.preview_only.is_some() {
+            "Preview only"
+        } else if photo.kind == lightcraft_catalog::MediaKind::Raw {
+            "Developed RAW"
+        } else {
+            "Image"
+        };
+        let scale = match app.ui.zoom {
+            Zoom::Percent(100)
+                if shown == "render"
+                    && app
+                        .renderer
+                        .textures
+                        .get(&Slot::Main)
+                        .is_some_and(|texture| texture.photo == id && texture.size[0].max(texture.size[1]) >= native[0].max(native[1])) =>
+            {
+                "100% · image pixel = display pixel"
+            }
+            Zoom::Percent(100) => "100% · waiting for full detail",
+            Zoom::Percent(_) => "Zoomed",
+            _ => "Fit",
+        };
+        let label = format!("Cull · {quality} · {scale} · X moves to Rejected · Ctrl+Z undo");
+        let galley = p.layout_no_wrap(label, t.font(11.0), t.text);
+        let badge = Rect::from_min_size(canvas.left_bottom() + vec2(12.0, -28.0), galley.size() + vec2(16.0, 8.0));
+        p.rect_filled(badge, 4.0, t.chrome);
+        p.galley(badge.min + vec2(8.0, 4.0), galley, t.text);
+    }
     if app.ui.before_after == BeforeAfter::Split {
         let mid = img_rect.center().x;
         if let Some(tex) = app.renderer.textures.get(&Slot::Before).filter(|t| t.photo == id) {

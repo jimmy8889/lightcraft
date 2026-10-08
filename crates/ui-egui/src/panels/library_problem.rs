@@ -57,7 +57,7 @@ fn open(app: &mut LightcraftApp, path: Option<String>) {
         Ok(_) => {
             let files = app.library_problem.take().map(|p| p.pending_import).unwrap_or_default();
             if !files.is_empty() {
-                let _ = app.run("library.import", json!({"paths": files}));
+                let _ = app.run("file.openPaths", json!({"paths": files}));
             }
         }
         Err(e) => {
@@ -145,7 +145,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
             }
             let files = app.library_problem.as_mut().map(|p| std::mem::take(&mut p.pending_import)).unwrap_or_default();
             if !files.is_empty() {
-                let _ = app.run("library.import", json!({"paths": files}));
+                let _ = app.run("file.openPaths", json!({"paths": files}));
             }
         }
         Some(Choice::Quit) => app.ui.quit = true,

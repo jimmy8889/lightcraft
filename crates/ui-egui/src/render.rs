@@ -196,6 +196,15 @@ impl Renderer {
         !self.request_needed(slot, key, priority)
     }
 
+    /// A culling thumbnail can keep its matching camera preview as the final texture.
+    pub fn quick_thumb_current(&self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize) -> bool {
+        let Some(&(ref old, size, key, quick)) = self.thumb_inputs.get(&photo.id) else { return false };
+        quick
+            && old.as_ptr() == Arc::as_ptr(photo)
+            && size == bucket
+            && self.textures.get(&Slot::ThumbQuick(photo.id)).is_some_and(|texture| texture.key == key)
+    }
+
     /// Remember the inputs of the thumbnail just requested (`quick`: through a stand-in).
     pub fn remember_thumb(&mut self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, key: u64, quick: bool) {
         if self.thumb_inputs.len() >= 1024 && !self.thumb_inputs.contains_key(&photo.id) {

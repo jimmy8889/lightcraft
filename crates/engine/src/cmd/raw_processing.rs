@@ -102,8 +102,14 @@ pub(crate) fn preserve_processing_packet(bytes: &[u8], packet: String) -> std::r
     .map_err(|e| e.to_string())
 }
 
+/// Frontends may default absent parameters to an object, but must preserve explicitly
+/// malformed RAW parameters so they cannot act on the current selection by accident.
+pub fn requires_object_params(id: &str) -> bool {
+    matches!(id, "photo.rawDenoise" | "photo.exportProcessedDng" | "folder.exportProcessedDng")
+}
+
 /// Strict local targets: explicit malformed input must never fall back to the selection.
-fn checked_targets(s: &Session, p: &Value, command: &str) -> Result<Vec<PhotoId>> {
+pub fn checked_targets(s: &Session, p: &Value, command: &str) -> Result<Vec<PhotoId>> {
     const MAX_TARGETS: usize = 10_000;
     let object = p.as_object().ok_or_else(|| bad(command, "params must be an object"))?;
     if object.contains_key("id") && object.contains_key("ids") {

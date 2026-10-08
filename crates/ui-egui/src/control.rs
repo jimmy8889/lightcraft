@@ -84,6 +84,8 @@ pub fn inspect(app: &LightcraftApp, ctx: &egui::Context) -> Value {
         "status": app.ui.status,
         "notices": app.notices,
         "quitPrompt": app.quit_prompt,
+        "rawProcessing": crate::processed_raw::status(app),
+        "sidecars": app.session.sidecar_status(),
         "unsaved": app.session.unsaved().map(|(n, e)| json!({"ops": n, "error": e})),
         "libraryProblem": app.library_problem.as_ref().map(crate::panels::library_problem::LibraryProblem::to_json),
         "scan": app.scan.as_ref().map(crate::import::ScanTask::status),
@@ -148,7 +150,11 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
     match req.method.as_str() {
         "engine.execute" | "ui.menu.invoke" | "command" => {
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
-            let params = p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
+            let params = p
+                .get("params")
+                .cloned()
+                .filter(|v| !v.is_null() || lightcraft_engine::cmd::raw_processing::requires_object_params(id))
+                .unwrap_or(json!({}));
             let r = app.run(id, params);
             ctx.request_repaint();
             wrap(r)
@@ -426,5 +432,37 @@ pub fn save_screenshot(app: &mut LightcraftApp, image: &egui::ColorImage, path: 
             Err(e) => json!({"ok": false, "error": e}),
         },
         None => json!({"ok": false, "error": "no writer configured"}),
+    }
+}
+
+#[cfg(test)]
+mod raw_parameter_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_null_never_runs_raw_commands_on_the_selected_photo() {
+        use lightcraft_engine::catalog::{MediaKind, Op, Photo, PhotoId, Source};
+        let mut app = LightcraftApp::new(lightcraft_engine::Session::new(), Default::default());
+        let id = PhotoId(1);
+        let mut photo = Photo::new(id, Source::File { path: "strict-parameters.ARW".into() }, "strict-parameters.ARW", "ARW", 10, 10, "2026-01-01");
+        photo.kind = MediaKind::Raw;
+        app.session.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+        app.session.execute("library.select", &json!({"ids":[id.0]})).unwrap();
+        app.session.execute("photo.rawDenoise", &json!({"strength":60})).unwrap();
+        let ctx = egui::Context::default();
+        for command in ["photo.rawDenoise", "photo.exportProcessedDng", "folder.exportProcessedDng"] {
+            for method in ["engine.execute", "ui.menu.invoke", "command"] {
+                let (request, _) = ControlRequest::new(method, json!({"command":command,"params":null}));
+                let Outcome::Done(reply) = handle(&mut app, &ctx, &request) else { panic!("unexpected screenshot") };
+                assert_eq!(reply["ok"], false, "{reply}");
+                assert!(reply["error"].as_str().unwrap().contains("must be an object"), "{reply}");
+                assert_eq!(app.session.develop_of(id).unwrap().detail.raw_denoise, 60.0);
+                assert!(!app.tasks.is_running("RAW Processing"));
+            }
+        }
+        let (request, _) = ControlRequest::new("engine.execute", json!({"command":"photo.rawDenoise"}));
+        let Outcome::Done(reply) = handle(&mut app, &ctx, &request) else { panic!("unexpected screenshot") };
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(app.session.develop_of(id).unwrap().detail.raw_denoise, 50.0);
     }
 }

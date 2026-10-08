@@ -272,7 +272,7 @@ impl ImportRun {
 /// window must keep answering meanwhile).
 pub struct ScanTask {
     progress: std::sync::Arc<ScanProgress>,
-    rx: std::sync::mpsc::Receiver<ScanOutput>,
+    rx: std::sync::mpsc::Receiver<Result<ScanOutput, String>>,
     /// Open the review with "copy into the library" checked (a camera / card).
     pub copy: bool,
     /// Browsing a folder (Local): the photos are read in place instead of opening the review.
@@ -292,7 +292,7 @@ pub fn open(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String
     let (tx, rx) = std::sync::mpsc::channel();
     let p = progress.clone();
     let job = move || {
-        let _ = tx.send(scan_with(input, &paths, &p));
+        let _ = tx.send(Ok(scan_with(input, &paths, &p)));
     };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(job);
@@ -314,7 +314,8 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
     if app.scan.as_ref().is_some_and(|t| !t.browse) || app.import.as_ref().is_some_and(|t| !t.browse) {
         return Err("an import is running".into());
     }
-    let dir_s = dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    let dir_s =
+        if dir.parent().is_none() { dir.to_string_lossy().to_string() } else { dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string() };
     let subfolders = subfolders.unwrap_or_else(|| app.session.browse.as_ref().is_some_and(|b| b.subfolders));
     let running = app.scan.as_ref().is_some_and(|t| t.browse) || app.import.as_ref().is_some_and(|t| t.browse);
     if running && app.session.browse.as_ref().is_some_and(|b| b.path == dir_s && b.subfolders == subfolders) {
@@ -326,34 +327,35 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
         t.progress.cancel.store(true, Ordering::Relaxed);
     }
     app.import = None;
+    // Recover incomplete moves and reconcile catalog paths before scanning originals.
+    if lightcraft_engine::find_command("cull.recover").is_some() {
+        app.session.execute("cull.recover", &json!({"folder": dir_s})).map_err(|e| e.to_string())?;
+    }
+    // Ordinary Local browsing retains its grid/editor view. Explicit Open Folder
+    // enters the culling workspace; later folder navigation keeps that workspace.
+    if app.ui.folder_cull {
+        crate::folder::entered(app, &dir_s);
+    }
     app.session.browse = Some(lightcraft_engine::Browse { path: dir_s.clone(), subfolders });
     app.session.source = lightcraft_engine::LibrarySource::Folder;
-    let (input, _) = ScanInput::new(&mut app.session, std::slice::from_ref(&dir_s));
     let progress = std::sync::Arc::new(ScanProgress::default());
     let (tx, rx) = std::sync::mpsc::channel();
     let p = progress.clone();
     let root = dir_s.clone();
     let job = move || {
-        let files: Vec<String> = if subfolders {
-            lightcraft_engine::import::expand(&[root], None)
-        } else {
-            let mut v: Vec<String> = std::fs::read_dir(&root)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .filter(|f| {
-                            f.is_file()
-                                && lightcraft_engine::import::is_supported(f)
-                                && !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))
-                        })
-                        .map(|f| f.to_string_lossy().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            v.sort();
-            v
+        let files = match crate::folder::scan_paths(&root, subfolders) {
+            Ok(files) => files,
+            Err(e) => {
+                log::warn!("folder scan: {e}");
+                let _ = tx.send(Err(e));
+                return;
+            }
         };
-        let _ = tx.send(scan_with(input, &files, &p));
+        // Folder work needs no import review: stream the existing import worker's batches
+        // instead of probing the entire shoot before the first image can appear.
+        let candidates =
+            files.into_iter().take_while(|_| !p.cancel.load(Ordering::Relaxed)).map(|path| ImportCandidate { path, ..Default::default() }).collect();
+        let _ = tx.send(Ok(ScanOutput { candidates, probes: Default::default() }));
     };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(job);
@@ -369,7 +371,12 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
     let Some(task) = app.scan.as_ref() else { return };
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
     let out = match task.rx.try_recv() {
-        Ok(o) => o,
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            app.scan = None;
+            app.toast_error(ctx, e);
+            return;
+        }
         Err(std::sync::mpsc::TryRecvError::Empty) => return,
         Err(_) => {
             app.scan = None;
@@ -547,15 +554,23 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     finish(app, ctx, task);
 }
 
-/// Add one readied batch to the catalog (an undo step merged into the import's at the end).
+/// Add a readied batch. Regular imports keep an undo step; folder discoveries preserve edit history.
 fn commit_batch(app: &mut LightcraftApp, task: &mut ImportTask, prepared: lightcraft_engine::import::Prepared) {
     let Some(run) = task.run.as_ref() else { return };
     let n = prepared.len();
     let (opts, now, album, album_name) = (&run.opts, run.now.as_str(), run.album, run.album_name.clone());
+    let undo_before = app.session.undo.len();
+    let redo_before = task.browse.then(|| std::mem::take(&mut app.session.redo));
     let r = app.session.execute_fn("library.import", |s| {
         let report = lightcraft_engine::import::commit_prepared(s, opts, now, prepared)?;
         lightcraft_engine::cmd::library::import_batch_done(s, report, album, album_name.as_deref())
     });
+    if let Some(redo) = redo_before {
+        // Discoveries are durable catalog bookkeeping, rather than user import/edit undo steps.
+        // Preserve edits made between arriving batches and their existing redo history.
+        app.session.undo.truncate(undo_before);
+        app.session.redo = redo;
+    }
     match r {
         Ok(v) => {
             // a new album (named in the params) is created with the first photos; later batches join it
@@ -585,9 +600,11 @@ fn commit_batch(app: &mut LightcraftApp, task: &mut ImportTask, prepared: lightc
 
 /// The import is done (or cancelled): one undo step, select the first photo, say what happened.
 fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
-    let steps = app.session.undo.len().saturating_sub(task.undo0);
-    let label = crate::i18n::tr_format!("Add {} Photo{}", task.imported, if task.imported == 1 { "" } else { "s" });
-    app.session.merge_undo(steps, &label);
+    if !task.browse {
+        let steps = app.session.undo.len().saturating_sub(task.undo0);
+        let label = crate::i18n::tr_format!("Add {} Photo{}", task.imported, if task.imported == 1 { "" } else { "s" });
+        app.session.merge_undo(steps, &label);
+    }
     if task.auto {
         if task.imported > 0 {
             app.toast(ctx, format!("Auto Import: added {} photo{}", task.imported, if task.imported == 1 { "" } else { "s" }));

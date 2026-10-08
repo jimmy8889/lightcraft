@@ -438,8 +438,14 @@ fn group_header(app: &mut LightcraftApp, ui: &mut egui::Ui, run: &DateRun, ids: 
 /// render then follows in the background.
 pub fn request_thumb(app: &mut LightcraftApp, id: PhotoId, size: usize, priority: u32) {
     let bucket = lightcraft_engine::media::thumb_bucket(size);
+    let preview_only = crate::folder::active(app)
+        && app
+            .session
+            .catalog
+            .photo(id)
+            .is_some_and(|photo| photo.kind == lightcraft_catalog::MediaKind::Raw && lightcraft_engine::import::has_import_look(photo));
     if let Some(photo) = app.session.catalog.photo(id)
-        && app.renderer.thumb_current(photo, bucket, priority)
+        && (app.renderer.thumb_current(photo, bucket, priority) || preview_only && app.renderer.quick_thumb_current(photo, bucket))
     {
         return;
     }
@@ -455,7 +461,7 @@ pub fn request_thumb(app: &mut LightcraftApp, id: PhotoId, size: usize, priority
     match quick {
         Some(q) => {
             app.renderer.request_quick(Slot::ThumbQuick(id), q, priority + 1);
-            if !app.renderer.is_pending(Slot::ThumbQuick(id)) {
+            if !preview_only && !app.renderer.is_pending(Slot::ThumbQuick(id)) {
                 app.renderer.request(Slot::Thumb(id), job, BACKGROUND_THUMB_PRIORITY);
             }
         }

@@ -161,7 +161,7 @@ impl Server {
             "tools/list" => Ok(json!({"tools": tool_definitions(self.backend.as_mut(), self.command_tools)})),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
-                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 Ok(call_tool(self.backend.as_mut(), name, &args).to_value())
             }
             "resources/list" => Ok(json!({"resources": [

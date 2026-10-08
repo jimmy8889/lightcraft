@@ -5,9 +5,9 @@
 //! The library (catalog, presets, thumbnail cache) lives in `--library DIR`, else
 //! `$LIGHTCRAFT_LIBRARY`, else the library last opened with Settings → Open Library…, else
 //! `~/Pictures/LightCraft Library`; a new library starts with the
-//! procedural demo photos unless `--no-demo` or files are given. Files and folders on the command
-//! line are imported (duplicates are skipped). `--memory` runs an in-memory session that writes
-//! nothing (demo photos unless files are given; used by the README showcase scripts). A library
+//! procedural demo photos only with `--demo`. Files and folders on the command
+//! line open directly in the folder workspace. `--memory` runs an in-memory session that writes
+//! no catalog data (explicit folder edits still write XMP); `--demo` shows procedural scenes. A library
 //! that can't be opened is never replaced silently: the window says why and asks what to do
 //! (`lightcraft_ui_egui::panels::library_problem`).
 //!
@@ -231,7 +231,7 @@ impl PrefsWriter {
 fn services() -> Services {
     Services {
         pick_folder: Some(Box::new(|| {
-            rfd::FileDialog::new().set_title(lightcraft_ui_egui::i18n::tr("Open Library")).pick_folder().map(|p| p.to_string_lossy().to_string())
+            rfd::FileDialog::new().set_title(lightcraft_ui_egui::i18n::tr("Choose Folder")).pick_folder().map(|p| p.to_string_lossy().to_string())
         })),
         open_with: Some(Box::new(|path: &str, app: &str| {
             // spawned, never waited for: the editor runs alongside
@@ -393,12 +393,13 @@ fn open_session(in_memory: bool, dir: Option<std::path::PathBuf>, seed_demo: boo
 const HELP: &str = "\
 lightcraft — photo library + raw developer
 
-USAGE: lightcraft [OPTIONS] [FILES/FOLDERS…]   (files and folders are imported)
+USAGE: lightcraft [OPTIONS] [FILES/FOLDERS…]   (files and folders open directly)
 
 OPTIONS:
   --library DIR    open (or create) this library (default: ~/Pictures/LightCraft Library; env LIGHTCRAFT_LIBRARY)
   --no-demo        don't seed a new library with the procedural demo photos
-  --memory         throwaway in-memory session (alias --demo); nothing is saved
+  --memory         throwaway catalog session (folder edits still write XMP)
+  --demo           show procedural demo photos in a throwaway session
   --control PORT   serve the JSON-lines control channel on 127.0.0.1:PORT (env LIGHTCRAFT_CONTROL_PORT;
                    see docs/control-protocol.md)
   --version, --help
@@ -445,7 +446,7 @@ fn main() -> eframe::Result {
     alloc_release::install();
     let mut control_port: Option<u16> = std::env::var("LIGHTCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
     let mut files = Vec::new();
-    let mut seed_demo = true;
+    let mut seed_demo = false;
     let mut in_memory = false;
     let mut library_dir: Option<std::path::PathBuf> = None;
     let mut args = std::env::args().skip(1);
@@ -454,7 +455,11 @@ fn main() -> eframe::Result {
             "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
             "--library" => library_dir = args.next().map(std::path::PathBuf::from),
             "--no-demo" => seed_demo = false,
-            "--memory" | "--demo" => in_memory = true,
+            "--memory" => in_memory = true,
+            "--demo" => {
+                in_memory = true;
+                seed_demo = true;
+            }
             "--version" => {
                 println!("lightcraft {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -515,6 +520,9 @@ fn main() -> eframe::Result {
             if let Some(ui) = prefs {
                 app.ui = ui;
             }
+            if app.session.catalog.photos().next().is_none() && !seed_demo {
+                app.ui.right = lightcraft_ui_egui::state::RightPanel::None;
+            }
             lightcraft_ui_egui::i18n::set_language(app.ui.language);
             app.integrated_titlebar = cfg!(target_os = "macos");
             app.notices.extend(prefs_warning);
@@ -539,8 +547,14 @@ fn main() -> eframe::Result {
                 p.pending_import = files;
                 app.library_problem = Some(p);
             } else if !files.is_empty() {
-                let _ = app.run("library.import", serde_json::json!({"paths": files}));
-                app.ui.view = lightcraft_ui_egui::state::ViewMode::PhotoGrid;
+                if let Err(e) = app.run("file.openPaths", serde_json::json!({"paths": files})) {
+                    app.notices.push(e);
+                }
+            } else if !in_memory && !seed_demo && !app.ui.folder_path.is_empty() {
+                let path = app.ui.folder_path.clone();
+                if let Err(e) = app.run("file.openFolder", serde_json::json!({"path": path})) {
+                    app.notices.push(e);
+                }
             }
             // native menu bar generated from the command registry (macOS; elsewhere the menus are
             // drawn in the window's top bar). LIGHTCRAFT_NO_NATIVE_MENU=1 keeps the in-window menus.

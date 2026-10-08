@@ -47,6 +47,8 @@ fn read(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if !ops.is_empty() {
         s.commit("Read Metadata from File", Op::Batch { ops })?;
+        // Reading is explicit conflict resolution; it must not immediately rewrite the packet.
+        s.skip_auto_write = true;
     }
     Ok(json!({"read": read, "failed": failed}))
 }
@@ -70,6 +72,24 @@ fn prefs(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "photo.retrySidecars",
+            "Retry Pending XMP Writes",
+            ["Photo"],
+            None,
+            "{} → {written, failed} — retry pending sidecars without bypassing conflict checks",
+            always,
+            |s, _| Ok(s.retry_sidecars())
+        ),
+        cmd!(
+            "photo.sidecarStatus",
+            "XMP Sidecar Status",
+            [],
+            None,
+            "{} → {pending:[{id,error}]} — edits saved in catalog but sidecar writes failed or conflicted",
+            always,
+            |s, _| Ok(s.sidecar_status())
+        ),
         cmd!(
             "photo.saveMetadataToFile",
             "Save Metadata to File",

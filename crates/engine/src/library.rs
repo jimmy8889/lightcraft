@@ -128,6 +128,9 @@ impl Library {
 #[serde(default, rename_all = "camelCase")]
 struct PrefsFile {
     xmp: crate::sidecar::XmpPrefs,
+    /// Last observed/written XMP packets; retained across reopen for conflict-safe folder edits.
+    sidecar_baselines: std::collections::BTreeMap<String, Option<String>>,
+    sidecar_pending: std::collections::BTreeMap<u64, String>,
     /// Parameters of the last export (for Export with Previous).
     #[serde(alias = "last_export")]
     last_export: Option<serde_json::Value>,
@@ -331,6 +334,8 @@ impl Session {
         // preferences
         let prefs = settings.read::<PrefsFile>(files.as_mut(), "prefs.json").unwrap_or_default();
         self.xmp = prefs.xmp;
+        self.restore_sidecar_baselines(prefs.sidecar_baselines);
+        self.restore_sidecar_pending(prefs.sidecar_pending);
         self.last_export = prefs.last_export;
         self.export_presets = prefs.export_presets;
         self.metadata_presets = prefs.metadata_presets;
@@ -525,6 +530,8 @@ impl Session {
     pub fn save_prefs(&mut self) -> Result<()> {
         let v = serde_json::to_vec_pretty(&PrefsFile {
             xmp: self.xmp,
+            sidecar_baselines: self.sidecar_baselines(),
+            sidecar_pending: self.sidecar_pending(),
             last_export: self.last_export.clone(),
             export_presets: self.export_presets.clone(),
             metadata_presets: self.metadata_presets.clone(),

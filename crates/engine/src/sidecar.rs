@@ -8,9 +8,10 @@
 //! An existing sidecar is never replaced wholesale (issue #92): LightCraft's properties
 //! ([`OWNED`], [`OWNED_IF_STATED`]) are merged into it ([`lightcraft_meta::merge_xmp`]) and
 //! everything else — another editor's `crs:` develop settings, `xmpMM` history, unknown
-//! namespaces — is kept byte for byte. A sidecar that can't be read as XMP is first copied to
-//! `<name>.xmp.bak-<time>` (never overwritten), then replaced. Writes are atomic (temp file,
-//! fsync, rename).
+//! namespaces — is kept byte for byte. Automatic writes refuse changed, malformed or untrusted
+//! packets and expose pending errors. An explicit manual save retains upstream recovery: unreadable
+//! XMP is copied to `<name>.xmp.bak-<time>` (never overwritten), then replaced. Writes are atomic
+//! (temp file, fsync, rename); observed packet fingerprints persist with library preferences.
 //!
 //! **Shared names** (Stem naming): `IMG_0001.CR3` and `IMG_0001.JPG` would share `IMG_0001.xmp`.
 //! When two catalogued files map to one stem sidecar, it belongs to one of them (a raw first, then
@@ -309,11 +310,6 @@ pub const OWNED: &[&str] = &[
 /// writes (`xmp:CreatorTool`) goes only into new sidecars.
 pub const OWNED_IF_STATED: &[&str] = &["exif:DateTimeOriginal", "photoshop:DateCreated", "exif:GPSLatitude", "exif:GPSLongitude"];
 
-/// Write `data` to `path` atomically: a temp file next to it, synced, then renamed over it.
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    lightcraft_catalog::safe_file::write_atomic(path, data)
-}
-
 /// Copy `path` to a new `<name>.bak-<stamp>` (`-1`, `-2`… if taken; never overwriting).
 fn backup(path: &Path, stamp: &str) -> std::io::Result<PathBuf> {
     use std::io::Write;
@@ -347,22 +343,27 @@ pub struct SidecarSaved {
 
 /// The new contents for the sidecar at `path`: `fresh` merged into the existing file, if any.
 /// Returns (contents, merged, backup).
-fn sidecar_contents(path: &Path, fresh: String, stamp: &str) -> std::io::Result<(String, bool, Option<PathBuf>)> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((fresh, false, None)),
-        // can't see what is there: never overwrite it blindly
-        Err(e) => return Err(e),
-    };
+fn sidecar_contents(
+    path: &Path,
+    fresh: String,
+    stamp: &str,
+    prior: Option<&[u8]>,
+    automatic: bool,
+) -> std::io::Result<(String, bool, Option<PathBuf>)> {
+    let Some(bytes) = prior else { return Ok((fresh, false, None)) };
     if bytes.iter().all(u8::is_ascii_whitespace) {
+        if automatic {
+            return Err(std::io::Error::other("empty or malformed XMP packet; automatic replacement refused"));
+        }
         return Ok((fresh, false, None));
     }
     let rules = lightcraft_meta::MergeRules { owned: OWNED, owned_if_present: OWNED_IF_STATED };
-    match std::str::from_utf8(&bytes)
+    match std::str::from_utf8(bytes)
         .map_err(|e| e.to_string())
         .and_then(|old| lightcraft_meta::merge_xmp(old, &fresh, rules).map_err(|e| e.to_string()))
     {
         Ok(merged) => Ok((merged, true, None)),
+        Err(why) if automatic => Err(std::io::Error::other(format!("malformed XMP ({why}); automatic replacement refused"))),
         Err(why) => {
             let b = backup(path, stamp)?;
             log::warn!("{}: not readable as XMP ({why}); kept a copy as {} before replacing it", path.display(), b.display());
@@ -385,10 +386,9 @@ fn file_path(p: &Photo) -> Option<&str> {
 
 /// The XMP packet that describes a photo on disk: its sidecar, else (raw/DNG) the embedded XMP.
 pub fn read_packet(original: &str, kind: MediaKind, naming: SidecarNaming) -> Option<(String, PathBuf)> {
-    if let Some(sc) = find_sidecar(original, naming)
-        && let Ok(s) = std::fs::read_to_string(&sc)
-    {
-        return Some((s, sc));
+    if let Some(sc) = find_sidecar(original, naming) {
+        let bytes = crate::sidecar_guard::read(&sc).ok()??;
+        return String::from_utf8(bytes).ok().map(|packet| (packet, sc));
     }
     if kind == MediaKind::Raw {
         let bytes = std::fs::read(original).ok()?;
@@ -458,15 +458,44 @@ impl Session {
     }
 
     pub(crate) fn save_sidecar_with(&self, id: PhotoId, owners: &StemOwners) -> Result<SidecarSaved> {
+        self.save_sidecar_checked(id, owners, false)
+    }
+
+    fn save_sidecar_checked(&self, id: PhotoId, owners: &StemOwners, automatic: bool) -> Result<SidecarSaved> {
+        let result = self.save_sidecar_inner(id, owners, automatic);
+        self.record_sidecar_result(id, &result);
+        result
+    }
+
+    fn save_sidecar_inner(&self, id: PhotoId, owners: &StemOwners, automatic: bool) -> Result<SidecarSaved> {
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         if p.copy_of.is_some() {
             return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the library", p.file_name)));
         }
         let orig = file_path(p).ok_or_else(|| EngineError::Other(format!("{} is not a file on disk", p.file_name)))?;
         let path = sidecar_path(orig, owners.naming(p, self.xmp.naming));
+        let upper = path.with_extension("XMP");
+        let path = if !path.exists() && upper.exists() { upper } else { path };
         let err = |e: std::io::Error| EngineError::Other(format!("{}: {e}", path.display()));
-        let (data, merged, backup) = sidecar_contents(&path, sidecar_packet(p, &self.catalog), &(self.clock)()).map_err(err)?;
-        write_atomic(&path, data.as_bytes()).map_err(err)?;
+        let prior = crate::sidecar_guard::read(&path).map_err(err)?;
+        let expected = crate::sidecar_guard::fingerprint(prior.as_deref());
+        if automatic {
+            self.check_sidecar(&path, &expected).map_err(err)?;
+        }
+        let (data, merged, backup) =
+            sidecar_contents(&path, sidecar_packet(p, &self.catalog), &(self.clock)(), prior.as_deref(), automatic).map_err(err)?;
+        // Check again after producing the temp file, immediately before the durable atomic
+        // writer installs it. This detects external changes during serialization/encoding.
+        lightcraft_catalog::safe_file::write_atomic_with(&path, &mut |writer| {
+            writer.write_all(data.as_bytes())?;
+            let current = crate::sidecar_guard::read(&path)?;
+            if crate::sidecar_guard::fingerprint(current.as_deref()) != expected {
+                return Err(std::io::Error::other("XMP changed while preparing its replacement; save refused"));
+            }
+            Ok(())
+        })
+        .map_err(err)?;
+        self.observe_sidecar(crate::sidecar_guard::Snapshot { path: path.clone(), hash: crate::sidecar_guard::fingerprint(Some(data.as_bytes())) });
         Ok(SidecarSaved { path, merged, backup })
     }
 
@@ -474,10 +503,28 @@ impl Session {
     pub fn read_sidecar_op(&self, id: PhotoId) -> Result<Option<(Op, PathBuf)>> {
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         let Some(orig) = file_path(p) else { return Ok(None) };
-        let Some((packet, from)) = read_packet(orig, p.kind, self.sidecar_naming(id)) else { return Ok(None) };
+        let naming = self.sidecar_naming(id);
+        let packet = if let Some(path) = find_sidecar(orig, naming) {
+            let bytes = crate::sidecar_guard::read(&path).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+            match bytes {
+                Some(bytes) => Some((String::from_utf8(bytes).map_err(|e| EngineError::Other(e.to_string()))?, path)),
+                None => None,
+            }
+        } else {
+            read_packet(orig, p.kind, naming)
+        };
+        let Some((packet, from)) = packet else { return Ok(None) };
         let sc = parse_sidecar(&packet, p.kind == MediaKind::Raw)
             .map_err(|e| EngineError::Other(format!("{}: {e}", from.display())))?
             .resolve_label(&self.catalog);
+        if from != Path::new(orig) {
+            crate::sidecar_guard::validate_path(&from).map_err(|e| EngineError::Other(e.to_string()))?;
+            self.observe_sidecar(crate::sidecar_guard::Snapshot {
+                path: from.clone(),
+                hash: crate::sidecar_guard::fingerprint(Some(packet.as_bytes())),
+            });
+        }
+        self.clear_sidecar_error(id);
         let mut q = (**p).clone();
         let develop_changed = merge_into(&mut q, &sc, &(self.clock)());
         let mut ops = vec![
@@ -495,20 +542,45 @@ impl Session {
         Ok(Some((Op::Batch { ops }, from)))
     }
 
-    /// Auto-write: sidecars for photos changed by `ops` (errors are logged, not returned).
-    pub(crate) fn auto_write_sidecars(&self, ops: &[Op]) {
+    /// Retry failed writes without bypassing conflict/malformed-packet guards.
+    pub fn retry_sidecars(&self) -> Value {
+        let owners = StemOwners::of(&self.catalog);
+        let mut written = Vec::new();
+        let mut failed = Vec::new();
+        for (id, _) in self.sidecar_errors() {
+            match self.save_sidecar_checked(id, &owners, true) {
+                Ok(saved) => written.push(saved.path.display().to_string()),
+                Err(error) => failed.push(serde_json::json!({"id": id.0, "error": error.to_string()})),
+            }
+        }
+        serde_json::json!({"written": written, "failed": failed})
+    }
+
+    /// Auto-write failures are visible and queryable; catalog changes remain durable.
+    pub(crate) fn auto_write_sidecars(&self, ops: &[Op]) -> Result<()> {
         let mut ids = Vec::new();
         ops.iter().for_each(|o| op_photos(o, &mut ids));
-        if ids.is_empty() {
-            return;
-        }
         let owners = StemOwners::of(&self.catalog);
+        let mut failures = Vec::new();
+        let mut failed_count = 0usize;
         for id in ids {
             if self.catalog.photo(id).is_some_and(|p| file_path(p).is_some() && p.copy_of.is_none())
-                && let Err(e) = self.save_sidecar_with(id, &owners)
+                && let Err(error) = self.save_sidecar_checked(id, &owners, true)
             {
-                log::warn!("auto-write XMP: {e}");
+                log::warn!("auto-write XMP: {error}");
+                failed_count += 1;
+                if failures.len() < 8 {
+                    failures.push(error.to_string());
+                }
             }
+        }
+        if failed_count == 0 {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!(
+                "Edits are saved in the catalog, but XMP is pending for {failed_count} photo(s): {}",
+                failures.join("; ")
+            )))
         }
     }
 }

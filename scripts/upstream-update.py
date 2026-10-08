@@ -22,7 +22,7 @@ class UpdateError(Exception):
 
 def run(args, cwd, *, check=True, capture=True):
     result = subprocess.run(
-        args, cwd=cwd, text=True, capture_output=capture, check=False
+        args, cwd=cwd, text=True, encoding="utf-8", capture_output=capture, check=False
     )
     if check and result.returncode:
         detail = (result.stderr or result.stdout or "").strip() if capture else ""
@@ -81,11 +81,11 @@ def prepare(args):
 
     def save(status):
         report["status"] = status
-        (report_dir / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        (report_dir / "result.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2))
 
     result = git(candidate, "merge", "--no-ff", "--no-commit", tip, check=False)
-    (report_dir / "merge.log").write_text((result.stdout or "") + (result.stderr or ""))
+    (report_dir / "merge.log").write_text((result.stdout or "") + (result.stderr or ""), encoding="utf-8")
     if result.returncode:
         save("merge-needs-review")
         print("Conflict state is preserved in the candidate worktree; the source branch is unchanged.", file=sys.stderr)
@@ -94,7 +94,7 @@ def prepare(args):
     inventory_changed = False
     if inventory.is_file():
         try:
-            data = json.loads(inventory.read_text())
+            data = json.loads(inventory.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("custom inventory must be an object")
             previous = (data.get("upstream_base"), data.get("upstream_version"))
@@ -106,12 +106,12 @@ def prepare(args):
                 data["upstream_base"] = tip
             cargo_manifest = candidate / "Cargo.toml"
             if cargo_manifest.is_file():
-                package = tomllib.loads(cargo_manifest.read_text()).get("workspace", {}).get("package", {})
+                package = tomllib.loads(cargo_manifest.read_text(encoding="utf-8")).get("workspace", {}).get("package", {})
                 if not older_ref and isinstance(package.get("version"), str):
                     data["upstream_version"] = "v" + package["version"]
             inventory_changed = previous != (data.get("upstream_base"), data.get("upstream_version"))
             if inventory_changed:
-                inventory.write_text(json.dumps(data, indent=2) + "\n")
+                inventory.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         except (OSError, ValueError, TypeError, AttributeError) as error:
             report["error"] = str(error)
             save("inventory-needs-review")
@@ -127,7 +127,7 @@ def prepare(args):
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     checks = [[sys.executable, "scripts/check-custom-features.py"], ["cargo", "xtask", "ci"]]
     for number, command in enumerate(checks, 1):
-        with (report_dir / f"check-{number}.log").open("w") as log:
+        with (report_dir / f"check-{number}.log").open("w", encoding="utf-8") as log:
             result = subprocess.run(command, cwd=candidate, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
         if result.returncode:
             save("checks-failed")

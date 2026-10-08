@@ -14,7 +14,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     errors = []
     try:
-        data = json.loads((root / "docs/custom/features.json").read_text())
+        data = json.loads((root / "docs/custom/features.json").read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("schema") != 1:
             raise ValueError("unknown custom feature schema")
         ids = set()
@@ -35,7 +35,7 @@ def main():
                     errors.append(f"{fid}: missing or invalid file {name}")
             for check in feature["checks"]:
                 path = (root / check["file"]).resolve()
-                if not path.is_relative_to(root) or not path.is_file() or check["contains"] not in path.read_text():
+                if not path.is_relative_to(root) or not path.is_file() or check["contains"] not in path.read_text(encoding="utf-8"):
                     errors.append(f"{fid}: missing hook in {check['file']}")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         errors.append(str(error))

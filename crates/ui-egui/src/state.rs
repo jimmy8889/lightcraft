@@ -211,6 +211,21 @@ pub struct UiState {
     /// a later save succeeds).
     #[serde(skip)]
     pub unsaved_seen: bool,
+    #[serde(skip)]
+    pub sidecar_error_seen: Option<String>,
+    /// Last directly opened folder, restored by the desktop host (catalog remains an index).
+    pub folder_path: String,
+    /// Explicit culling workspace; editing panels temporarily suspend its keyboard bindings.
+    pub folder_cull: bool,
+    /// Edit-stack depths at this session's reversible file rejections. Real edits added later
+    /// are undone first; after restart, file Undo is recovered from the durable culling journal.
+    #[serde(skip)]
+    pub folder_undo_actions: Vec<usize>,
+    #[serde(skip)]
+    pub folder_undo_floor: usize,
+    /// File supplied on the command line, selected when its folder finishes reading.
+    #[serde(skip)]
+    pub folder_pending_file: Option<String>,
     pub view: ViewMode,
     pub left_panel: bool,
     pub right: RightPanel,
@@ -543,7 +558,13 @@ impl Default for UiState {
             language: crate::i18n::default_language(),
             preview_build_seen: None,
             unsaved_seen: false,
+            sidecar_error_seen: None,
             luminance_map_restore: None,
+            folder_path: String::new(),
+            folder_cull: false,
+            folder_undo_actions: Vec::new(),
+            folder_undo_floor: 0,
+            folder_pending_file: None,
             view: ViewMode::Detail,
             left_panel: false,
             left_width: LEFT_WIDTH.default,

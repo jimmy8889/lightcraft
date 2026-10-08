@@ -24,9 +24,27 @@
     {
       "id": "CUSTOM-002",
       "name": "Folder-first culling workspace",
-      "status": "in-progress",
-      "files": [],
-      "checks": []
+      "status": "implemented",
+      "files": [
+        "crates/ui-egui/src/folder.rs",
+        "crates/ui-egui/src/import.rs",
+        "crates/ui-egui/src/processed_raw.rs",
+        "apps/lightcraft/src/main.rs"
+      ],
+      "checks": [
+        {
+          "file": "crates/ui-egui/src/folder.rs",
+          "contains": "first_folder_batch_arrives_before_later_files_finish_probing"
+        },
+        {
+          "file": "crates/ui-egui/src/folder.rs",
+          "contains": "file_rejection_shortcut_and_ctrl_z_restore_complete_group"
+        },
+        {
+          "file": "crates/ui-egui/src/processed_raw.rs",
+          "contains": "photo.exportProcessedDng"
+        }
+      ]
     },
     {
       "id": "CUSTOM-003",
@@ -90,9 +108,26 @@
     {
       "id": "CUSTOM-006",
       "name": "Persistent XMP conflict checks and visible save failures",
-      "status": "in-progress",
-      "files": [],
-      "checks": []
+      "status": "implemented",
+      "files": [
+        "crates/engine/src/sidecar_guard.rs",
+        "crates/engine/src/sidecar.rs",
+        "crates/engine/src/library.rs"
+      ],
+      "checks": [
+        {
+          "file": "crates/engine/src/sidecar_guard.rs",
+          "contains": "ordinary_reopen_uses_saved_baseline_but_foreign_edit_after_restart_conflicts"
+        },
+        {
+          "file": "crates/engine/src/sidecar_guard.rs",
+          "contains": "malformed_sidecar_is_never_automatically_replaced_or_backed_up"
+        },
+        {
+          "file": "crates/engine/src/cmd/xmp.rs",
+          "contains": "photo.retrySidecars"
+        }
+      ]
     },
     {
       "id": "CUSTOM-007",

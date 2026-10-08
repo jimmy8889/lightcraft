@@ -16,7 +16,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin { left, right: 12, top: 0, bottom: 0 }))
         .show(ui, |ui| {
             let full = ui.max_rect();
-            let mut sw = 640.0f32.min(full.width() - 460.0).max(200.0);
+            let mut sw = 640.0f32.min(full.width() - 750.0).max(200.0);
             if !app.native_menu {
                 // leave room for the in-window menus left of the (centred) search field
                 let menus_right = full.left() + 140.0 + crate::menubar::bar_width(ui) + 24.0;
@@ -109,6 +109,28 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             if fresp.clicked() {
                 let _ = app.run("view.filterBar", json!({}));
             }
+            // Direct folder workflow is always reachable, independent of catalog/import menus.
+            let r = Rect::from_center_size(pos2(full.right() - 278.0, full.center().y), vec2(100.0, 28.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
+            let response = child.add_visible(
+                full.width() >= 1000.0,
+                egui::Button::new(if crate::folder::active(app) {
+                    "Develop"
+                } else if app.session.source == lightcraft_engine::LibrarySource::Folder {
+                    "Cull"
+                } else {
+                    "Open Folder…"
+                })
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .min_size(vec2(100.0, 28.0)),
+            );
+            register(ui.ctx(), "button:folderWorkspace", response.rect);
+            if response.clicked() {
+                let command = if app.session.source == lightcraft_engine::LibrarySource::Folder { "folder.cullMode" } else { "file.openFolder" };
+                if let Err(e) = app.run(command, json!({})) {
+                    app.toast(ui.ctx(), e);
+                }
+            }
             // right icons
             let mut x = full.right() - 18.0;
             // saving is failing: the cloud icon turns into a warning until a save succeeds
@@ -121,7 +143,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     n = n
                 )
             });
-            let cloud_tip = unsaved.as_deref().unwrap_or("Local library — no cloud account needed");
+            let (sidecar_pending, error) = app.session.sidecar_summary();
+            let sidecar_warning = error.map(|error| format!("{sidecar_pending} XMP sidecar(s) pending; edits are saved in the catalog. {error}"));
+            let cloud_tip = unsaved.as_deref().or(sidecar_warning.as_deref()).unwrap_or("Local library — no cloud account needed");
             for (id, icon, tip, cmd) in [
                 ("discord", Icon::Chat, "Join the ArtCraft community on Discord", "app.discord"),
                 ("cloud", Icon::Cloud, cloud_tip, ""),
@@ -132,7 +156,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 let r = Rect::from_center_size(pos2(x, full.center().y), vec2(28.0, 28.0));
                 let resp = ui.interact(r, egui::Id::new(("top", id)), Sense::click()).on_hover_text(tip);
                 register(ui.ctx(), format!("icon:{id}"), r);
-                let warn = id == "cloud" && unsaved.is_some();
+                let warn = id == "cloud" && (unsaved.is_some() || sidecar_warning.is_some());
                 let colour = if warn {
                     t.caution
                 } else if resp.hovered() {
@@ -145,7 +169,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     let c = r.right_top() + vec2(-5.0, 6.0);
                     ui.painter().circle_filled(c, 6.0, t.reject);
                     ui.painter().text(c, Align2::CENTER_CENTER, "!", t.semibold(9.5), t.canvas);
-                    register(ui.ctx(), "indicator:unsaved", r);
+                    register(ui.ctx(), if unsaved.is_some() { "indicator:unsaved" } else { "indicator:sidecarPending" }, r);
                 }
                 if resp.clicked() && !cmd.is_empty() {
                     let _ = app.run(cmd, json!({}));

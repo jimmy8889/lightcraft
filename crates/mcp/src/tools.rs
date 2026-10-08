@@ -434,7 +434,10 @@ fn obj(args: &Value, keys: &[&str]) -> Value {
 
 /// Run one tool.
 pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> ToolResult {
-    let args = if args.is_null() { &json!({}) } else { args };
+    let strict = name
+        .strip_prefix(COMMAND_TOOL_PREFIX)
+        .is_some_and(|id| lightcraft_engine::cmd::raw_processing::requires_object_params(&id.replace('_', ".")));
+    let args = if args.is_null() && !strict { &json!({}) } else { args };
     if !args.is_object() {
         return ToolResult::error("tool arguments must be an object");
     }
@@ -461,7 +464,14 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> ToolResult {
             }))
         }
         "run_command" => match s("command") {
-            Some(c) => ToolResult::from(exec(b, c, args.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})))),
+            Some(c) => ToolResult::from(exec(
+                b,
+                c,
+                args.get("params")
+                    .cloned()
+                    .filter(|p| !p.is_null() || lightcraft_engine::cmd::raw_processing::requires_object_params(c))
+                    .unwrap_or(json!({})),
+            )),
             None => ToolResult::error("missing `command`"),
         },
         "import" => {

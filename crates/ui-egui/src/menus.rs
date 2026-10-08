@@ -40,6 +40,14 @@ pub fn language_from_command(id: &str) -> Option<crate::i18n::Locale> {
 }
 
 pub const UI_COMMANDS: &[UiCommand] = &[
+    ("file.openFolder", "Open Folder…", Some("Cmd+O"), "File"),
+    ("file.openPaths", "Open Files or Folders", None, ""),
+    ("folder.cullMode", "Folder Culling Workspace", None, "View"),
+    ("folder.refresh", "Refresh Folder", Some("F5"), "File"),
+    ("folder.reject", "Move to Rejected", None, "Photo"),
+    ("folder.undo", "Undo Folder Culling", None, "Edit"),
+    ("folder.exportProcessedDng", "Save Cleaned DNG in Processed", None, ""),
+    ("folder.cancelProcessedDng", "Cancel RAW Processing", None, ""),
     ("view.photoGrid", "Photo Grid", None, "View"),
     ("view.squareGrid", "Square Grid", None, "View"),
     // G: Photo Grid ↔ Square Grid (from other views: the photo grid)

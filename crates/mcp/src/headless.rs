@@ -98,7 +98,11 @@ impl Backend for Headless {
         match method {
             "engine.execute" | "ui.menu.invoke" | "command" => {
                 let id = p.get("command").or(p.get("id")).and_then(Value::as_str).ok_or("missing `command`")?;
-                let params = p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
+                let params = p
+                    .get("params")
+                    .cloned()
+                    .filter(|v| !v.is_null() || lightcraft_engine::cmd::raw_processing::requires_object_params(id))
+                    .unwrap_or(json!({}));
                 if id == "app.export" {
                     return self.export(&params);
                 }
@@ -187,6 +191,35 @@ pub fn write_image(path: &Path, img: &Rgba8, quality: u8) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_null_raw_parameters_survive_control_and_mcp_dispatch() {
+        use lightcraft_engine::catalog::{MediaKind, Op, Photo, Source};
+        let mut h = Headless::new(Session::new());
+        let id = PhotoId(1);
+        let mut photo = Photo::new(id, Source::File { path: "strict-parameters.ARW".into() }, "strict-parameters.ARW", "ARW", 10, 10, "2026-01-01");
+        photo.kind = MediaKind::Raw;
+        h.session.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+        h.session.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+        h.session.execute("photo.rawDenoise", &json!({"strength":60})).unwrap();
+        for command in ["photo.rawDenoise", "photo.exportProcessedDng"] {
+            for method in ["engine.execute", "ui.menu.invoke", "command"] {
+                let error = h.call(method, json!({"command":command,"params":null})).unwrap_err();
+                assert!(error.contains("params must be an object"), "{error}");
+            }
+            assert!(crate::call_tool(&mut h, "run_command", &json!({"command":command,"params":null})).is_error);
+            assert!(crate::call_tool(&mut h, &crate::command_tool_name(command), &Value::Null).is_error);
+            assert_eq!(h.session.develop_of(id).unwrap().detail.raw_denoise, 60.0);
+        }
+        // Absent params still deliberately use command defaults, including MCP's omitted arguments.
+        h.call("engine.execute", json!({"command":"photo.rawDenoise"})).unwrap();
+        assert_eq!(h.session.develop_of(id).unwrap().detail.raw_denoise, 50.0);
+        let mut server = crate::Server::new(Box::new(h));
+        let reply = server
+            .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":crate::command_tool_name("photo.rawDenoise")}}))
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false);
+    }
 
     /// `app.export` without `ids` exports the selection (as the desktop app does), else the active photo.
     #[test]

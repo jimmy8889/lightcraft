@@ -83,6 +83,9 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() {
         return;
     }
+    if crate::folder::handle_keys(app, ctx) {
+        return;
+    }
     let mut fire: Vec<String> = Vec::new();
     // shortcuts the native menu bar handles (it consumes those key presses itself)
     let native = |sc: &str| app.native_shortcuts.contains(sc);

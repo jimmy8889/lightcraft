@@ -525,7 +525,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 .or(v.get("method"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("{path}:{}: needs `command` or `method`", n + 1))?;
-            let params = v.get("params").cloned().filter(|p| p.is_object()).unwrap_or_else(|| json!({}));
+            let params = v
+                .get("params")
+                .cloned()
+                .filter(|p| p.is_object() || lightcraft_engine::cmd::raw_processing::requires_object_params(id))
+                .unwrap_or_else(|| json!({}));
             steps.push(Step { id: id.to_string(), params });
         }
     }

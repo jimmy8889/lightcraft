@@ -75,12 +75,14 @@ fn unopenable_library_asks_instead_of_running_a_demo() {
     assert!(!has(&h, "button:libraryRetry"));
     assert!(has(&h, "indicator:temporarySession"));
     assert!(h.app.session.library.is_none());
+    assert!(h.settle(T), "the command-line folder opens in background batches");
     assert_eq!(h.app.session.catalog.len(), 1, "the command-line photo is imported into the temporary session");
     if let Some(p) = std::env::var_os("LIGHTCRAFT_TEST_SHOTS") {
         let r = h.request("ui.screenshot", json!({"path": std::path::Path::new(&p).join("banner.png").to_string_lossy(), "headless": true}), T);
         assert_eq!(r["ok"], true, "{r}");
     }
     h.request("engine.execute", json!({"command": "photo.rate", "params": {"rating": 3}}), T);
+    assert!(!dir.join("a.xmp").exists(), "Continue Without Saving must not automatically save folder edits");
     let after: Vec<_> = std::fs::read_dir(&lib).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after, "the temporary session never writes to the library");
 

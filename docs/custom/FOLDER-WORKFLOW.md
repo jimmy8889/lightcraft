@@ -7,6 +7,12 @@ and how future creator updates are tested without replacing custom work.
 
 ## Working directly in a folder
 
+The target camera is the **Sony A1 II (ILCE-1M2)**. The target kit is Sony
+FE 14mm F1.8 GM, FE 24mm F1.4 GM, FE 50mm F1.4 GM, FE 70–200mm
+F2.8 GM OSS II, FE 300mm F2.8 GM OSS and the Viltrox Sony E 2× converter
+(TC-2.0X). Lens recognition, RAW decoding and measured optical calibration
+are separate checks; missing calibration does not prevent folder culling.
+
 The desktop host opens a supplied file or folder in place. The catalog remains
 a metadata index and cache; originals stay in their existing folder.
 
@@ -32,7 +38,7 @@ reintroducing moved paths. The 100% view also depends on the GPU texture limit;
 it is not a guarantee that every camera resolution fits a single texture.
 
 Recursive scans skip `Rejected`, `Processed` and internal workflow folders.
-An explicitly opened output folder remains inspectable. Refresh reads new files.
+An explicitly opened output folder remains inspectable. Refresh (`F5`) reads new files.
 
 ## Safe rejection and sidecars
 
@@ -49,10 +55,9 @@ Windows read-only source files are refused without changing their attributes.
 Windows does not expose Unix directory syncing through Rust's standard library;
 native power-loss recovery must be validated separately on the target storage.
 
-Edits and ratings save beside originals in XMP. Sidecar conflict detection and
-visible failure reporting are tracked separately in the feature inventory until
-their tests pass. External edits must be reread before retrying a conflicting
-write. Automatic writes use persisted fingerprints and a final packet recheck;
+Edits and ratings save beside originals in XMP. Sidecar conflicts and failed
+saves remain visible in the toolbar and can be retried. External edits must be
+reread before retrying a conflicting write. Automatic writes use persisted fingerprints and a final packet recheck;
 an external program can still race the final check because it does not share
 LightCraft's lock. An explicit **Save Metadata to File** is a deliberate write
 and retains upstream merge/backup behavior for malformed packets. DOP files
@@ -66,7 +71,8 @@ has a distinct path for Sony lossless M/S linear RGB. Strength zero disables it.
 Masked sensor borders and clipped highlights remain unchanged. Unsupported CFA
 layouts return an error. This is not AI, DeepPRIME or a DxO quality-equivalence claim.
 
-**Export Processed DNG** writes actual cleaned sensor samples, rather than
+**Save Cleaned DNG** runs in a cancellable background job and writes actual
+cleaned sensor samples, rather than
 repackaging an unchanged RAW. The default is `Processed/<stem>-Clean.dng`.
 Existing output names are refused. Publication requires reliable hard-link
 support; choose an NTFS, ext4 or Btrfs output folder rather than FAT/exFAT

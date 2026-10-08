@@ -7,11 +7,14 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 ## Where we stand
 
 The Windows/Linux custom fork adds journaled folder rejection and recovery for RAW/XMP/DOP groups.
+The direct-folder workspace adds natural filename navigation, camera-JPEG Fit previews,
+physical 100% inspection, ratings, rejection/Undo and cancellable cleaned-DNG jobs.
+Persisted XMP fingerprints preserve external edits and keep conflicts/save failures visible.
 Linux fault and restart tests cover byte preservation and collision refusal; Windows tests
 cross-compile, with native storage/power-loss acceptance still open. Custom feature status and
 upstream integration are tracked in [docs/custom/features.json](docs/custom/features.json).
 The fork also adds full-resolution classical RAW denoising and actual cleaned-sample DNG
-export, verified on eight Sony corpus variants. These do not close the AI denoise or
+export, verified on eight earlier Sony corpus variants and nine A1 II full-frame/APS-C samples. These do not close the AI denoise or
 measured camera-colour gaps. New-file publication refuses unsupported hard-link volumes
 to prevent the prior check-then-rename collision race.
 

@@ -9,6 +9,7 @@
 pub mod control;
 pub mod credits;
 pub mod export_task;
+pub mod folder;
 pub mod headless;
 pub mod i18n;
 pub mod icons;
@@ -18,6 +19,7 @@ pub mod menubar;
 pub mod menus;
 pub mod merge;
 pub mod panels;
+pub mod processed_raw;
 pub mod render;
 pub mod shortcuts;
 pub mod softpaint;
@@ -189,6 +191,7 @@ pub struct LightcraftApp {
     pub export: Option<export_task::ExportTask>,
     /// Background file-system work of other commands (Find Missing Photos, auto import…).
     pub tasks: tasks::Tasks,
+    pub processed_raw: processed_raw::State,
     /// The files of the last finished background export (`ui.inspect` → `export.last`).
     pub last_export_result: Option<Value>,
     /// The look the loupe shows while the pointer rests on a preset or profile (set by the
@@ -246,6 +249,7 @@ impl LightcraftApp {
             scan: None,
             export: None,
             tasks: Default::default(),
+            processed_raw: Default::default(),
             last_export_result: None,
             hover_preview: None,
             window_is_fullscreen: false,
@@ -264,6 +268,12 @@ impl LightcraftApp {
 
     /// Run a UI or engine command by id. The single entry point for every frontend path.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if let Some(r) = processed_raw::run(self, id, &params) {
+            return r;
+        }
+        if let Some(r) = folder::run(self, id, &params) {
+            return r;
+        }
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
         }
@@ -350,6 +360,16 @@ impl LightcraftApp {
             }
             (Some(_), true) => ctx.request_repaint_after(std::time::Duration::from_secs(2)), // retry
             (None, false) => {}
+        }
+        let (pending, error) = self.session.sidecar_summary();
+        let message = error.map(|error| format!("{pending} XMP sidecar(s) pending; edits remain in the catalog: {error}"));
+        if message != self.ui.sidecar_error_seen {
+            if let Some(message) = &message {
+                self.toast_error(ctx, message);
+            } else if self.ui.sidecar_error_seen.is_some() {
+                self.toast(ctx, "XMP sidecar warnings cleared");
+            }
+            self.ui.sidecar_error_seen = message;
         }
     }
 
@@ -620,6 +640,7 @@ impl LightcraftApp {
         import::poll_scan(self, ctx);
         import::tick(self, ctx);
         tasks::poll(self, ctx);
+        folder::tick(self);
         self.preview_build_status(ctx);
         self.save_status(ctx);
         self.slideshow_tick(ctx);
@@ -682,7 +703,12 @@ impl LightcraftApp {
             }
             // read and added on a worker thread (dropped folders can be large, or on a slow drive)
             if !photos.is_empty()
-                && let Err(e) = import::start_paths(self, photos)
+                && let Err(e) =
+                    if photos.iter().any(|p| std::path::Path::new(p).is_dir()) || self.session.source == lightcraft_engine::LibrarySource::Folder {
+                        self.run("file.openPaths", serde_json::json!({"paths": photos})).map(|_| ())
+                    } else {
+                        import::start_paths(self, photos).map(|_| ())
+                    }
             {
                 self.toast(ctx, e);
             }
@@ -807,13 +833,19 @@ impl LightcraftApp {
         } else {
             t.grid_bg
         };
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg)).show(ui, |ui| match self.ui.view {
-            state::ViewMode::PhotoGrid | state::ViewMode::SquareGrid => panels::grid::show(self, ui),
-            state::ViewMode::Detail => panels::detail::show(self, ui),
-            state::ViewMode::Compare => panels::compare::show_compare(self, ui),
-            state::ViewMode::Survey => panels::compare::show_survey(self, ui),
-            state::ViewMode::Reference => panels::compare::show_reference(self, ui),
-            state::ViewMode::People => panels::people::show(self, ui),
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg)).show(ui, |ui| {
+            if self.session.catalog.photos().next().is_none() && self.scan.is_none() && self.import.is_none() {
+                folder::empty(self, ui);
+                return;
+            }
+            match self.ui.view {
+                state::ViewMode::PhotoGrid | state::ViewMode::SquareGrid => panels::grid::show(self, ui),
+                state::ViewMode::Detail => panels::detail::show(self, ui),
+                state::ViewMode::Compare => panels::compare::show_compare(self, ui),
+                state::ViewMode::Survey => panels::compare::show_survey(self, ui),
+                state::ViewMode::Reference => panels::compare::show_reference(self, ui),
+                state::ViewMode::People => panels::people::show(self, ui),
+            }
         });
         panels::second::show(self, &ctx);
         panels::notices::show(self, &ctx);
@@ -822,6 +854,7 @@ impl LightcraftApp {
         import::progress(self, &ctx);
         import::scan_progress(self, &ctx);
         export_task::poll(self, &ctx);
+        processed_raw::show(self, &ctx);
         panels::grid::drag_feedback(self, &ctx);
         panels::toast(self, &ctx);
         self.widgets = widgets::take_registry(&ctx);

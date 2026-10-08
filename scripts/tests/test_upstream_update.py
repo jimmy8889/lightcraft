@@ -97,6 +97,24 @@ class UpdateSafety(unittest.TestCase):
         self.assertEqual(json.loads(inventory.read_text())["upstream_base"], "old")
         self.unchanged()
 
+    def test_utf8_manifest_is_read_independently_of_windows_or_ascii_locale(self):
+        inventory = self.source / "docs/custom/features.json"
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text(json.dumps({"schema": 1, "upstream_base": "old",
+                                         "upstream_version": "v0.4.0", "features": []}), encoding="utf-8")
+        self.commit(self.source, "custom inventory")
+        self.before = self.git(self.source, "rev-parse", "HEAD").stdout.strip()
+        (self.upstream / "Cargo.toml").write_text(
+            '[workspace.package]\nversion = "0.5.0"\n# Camera tools: \u6444\u5f71\n', encoding="utf-8")
+        self.commit(self.upstream, "UTF8 manifest")
+        self.env.update(PYTHONUTF8="0", PYTHONCOERCECLOCALE="0", LC_ALL="C")
+        candidate = self.root / "candidate"
+        result = self.invoke("--prepare-only", "--worktree", str(candidate))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        merged = json.loads((candidate / "docs/custom/features.json").read_text(encoding="utf-8"))
+        self.assertEqual(merged["upstream_version"], "v0.5.0")
+        self.unchanged()
+
     def test_existing_candidate_never_overwritten(self):
         candidate = self.root / "candidate"
         candidate.mkdir()
