@@ -28,6 +28,7 @@ mod prefs;
 mod preset_files;
 pub mod previews;
 mod query;
+pub mod raw_processing;
 mod xmp;
 
 use serde::Serialize;
@@ -130,6 +131,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(cull::specs());
         v.extend(culling::specs());
         v.extend(convert::specs());
+        v.extend(raw_processing::specs());
         v.extend(convert::edit_specs());
         v.extend(merge::specs());
         v.extend(query::specs());

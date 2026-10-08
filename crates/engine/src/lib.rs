@@ -285,7 +285,9 @@ impl Session {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         (spec.enabled)(self).map_err(|why| EngineError::Disabled(id.to_string(), why))?;
         let empty = Value::Object(Default::default());
-        let params = if params.is_null() { &empty } else { params };
+        // RAW commands require an object: do not let malformed explicit input act on selection.
+        let strict_params = matches!(id, "photo.rawDenoise" | "photo.exportProcessedDng");
+        let params = if params.is_null() && !strict_params { &empty } else { params };
         self.run_command(id, spec.journal.then_some(params), |s| (spec.run)(s, params))
     }
 

@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 11;
+pub const RENDER_CACHE_VERSION: u64 = 12;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -115,6 +115,8 @@ pub type PreviewLoader = Arc<dyn Fn(&str, usize) -> Option<Rgba8> + Send + Sync>
 #[derive(Clone)]
 pub struct DecodedSource {
     pub image: Arc<Rgb32f>,
+    /// Source-stage processing fingerprint; independent of downstream edits.
+    pub raw_processing_key: u64,
     pub info: Option<SourceInfo>,
     /// A smart preview's stored camera tone curve: the one decoder fact its pixels need that the
     /// catalog's header facts lack (used when `info` is `None`).
@@ -123,7 +125,7 @@ pub struct DecodedSource {
 
 impl DecodedSource {
     pub fn new(image: Arc<Rgb32f>, info: Option<SourceInfo>) -> Self {
-        DecodedSource { image, info, camera_tone: None }
+        DecodedSource { image, info, camera_tone: None, raw_processing_key: 0 }
     }
 
     /// What to render these pixels against: the decoder's facts, else `header` (the catalog's)
@@ -144,6 +146,8 @@ pub enum SourceRef {
         path: String,
         max_edge: usize,
         loader: Option<FileLoader>,
+        /// Source-stage processing fingerprint assigned to the decoded source.
+        raw_processing_key: u64,
         /// The photo's smart preview, used when the original can't be read (offline drive). The
         /// UI thread never checks whether the original is there; the render worker finds out.
         fallback: Option<std::path::PathBuf>,
@@ -163,15 +167,21 @@ impl SourceRef {
         let image = match self {
             SourceRef::Loaded(a) => return Ok((**a).clone()),
             SourceRef::Demo { scene, max_edge } => Arc::new(scene.render_fit(*max_edge)),
-            SourceRef::File { path, max_edge, loader, fallback } => {
+            SourceRef::File { path, max_edge, loader, fallback, raw_processing_key } => {
                 let r = match loader {
-                    Some(l) => l(path, *max_edge).map(|(image, info)| DecodedSource::new(Arc::new(image), Some(info))),
+                    Some(l) => l(path, *max_edge).map(|(image, info)| {
+                        let mut source = DecodedSource::new(Arc::new(image), Some(info));
+                        source.raw_processing_key = *raw_processing_key;
+                        source
+                    }),
                     None => Err(format!("no decoder available for {path}")),
                 };
                 // An offline original renders from its smart preview (no decoder facts: header ones).
                 return match (r, fallback) {
                     #[cfg(not(target_arch = "wasm32"))]
-                    (Err(e), Some(sp)) if crate::smart::is_valid(sp) => crate::smart::load(sp).map_err(|e2| format!("{e}; smart preview: {e2}")),
+                    (Err(e), Some(sp)) if *raw_processing_key == 0 && crate::smart::is_valid(sp) => {
+                        crate::smart::load(sp).map_err(|e2| format!("{e}; smart preview: {e2}"))
+                    }
                     (r, _) => r,
                 };
             }
@@ -398,8 +408,42 @@ impl MediaCache {
     }
 
     pub fn source_ref(&mut self, p: &Photo, level: SourceLevel) -> SourceRef {
-        if let Some(a) = self.get_source(p.id, level) {
+        self.source_ref_with_settings(p, level, &p.develop)
+    }
+
+    fn source_ref_with_settings(&mut self, p: &Photo, level: SourceLevel, settings: &DevelopSettings) -> SourceRef {
+        let options = crate::files::raw_denoise_options(settings);
+        let processing_key = options.cache_key();
+        if let Some(a) = self.get_source(p.id, level)
+            && a.raw_processing_key == processing_key
+        {
             return SourceRef::Loaded(Box::new(a));
+        }
+        if processing_key != 0 {
+            let read = self.file_bytes.clone();
+            let loader: FileLoader = Arc::new(move |path, max_edge| {
+                let weight = std::fs::metadata(path).map(|m| m.len().saturating_mul(6).min(usize::MAX as u64) as usize).unwrap_or(0);
+                let gate = crate::memory::work_gate();
+                let _permit = if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) };
+                let bytes = crate::files::read_processing_source(path, read.as_ref())?;
+                crate::files::load_bytes_with_raw_denoise(&bytes, max_edge, options)
+            });
+            return match &p.source {
+                Source::File { path } => SourceRef::File {
+                    path: path.clone(),
+                    max_edge: level.max_edge(),
+                    loader: Some(loader),
+                    raw_processing_key: processing_key,
+                    fallback: None,
+                },
+                _ => SourceRef::File {
+                    path: "RAW denoise is unavailable for generated images".into(),
+                    max_edge: level.max_edge(),
+                    loader: None,
+                    raw_processing_key: processing_key,
+                    fallback: None,
+                },
+            };
         }
         // Procedural scenes have a nominal size: "full" is that size, not unbounded.
         let max_edge = level.max_edge().min(match (&p.source, level) {
@@ -436,10 +480,12 @@ impl MediaCache {
                 }
                 match self.scenes.iter().find(|s| s.id == *scene) {
                     Some(s) => SourceRef::Demo { scene: Box::new(s.clone()), max_edge },
-                    None => SourceRef::File { path: format!("demo:{scene}"), max_edge, loader: None, fallback: None },
+                    None => SourceRef::File { path: format!("demo:{scene}"), max_edge, loader: None, fallback: None, raw_processing_key: 0 },
                 }
             }
-            Source::File { path } => SourceRef::File { path: path.clone(), max_edge, loader: self.file_loader.clone(), fallback: None },
+            Source::File { path } => {
+                SourceRef::File { path: path.clone(), max_edge, loader: self.file_loader.clone(), fallback: None, raw_processing_key: 0 }
+            }
         }
     }
 }
@@ -695,6 +741,16 @@ pub fn source_info(p: &Photo) -> SourceInfo {
     }
 }
 
+fn source_cache_key(p: &Photo, settings: &DevelopSettings) -> Hash128 {
+    let key = crate::files::raw_denoise_options(settings).cache_key();
+    let mut h = Hasher128::new();
+    h.str(&content_key(p));
+    if key != 0 {
+        h.u64(key);
+    }
+    h.finish()
+}
+
 impl crate::Session {
     /// Build a render job for `id` fitting `max_w × max_h`. `before` renders the unedited look.
     pub fn render_job(&mut self, id: PhotoId, max_w: usize, max_h: usize, before: bool, apply_crop: bool) -> Option<RenderJob> {
@@ -719,14 +775,14 @@ impl crate::Session {
     ) -> Option<RenderJob> {
         let p = self.catalog.photo(id)?.clone();
         let level = SourceLevel::for_size(max_w.max(max_h));
-        let source = self.media.source_ref(&p, level);
         let settings = if before { Arc::new(self.before_settings(&p)) } else { p.develop.clone() };
+        let source = self.media.source_ref_with_settings(&p, level, &settings);
         let request = RenderRequest { apply_crop, ..RenderRequest::fit(max_w, max_h) };
         // the photo id is part of the key: two photos with the same settings and size must not
         // share a result (a view slot showing photo A would otherwise look current for photo B)
         // …and so is the file's content: a file changed on disk (Reload) renders afresh
         let content_key = content_key(&p);
-        let source_key = Hasher128::new().str(&content_key).finish();
+        let source_key = source_cache_key(&p, &settings);
         let content = source_key.0 as u64;
         // Temporary "before" settings must not replace the photo's cached develop hash.
         let settings_hash = if before { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
@@ -769,6 +825,9 @@ impl crate::Session {
     /// temporary preview while hovering a preset or profile; nothing is committed or cached).
     pub fn preview_job(&mut self, id: PhotoId, max_w: usize, max_h: usize, apply_crop: bool, settings: &DevelopSettings) -> Option<RenderJob> {
         let mut job = self.render_job(id, max_w, max_h, false, apply_crop)?;
+        let p = self.catalog.photo(id)?.clone();
+        job.source = self.media.source_ref_with_settings(&p, job.level, settings);
+        job.source_key = Some(source_cache_key(&p, settings));
         job.settings = Arc::new(settings.clone());
         job.key = settings.hash64() ^ ((max_w as u64) << 40) ^ ((max_h as u64) << 20) ^ (apply_crop as u64) ^ (job.level as u64) << 60;
         Some(job)
@@ -795,12 +854,12 @@ impl crate::Session {
         let p = self.catalog.photo(id)?.clone();
         let edge = edge.clamp(16, SourceLevel::Thumb.max_edge());
         let level = SourceLevel::Thumb;
-        let source = self.media.source_ref(&p, level);
+        let source = self.media.source_ref_with_settings(&p, level, settings);
         let ck = Self::variant_key(&p, settings, edge);
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
-            source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_key: Some(source_cache_key(&p, settings)),
             photo: id,
             level,
             source,
@@ -845,7 +904,7 @@ impl crate::Session {
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
-            source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_key: Some(source_cache_key(&p, &settings)),
             photo: id,
             level,
             source,
@@ -923,7 +982,7 @@ impl crate::Session {
     /// Accept a finished job's loaded source into the cache.
     pub fn accept(&mut self, r: &RenderResult) {
         if let Some(src) = &r.loaded
-            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == key))
+            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| source_cache_key(p, &p.develop) == key))
         {
             self.media.insert_source(r.photo, r.level, src.clone());
         }
@@ -1121,6 +1180,7 @@ mod tests {
         let id = s.active().unwrap();
         let mut job = s.render_job(id, 64, 64, false, true).unwrap();
         job.source = SourceRef::File {
+            raw_processing_key: 0,
             path: "synthetic.arw".into(),
             max_edge: 64,
             loader: Some(Arc::new(move |_, _| {

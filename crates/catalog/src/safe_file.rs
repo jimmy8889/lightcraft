@@ -20,8 +20,8 @@
 //!   it is then simply exported again.
 //! - [`write_new`] / [`write_new_unique`] write a file that must not exist yet: the same temp file
 //!   and sync, plus a read-back check, and the file then appears under its final name **without
-//!   replacing anything** (a hard link, which fails on a taken name; a check-then-rename where the
-//!   volume has no hard links).
+//!   replacing anything** (an exclusive hard link, which fails on a taken name). Volumes without
+//!   reliable hard links refuse publication; there is no check-then-rename fallback.
 //! - [`same_file`] tells whether two paths name the same file on disk (device + inode on Unix,
 //!   resolved paths elsewhere), for "is this target an original?" checks.
 
@@ -216,23 +216,24 @@ pub fn write_new_unique(candidates: &mut dyn Iterator<Item = PathBuf>, data: &[u
         }
         Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{}: no free file name", first.display())))
     })();
-    // after a hard link the temp name is a second name of the new file; after a rename it's gone
+    // After publication the temp name is a second name of the complete new file.
     let _ = fs::remove_file(&tmp);
     r
 }
 
 /// Give the complete temp file `tmp` the name `path`, unless that is taken.
 fn publish_new(tmp: &Path, path: &Path) -> io::Result<()> {
-    match fs::hard_link(tmp, path) {
+    publish_new_link(tmp, path, |from, to| fs::hard_link(from, to))
+}
+
+fn publish_new_link(tmp: &Path, path: &Path, link: impl FnOnce(&Path, &Path) -> io::Result<()>) -> io::Result<()> {
+    match link(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-        // no hard links on this volume (FAT/exFAT, some shares): check, then rename
-        Err(_) => {
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", path.display())));
-            }
-            fs::rename(tmp, path)
-        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("exclusive atomic publication requires reliable hard links; destination retained: {} ({e})", path.display()),
+        )),
     }
 }
 
@@ -294,6 +295,35 @@ mod tests {
         let mut v: Vec<String> = fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn unsupported_publication_retains_complete_temp_without_creating_destination() {
+        let dir = temp("unsupported-publication");
+        let (source, destination) = (dir.join("complete.tmp"), dir.join("clean.dng"));
+        fs::write(&source, b"complete derivative").unwrap();
+        let error =
+            publish_new_link(&source, &destination, |_, _| Err(io::Error::new(io::ErrorKind::Unsupported, "volume has no hard links"))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read(&source).unwrap(), b"complete derivative");
+        assert!(!destination.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn destination_created_during_failed_link_is_never_renamed_over() {
+        let dir = temp("publication-collision");
+        let (source, destination) = (dir.join("complete.tmp"), dir.join("clean.dng"));
+        fs::write(&source, b"complete derivative").unwrap();
+        let error = publish_new_link(&source, &destination, |_, to| {
+            fs::write(to, b"another program's output")?;
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "link publication failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&source).unwrap(), b"complete derivative");
+        assert_eq!(fs::read(&destination).unwrap(), b"another program's output");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

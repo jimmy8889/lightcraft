@@ -55,9 +55,30 @@
     {
       "id": "CUSTOM-004",
       "name": "Native source-stage RAW denoising and processed DNG",
-      "status": "in-progress",
-      "files": [],
-      "checks": []
+      "status": "implemented",
+      "files": [
+        "crates/raw/src/denoise.rs",
+        "crates/raw/tests/denoise.rs",
+        "crates/engine/src/cmd/raw_processing.rs"
+      ],
+      "checks": [
+        {
+          "file": "crates/develop/src/controls.rs",
+          "contains": "\"detail.rawDenoise\""
+        },
+        {
+          "file": "crates/raw/tests/denoise.rs",
+          "contains": "fine_sinusoidal_texture_retains_contrast_while_noise_falls"
+        },
+        {
+          "file": "crates/engine/src/cmd/raw_processing.rs",
+          "contains": "invalid_explicit_targets_never_use_selection_or_mutate_sources"
+        },
+        {
+          "file": "crates/engine/src/media.rs",
+          "contains": "raw_denoise_options(settings).cache_key()"
+        }
+      ]
     },
     {
       "id": "CUSTOM-005",
@@ -93,6 +114,20 @@
       "status": "planned",
       "files": [],
       "checks": []
+    },
+    {
+      "id": "CUSTOM-010",
+      "name": "Exclusive new-file publication refuses unsupported hard-link volumes",
+      "status": "implemented",
+      "files": [
+        "crates/catalog/src/safe_file.rs"
+      ],
+      "checks": [
+        {
+          "file": "crates/catalog/src/safe_file.rs",
+          "contains": "unsupported_publication_retains_complete_temp_without_creating_destination"
+        }
+      ]
     }
   ]
 }

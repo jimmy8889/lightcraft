@@ -12,7 +12,7 @@ use lightcraft_raster::{
 };
 use lightcraft_raw::{RawFormat, RawImage, color::CameraTransform, profile::HsvTable};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CameraLook {
     pub matrix: Mat3,
     pub tone: CameraTone,

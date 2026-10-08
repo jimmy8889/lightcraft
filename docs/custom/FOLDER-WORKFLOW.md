@@ -68,7 +68,9 @@ layouts return an error. This is not AI, DeepPRIME or a DxO quality-equivalence 
 
 **Export Processed DNG** writes actual cleaned sensor samples, rather than
 repackaging an unchanged RAW. The default is `Processed/<stem>-Clean.dng`.
-Existing output names are refused. The file is decoded and its samples and
+Existing output names are refused. Publication requires reliable hard-link
+support; choose an NTFS, ext4 or Btrfs output folder rather than FAT/exFAT
+or a share without that support. The file is decoded and its samples and
 sensor interpretation are checked before writing. The original is untouched.
 The derivative resets its RAW denoise setting so reopening does not process it
 twice; other development edits remain metadata.

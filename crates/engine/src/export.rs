@@ -1099,6 +1099,7 @@ impl PreparedExport {
                     return Err(format!("{label}: DNG export needs a raw photo"));
                 }
                 let raw = lightcraft_raw::decode(&bytes).map_err(|e| format!("{label}: {e}"))?;
+                let packet = crate::cmd::raw_processing::preserve_processing_packet(&bytes, packet)?;
                 drop(bytes);
                 let compression = match dng {
                     DngCompression::Lossless => lightcraft_raw::DngCompression::Lj92 { tile: 256 },

@@ -205,28 +205,88 @@ pub fn bin_factor(raw: &lightcraft_raw::RawImage, max_edge: usize) -> Option<usi
 /// instead of each one waking the pool from outside and waiting for it (which costs more than the
 /// loops themselves when the machine is busy).
 pub fn load_bytes(bytes: &[u8], max_edge: usize) -> Result<(Rgb32f, SourceInfo), String> {
-    rayon::scope(|_| load_bytes_now(std::borrow::Cow::Borrowed(bytes), max_edge))
+    rayon::scope(|_| load_bytes_now(std::borrow::Cow::Borrowed(bytes), max_edge, Default::default()))
 }
 
 /// [`load_bytes`] taking the file's bytes: a raw file's bytes are freed as soon as it is decoded
 /// (less memory held while it is developed).
 pub fn load_vec(bytes: Vec<u8>, max_edge: usize) -> Result<(Rgb32f, SourceInfo), String> {
-    rayon::scope(move |_| load_bytes_now(std::borrow::Cow::Owned(bytes), max_edge))
+    rayon::scope(move |_| load_bytes_now(std::borrow::Cow::Owned(bytes), max_edge, Default::default()))
 }
 
-fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, SourceInfo), String> {
+/// Load using the same full-resolution preprocessing used by processed-DNG export.
+/// Camera colour/tone fitting observes the original samples before any noise reduction.
+pub fn load_bytes_with_raw_denoise(bytes: &[u8], max_edge: usize, options: lightcraft_raw::denoise::Options) -> Result<(Rgb32f, SourceInfo), String> {
+    options.validate().map_err(|e| e.to_string())?;
+    if options.strength > 0.0 {
+        preflight_raw_processing(bytes)?;
+    }
+    rayon::scope(|_| load_bytes_now(std::borrow::Cow::Borrowed(bytes), max_edge, options))
+}
+
+/// Header limits are checked before allocating the full decoded sensor buffer.
+pub(crate) fn preflight_raw_processing(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > 1 << 30 {
+        return Err("RAW source exceeds 1 GiB processing limit".into());
+    }
+    let info = lightcraft_raw::probe_info(bytes).map_err(|e| e.to_string())?;
+    let count = info.width.checked_mul(info.height).and_then(|n| n.checked_mul(info.cpp)).ok_or("RAW processing dimensions overflow")?;
+    if count > lightcraft_raw::denoise::MAX_DENOISE_SAMPLES {
+        return Err("RAW processing sample limit exceeded".into());
+    }
+    Ok(())
+}
+
+/// Bounded filesystem read for optional preprocessing (custom byte hooks are checked afterwards).
+pub(crate) fn read_processing_source(path: &str, read: Option<&crate::merge::ByteReader>) -> Result<Vec<u8>, String> {
+    let limit = 1u64 << 30;
+    let bytes = if let Some(read) = read {
+        read(path)?
+    } else {
+        use std::io::Read;
+        let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        if f.metadata().map_err(|e| e.to_string())?.len() > limit {
+            return Err("RAW source exceeds 1 GiB processing limit".into());
+        }
+        let mut bytes = Vec::new();
+        f.take(limit + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        bytes
+    };
+    if bytes.len() as u64 > limit {
+        return Err("RAW source exceeds 1 GiB processing limit".into());
+    }
+    Ok(bytes)
+}
+
+/// Effective source processing: the Detail eye toggle disables RAW noise reduction too.
+pub fn raw_denoise_options(settings: &lightcraft_develop::DevelopSettings) -> lightcraft_raw::denoise::Options {
+    lightcraft_raw::denoise::Options { strength: if settings.section_enabled("detail") { settings.detail.raw_denoise as f32 } else { 0.0 } }
+}
+
+fn load_bytes_now(
+    bytes: std::borrow::Cow<'_, [u8]>,
+    max_edge: usize,
+    options: lightcraft_raw::denoise::Options,
+) -> Result<(Rgb32f, SourceInfo), String> {
     if lightcraft_raw::probe(&bytes).is_some() {
         let mut raw = match lightcraft_raw::decode(&bytes) {
             Ok(r) => r,
             Err(lightcraft_raw::RawError::Unsupported(why)) => {
+                if options.strength > 0.0 {
+                    return Err(format!("RAW denoise unavailable for unsupported source: {why}"));
+                }
                 // show the camera's embedded JPEG (rendered, not raw) until the variant is supported
                 return load_embedded_preview(&bytes, max_edge).ok_or(format!("unsupported raw ({why}) without an embedded preview"));
             }
             Err(e) => return Err(e.to_string()),
         };
-        let xy = lightcraft_raw::color::as_shot_white_xy(&raw);
-        let t = lightcraft_raw::color::camera_transform(&raw, xy);
-        let camera_look = crate::camera_preview::fit_preview(&raw, &bytes, &t);
+        let interpretation = crate::cmd::raw_processing::source_interpretation(&raw, &bytes);
+        let t = interpretation.transform;
+        let xy = t.white_xy;
+        let camera_look = interpretation.look;
+        if options.strength > 0.0 {
+            lightcraft_raw::denoise::process(&mut raw, options, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| e.to_string())?;
+        }
         drop(bytes);
         // Embedded lens corrections are applied by the pipeline ("Enable Profile Corrections"), not baked in.
         let lens = embedded_lens(&raw.info());
@@ -289,10 +349,13 @@ fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<
             eprintln!("[profile] raw source {}×{} (max {max_edge}, ms after decode): {}", img.width, img.height, parts.join(", "));
         }
         let (temp, tint) = xy_to_temp_tint(xy);
-        let relative = crate::camera_preview::file_local_look(raw.format) && t.matrix_is_fallback;
+        let relative = interpretation.relative_wb;
         let camera_tone = camera_look.as_ref().map(|p| p.tone).or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
         let (temp, tint) = if relative { (6500.0, 0.0) } else { (temp.round(), tint.round()) };
         return Ok((img, SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, lens, relative_wb: relative, camera_tone }));
+    }
+    if options.strength > 0.0 {
+        return Err("RAW denoise requires a supported RAW source".into());
     }
     let d = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions::fit(max_edge as u32, max_edge as u32)).map_err(|e| e.to_string())?;
     drop(bytes);

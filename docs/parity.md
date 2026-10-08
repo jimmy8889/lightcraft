@@ -26,7 +26,7 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | C. Views & navigation (VIEW) | 16 | 0 | 1 | 0 | 9/9 (100%) | 4/4 (100%) |
 | D. Search & filter (FILT) | 11 | 1 | 1 | 0 | 4/4 (100%) | 4/4 (100%) |
 | E. Metadata (META) | 5 | 1 | 0 | 0 | 2/2 (100%) | 2/2 (100%) |
-| F. Edit panel — global adjustments (EDIT) | 42 | 1 | 5 | 1 | 28/28 (100%) | 13/14 (93%) |
+| F. Edit panel — global adjustments (EDIT) | 42 | 2 | 5 | 1 | 28/28 (100%) | 13/15 (87%) |
 | G. Profiles (PROF) | 6 | 2 | 3 | 0 | 3/4 (75%) | 2/3 (67%) |
 | H. Crop & rotate (CROP) | 9 | 0 | 0 | 1 | 6/6 (100%) | 3/3 (100%) |
 | I. Remove / healing (REM) | 7 | 1 | 2 | 2 | 4/4 (100%) | 2/3 (67%) |
@@ -39,7 +39,7 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | P. Enhance (ENH) | 0 | 0 | 2 | 0 | — | — |
 | Q. HDR (HDR) | 0 | 0 | 5 | 0 | — | — |
 | R. Video (VID) | 0 | 0 | 5 | 1 | — | 0/2 (0%) |
-| S. Export (EXP) | 15 | 1 | 2 | 0 | 7/7 (100%) | 7/7 (100%) |
+| S. Export (EXP) | 15 | 2 | 2 | 0 | 7/7 (100%) | 7/8 (88%) |
 | T. Share (SHARE) | 0 | 0 | 0 | 4 | — | — |
 | U. Map & location (MAP) | 0 | 1 | 1 | 0 | — | 0/1 (0%) |
 | V. Preferences (PREF) | 5 | 0 | 3 | 3 | 1/1 (100%) | 4/4 (100%) |
@@ -48,9 +48,9 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | Y. Menus | 81 | 0 | 4 | 8 | 47/47 (100%) | 23/23 (100%) |
 | Z. Keyboard shortcuts (desktop) | 74 | 3 | 3 | 1 | 49/52 (94%) | 22/23 (96%) |
 | Lightroom Classic extras | 31 | 10 | 39 | 9 | — | 21/22 (95%) |
-| **Total** | 389 | 35 | 86 | 37 | 194/200 (97%) | 139/150 (93%) |
+| **Total** | 389 | 37 | 86 | 37 | 194/200 (97%) | 139/152 (91%) |
 
-Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **79.7%** of 510 in-scope rows — P0 98.5% of 200 · P1 95.3% of 150 · P2 41.6% of 160.
+Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **79.6%** of 512 in-scope rows — P0 98.5% of 200 · P1 94.7% of 152 · P2 41.6% of 160.
 <!-- /parity:summary -->
 
 ## Top gaps
@@ -250,6 +250,7 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-EDIT-DETAIL-SHARPEN | Sharpening | P0 | ✅ | `ctl:detail.sharpenAmount`, `ctl:detail.sharpenRadius`, `ctl:detail.sharpenDetail`, `ctl:detail.sharpenMasking` | no Alt-drag mask preview |
 | LR-EDIT-DETAIL-NR | Luminance noise reduction | P0 | ✅ | `ctl:detail.nrLuminance`, `ctl:detail.nrDetail`, `ctl:detail.nrContrast` | |
 | LR-EDIT-DETAIL-CNR | Colour noise reduction | P0 | ✅ | `ctl:detail.nrColor`, `ctl:detail.nrColorDetail`, `ctl:detail.nrColorSmoothness` | |
+| LR-EDIT-DETAIL-RAWNR | Native sensor-stage denoising (custom fork) | P1 | 🟡 | `ctl:detail.rawDenoise`, `cmd:photo.rawDenoise`, `crates/raw/src/denoise.rs`, `crates/raw/tests/denoise.rs` | Full-resolution classical phase-aware Bayer and Sony M/S linear-RGB denoising before white balance/demosaic; protected borders/highlights, cancellation and texture regressions; source-cache key isolates Before/After. UI workspace integration pending. Not AI or DeepPRIME parity |
 | LR-EDIT-DETAIL-DENOISE | AI denoise | P2 | ⬜ | | settings field reserved, not rendered |
 | LR-EDIT-DETAIL-RAWDETAILS | Improved demosaic toggle | P2 | ⬜ | | |
 | LR-EDIT-DETAIL-SUPERRES | Super resolution | P2 | ⬜ | | |
@@ -427,6 +428,7 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 |---|---|---|---|---|---|
 | LR-EXP-DIALOG | Export dialog | P0 | ✅ | `cmd:dialog.export`, `cmd:app.export` (`preset`), `cmd:export.presets`, `cmd:export.savePreset`, `cmd:export.deletePreset`, `crates/ui-egui/src/panels/dialogs.rs`, `crates/engine/src/export.rs` | batch export; built-in presets (JPEG Small 2048 px / Large full size, Original + Settings, DNG) and saved user presets (library prefs) load into the dialog; deleting a user preset is command-only |
 | LR-EXP-TYPE | File types | P0 | ✅ | `cmd:app.export` (`format`), `crates/engine/src/export.rs` (`ExportFormat`), `crates/engine/src/tests_export.rs` | JPEG, PNG, TIFF, WebP, AVIF, DNG (raw photos: lossless re-encode with the edits in the embedded XMP), Original (+ XMP sidecar). No JXL encoder; non-raw → DNG not supported |
+| LR-EXP-PROCESSEDDNG | Export cleaned RAW samples (custom fork) | P1 | 🟡 | `cmd:photo.exportProcessedDng`, `crates/engine/src/cmd/raw_processing.rs` | New lossless DNG with actual cleaned samples, full readback before exclusive publication; preserves original and source colour interpretation in private XMP, resets RAW strength; other-editor colour and native Windows acceptance remain open. Asynchronous desktop workspace pending |
 | LR-EXP-DIM | Output size | P0 | ✅ | `cmd:app.export` (`longEdge`, `shortEdge`, `width`, `height`, `megapixels`, `percent`, `dontEnlarge`, `ppi`), `crates/engine/src/export.rs` (`Resize`), `crates/ui-egui/src/panels/dialogs.rs` | full size = the cropped native size (no longer upscaled); W × H fits either orientation; ppi written to JFIF / pHYs / TIFF tags |
 | LR-EXP-QUALITY | JPEG quality | P0 | ✅ | `cmd:app.export` (`quality`, `limitKb`) | |
 | LR-EXP-BITDEPTH | Bit depth | P1 | ✅ | `cmd:app.export` (`bitDepth`), `crates/pipeline/src/output.rs` (`OutputDepth`), `crates/engine/src/export.rs` | 16-bit PNG/TIFF rendered at 16 bits (TIFF defaults to 16), 32-bit float linear TIFF with a linear profile, 10-bit AVIF; high-bit-depth renders run on the CPU |

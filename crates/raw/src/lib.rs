@@ -25,6 +25,7 @@
 mod binned;
 pub mod color;
 pub mod demosaic;
+pub mod denoise;
 mod dng;
 pub mod dngwrite;
 pub mod highlight;
@@ -145,6 +146,15 @@ pub fn probe(bytes: &[u8]) -> Option<RawFormat> {
         return Some(RawFormat::OtherTiff);
     }
     None
+}
+
+/// Read a TIFF RAW's embedded XMP without duplicating its full sensor/Exif payload.
+/// Used for LightCraft's private processed-DNG interpretation, never as sensor samples.
+pub fn embedded_xmp(bytes: &[u8]) -> Option<String> {
+    let t = Tiff::parse_with(bytes, &lightcraft_tiff::ParseOptions { max_ifds: 256, ..Default::default() }).ok()?;
+    let e = t.ifds.first()?.get(lightcraft_tiff::tags::XMP)?;
+    let bytes = e.value.as_bytes()?;
+    (bytes.len() <= 16 << 20).then(|| std::str::from_utf8(bytes).ok().map(str::to_owned)).flatten()
 }
 
 /// Decode a raw file.
@@ -498,7 +508,11 @@ impl RawImage {
         if self.width == 0 || self.height == 0 || !(1..=4).contains(&self.cpp) {
             return Err(RawError::Corrupt("bad dimensions".into()));
         }
-        if samples && self.data.len() != self.width * self.height * self.cpp {
+        let count = self.width.checked_mul(self.height).and_then(|n| n.checked_mul(self.cpp)).ok_or(RawError::Limit("sample dimensions"))?;
+        if count > MAX_SAMPLES {
+            return Err(RawError::Limit("sample count"));
+        }
+        if samples && self.data.len() != count {
             return Err(RawError::Corrupt("data length mismatch".into()));
         }
         if let Some(c) = &self.cfa
@@ -507,7 +521,11 @@ impl RawImage {
             return Err(RawError::Unsupported(format!("CFA pattern {}", c.name())));
         }
         let a = self.active_area;
-        if a.width == 0 || a.height == 0 || a.x + a.width > self.width || a.y + a.height > self.height {
+        if a.width == 0
+            || a.height == 0
+            || a.x.checked_add(a.width).is_none_or(|v| v > self.width)
+            || a.y.checked_add(a.height).is_none_or(|v| v > self.height)
+        {
             return Err(RawError::Corrupt("active area outside image".into()));
         }
         Ok(())

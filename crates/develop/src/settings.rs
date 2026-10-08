@@ -464,6 +464,9 @@ impl Default for Grain {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Detail {
+    /// Native sensor-stage denoise strength 0..100, before demosaic (linear RAW: before colour).
+    /// Classical filtering, not AI. Zero preserves the original development path.
+    pub raw_denoise: f64,
     pub sharpen_amount: f64,
     pub sharpen_radius: f64,
     pub sharpen_detail: f64,
@@ -481,6 +484,7 @@ impl Default for Detail {
     /// values for rendered files and apply raw defaults at import time (`DevelopSettings::for_raw`).
     fn default() -> Self {
         Self {
+            raw_denoise: 0.0,
             sharpen_amount: 0.0,
             sharpen_radius: 1.0,
             sharpen_detail: 25.0,
