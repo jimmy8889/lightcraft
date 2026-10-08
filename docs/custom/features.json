@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "upstream_repository": "storytold/lightcraft",
+  "upstream_base": "2472021091a28eb93a05947cfc9b941d3911543a",
+  "upstream_version": "v0.4.0",
+  "integration_branch": "custom/folder-raw-workflow",
+  "features": [
+    {
+      "id": "CUSTOM-001",
+      "name": "Upstream merge candidates with mandatory custom and upstream checks",
+      "status": "implemented",
+      "files": [
+        "scripts/upstream-update.py",
+        "scripts/check-custom-features.py",
+        "scripts/tests/test_upstream_update.py"
+      ],
+      "checks": [
+        {
+          "file": "scripts/upstream-update.py",
+          "contains": "merge-needs-review"
+        }
+      ]
+    },
+    {
+      "id": "CUSTOM-002",
+      "name": "Folder-first culling workspace",
+      "status": "in-progress",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-003",
+      "name": "Journaled rejection and recovery of RAW/XMP/DOP file groups",
+      "status": "in-progress",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-004",
+      "name": "Native source-stage RAW denoising and processed DNG",
+      "status": "in-progress",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-005",
+      "name": "Licensed calibrated distortion, chromatic aberration and vignetting profiles",
+      "status": "planned",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-006",
+      "name": "Persistent XMP conflict checks and visible save failures",
+      "status": "in-progress",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-007",
+      "name": "Bounded camera JPEG reads for fast RAW culling",
+      "status": "in-progress",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-008",
+      "name": "Optional calibrated PMRID RAW inference with a verified licensed checkpoint",
+      "status": "in-progress",
+      "files": [],
+      "checks": []
+    },
+    {
+      "id": "CUSTOM-009",
+      "name": "Measured camera colour, lens sharpness and external-editor fidelity",
+      "status": "planned",
+      "files": [],
+      "checks": []
+    }
+  ]
+}

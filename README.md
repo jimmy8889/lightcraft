@@ -10,6 +10,11 @@
 
 <h1 align="center">LightCraft</h1>
 
+This custom fork targets a direct-folder photography workflow on **Windows and Linux**.
+See [the custom workflow and implementation status](docs/custom/FOLDER-WORKFLOW.md)
+and [how creator updates are integrated](docs/custom/UPSTREAM.md). The upstream
+project and its other platform paths are retained below.
+
 <h3 align="center">Your photos. Your pixels. Your machine.</h3>
 
 <p align="center">

@@ -14,3 +14,5 @@ plan/
 # model weights are never committed (SAM 3: docs/ai-masks.md)
 *.safetensors
 *.safetensors.part
+# Python fork-maintenance tools
+__pycache__/

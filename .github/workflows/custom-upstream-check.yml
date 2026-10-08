@@ -1,0 +1,59 @@
+name: Check an upstream release
+
+# Explicit invocation only. No schedule, automatic merge, publication, or deployment.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream tag or branch, for example v0.4.0 or main'
+        required: true
+        default: main
+      custom_branch:
+        description: 'Custom branch containing the features to preserve'
+        required: true
+        default: custom/folder-raw-workflow
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_TEST_THREADS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.custom_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy,rustfmt
+      - name: Configure candidate author and upstream
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/storytold/lightcraft.git
+      - name: Merge and validate in a separate candidate
+        run: python3 scripts/upstream-update.py --ref "$UPSTREAM_REF" --worktree "$RUNNER_TEMP/lightcraft-candidate"
+      - name: Preserve candidate changes and check evidence
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/lightcraft-candidate/.git" ] || [ -f "$RUNNER_TEMP/lightcraft-candidate/.git" ]; then
+            base=$(python3 -c 'import json, os; from pathlib import Path; print(json.loads((Path(os.environ["RUNNER_TEMP"])/"lightcraft-candidate/plan/upstream-update/result.json").read_text())["source"])')
+            git -C "$RUNNER_TEMP/lightcraft-candidate" diff --binary "$base" > "$RUNNER_TEMP/lightcraft-candidate/plan/upstream-update/candidate.patch"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: upstream-merge-evidence
+          path: ${{ runner.temp }}/lightcraft-candidate/plan/upstream-update/
+          if-no-files-found: ignore

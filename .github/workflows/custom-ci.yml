@@ -1,0 +1,40 @@
+name: Custom feature compatibility
+
+on:
+  push:
+    branches: ['custom/**', 'updates/**']
+  pull_request:
+    branches: ['custom/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_TEST_THREADS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy,rustfmt
+      - name: Preserve custom feature hooks and update safety
+        run: python scripts/check-custom-features.py
+      - name: Full upstream and custom Rust checks
+        run: cargo xtask ci
