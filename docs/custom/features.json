@@ -31,9 +31,26 @@
     {
       "id": "CUSTOM-003",
       "name": "Journaled rejection and recovery of RAW/XMP/DOP file groups",
-      "status": "in-progress",
-      "files": [],
-      "checks": []
+      "status": "implemented",
+      "files": [
+        "crates/engine/src/culling.rs",
+        "crates/engine/src/cmd/culling.rs",
+        "crates/engine/src/tests_culling.rs"
+      ],
+      "checks": [
+        {
+          "file": "crates/engine/src/cmd/culling.rs",
+          "contains": "\"cull.reject\""
+        },
+        {
+          "file": "crates/engine/src/tests_culling.rs",
+          "contains": "interrupted_link_and_unlink_recover_after_restart_without_rewriting_bytes"
+        },
+        {
+          "file": "crates/catalog/src/query.rs",
+          "contains": "canonical_windows_and_unc_spellings_preserve_folder_boundaries"
+        }
+      ]
     },
     {
       "id": "CUSTOM-004",

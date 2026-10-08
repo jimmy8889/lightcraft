@@ -16,6 +16,7 @@ pub mod camera_profiles;
 pub mod cmd;
 pub mod crs;
 pub mod crs_masks;
+pub mod culling;
 pub mod demo;
 pub mod devices;
 pub mod export;
@@ -606,6 +607,9 @@ impl Session {
                 f.subfolders = b.subfolders;
             }
             let mut visible = self.catalog.query(&f, &self.sort);
+            if self.source == LibrarySource::Folder {
+                visible.retain(|id| culling::in_folder_view(self, *id));
+            }
             if matches!(self.source, LibrarySource::Album(_))
                 && self.sort.key == lightcraft_catalog::SortKey::CaptureDate
                 && let LibrarySource::Album(a) = self.source
@@ -656,7 +660,12 @@ impl Session {
                 f.folder = Some(b.path);
                 f.subfolders = b.subfolders;
             }
-            let n = self.catalog.query(&f, &self.sort).len();
+            let n = self
+                .catalog
+                .query(&f, &self.sort)
+                .into_iter()
+                .filter(|id| self.source != LibrarySource::Folder || culling::in_folder_view(self, *id))
+                .count();
             self.total = Some((key, n));
         }
         self.total.as_ref().map(|t| t.1)
@@ -734,3 +743,6 @@ mod tests_settings_files;
 mod tests_spots;
 #[cfg(test)]
 mod tests_xmp;
+
+#[cfg(test)]
+mod tests_culling;

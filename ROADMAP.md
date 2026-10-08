@@ -6,6 +6,11 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 
 ## Where we stand
 
+The Windows/Linux custom fork adds journaled folder rejection and recovery for RAW/XMP/DOP groups.
+Linux fault and restart tests cover byte preservation and collision refusal; Windows tests
+cross-compile, with native storage/power-loss acceptance still open. Custom feature status and
+upstream integration are tracked in [docs/custom/features.json](docs/custom/features.json).
+
 *Honest assessment, 2026-10-05. Agents: read this before picking work. The checklist in
 [`docs/parity.md`](docs/parity.md) counts features that **exist**; this section is about whether a photographer can
 **switch** from Lightroom. Update it when a gap below closes.*

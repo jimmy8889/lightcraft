@@ -432,10 +432,14 @@ pub struct DateGroup {
 /// Whether file `path` is directly in `dir` (or anywhere below it with `deep`). Both `/` and `\\`
 /// separate.
 pub fn in_folder(path: &str, dir: &str, deep: bool) -> bool {
-    let dir = dir.trim_end_matches(['/', '\\']);
+    if dir.is_empty() {
+        return false;
+    }
+    let (path, dir) = (folder_key(path), folder_key(dir));
+    let dir = dir.trim_end_matches('/');
     let Some(rest) = path.strip_prefix(dir) else { return false };
-    let Some(rest) = rest.strip_prefix(['/', '\\']) else { return false };
-    !rest.is_empty() && (deep || !rest.contains(['/', '\\']))
+    let Some(rest) = rest.strip_prefix('/') else { return false };
+    !rest.is_empty() && (deep || !rest.contains('/'))
 }
 
 /// A folder path's identity, for telling whether two spellings name the same folder: `/` and
@@ -498,5 +502,29 @@ pub fn merged_kind(file_name: &str) -> Option<&'static str> {
         Some("panorama")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod folder_spelling_tests {
+    use super::in_folder;
+    #[test]
+    fn canonical_windows_and_unc_spellings_preserve_folder_boundaries() {
+        assert!(in_folder(r"\\?\C:\Photos\A.ARW", "c:/Photos", false));
+        assert!(in_folder(r"C:\Photos\sub\A.ARW", r"\\?\C:\Photos", true));
+        assert!(!in_folder(r"C:\Photos\sub\A.ARW", r"\\?\C:\Photos", false));
+        assert!(!in_folder("c:/Photos2/A.ARW", "C:/Photos", true));
+        assert!(in_folder(r"\\?\UNC\server\share\Photos\A.ARW", "//server/share/Photos/", false));
+        assert!(!in_folder("//server/share2/Photos/A.ARW", "//server/share", true));
+        assert!(in_folder("/A.ARW", "/", false));
+        assert!(in_folder("/sub/A.ARW", "/", true));
+        assert!(!in_folder("/sub/A.ARW", "/", false));
+        assert!(!in_folder("/A.ARW", "", true));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_folder_case_matches_canonical_source_paths() {
+        assert!(in_folder(r"\\?\C:\PHOTOS\A.ARW", "c:/photos", false));
+        assert!(!in_folder("C:/PHOTOS2/A.ARW", "c:/photos", true));
     }
 }
