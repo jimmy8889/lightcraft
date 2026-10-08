@@ -44,7 +44,7 @@ fn meta_of(m: &lightcraft_meta::Metadata) -> (Meta, Option<String>) {
 }
 
 /// Lens corrections embedded in a DNG's `OpcodeList3` (`WarpRectilinear`, `FixVignetteRadial`), re-expressed for
-/// the default-cropped, EXIF-oriented image. These are the only "profile" corrections LightCraft applies.
+/// the default-cropped, EXIF-oriented image. Embedded opcodes take precedence over external calibration.
 pub fn embedded_lens(raw: &lightcraft_raw::RawInfo) -> Option<lightcraft_develop::EmbeddedLens> {
     use lightcraft_develop::{EmbeddedLens, EmbeddedVignette, EmbeddedWarp};
     use lightcraft_geom::Point;
@@ -287,6 +287,14 @@ fn load_bytes_now(
         if options.strength > 0.0 {
             lightcraft_raw::denoise::process(&mut raw, options, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| e.to_string())?;
         }
+        let (meta, _) = meta_of(&lightcraft_meta::extract(&bytes));
+        let calibration_key = lightcraft_develop::lens_profiles::capture_identity(
+            &meta.camera,
+            &meta.lens,
+            meta.focal_mm,
+            meta.aperture,
+            Some(&lightcraft_preview::hash_bytes(&bytes).to_string()),
+        );
         drop(bytes);
         // Embedded lens corrections are applied by the pipeline ("Enable Profile Corrections"), not baked in.
         let lens = embedded_lens(&raw.info());
@@ -352,7 +360,10 @@ fn load_bytes_now(
         let relative = interpretation.relative_wb;
         let camera_tone = camera_look.as_ref().map(|p| p.tone).or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
         let (temp, tint) = if relative { (6500.0, 0.0) } else { (temp.round(), tint.round()) };
-        return Ok((img, SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, lens, relative_wb: relative, camera_tone }));
+        return Ok((
+            img,
+            SourceInfo { calibration_key, raw: true, as_shot_temp: temp, as_shot_tint: tint, lens, relative_wb: relative, camera_tone },
+        ));
     }
     if options.strength > 0.0 {
         return Err("RAW denoise requires a supported RAW source".into());

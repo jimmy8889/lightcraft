@@ -87,6 +87,13 @@ $Stage = Join-Path $TargetDir "windows-package\$Arch"
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 Copy-Item (Join-Path $Bin 'lightcraft.exe'), (Join-Path $Bin 'lightcraft-cli.exe') $Stage
+# Both the installer and portable archive include the embedded lens data's licence and notices.
+New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'assets\lens-profiles'), (Join-Path $Stage 'docs') | Out-Null
+Copy-Item (Join-Path $Root 'assets\ATTRIBUTION.md') (Join-Path $Stage 'assets')
+foreach ($f in 'sony-e.json', 'README.md', 'LICENSE-CC-BY-SA-3.0.txt') {
+  Copy-Item (Join-Path $Root "assets\lens-profiles\$f") (Join-Path $Stage 'assets\lens-profiles')
+}
+Copy-Item (Join-Path $Root 'docs\lens-profiles.md') (Join-Path $Stage 'docs')
 
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'lightcraft.exe') (Join-Path $Stage 'lightcraft-cli.exe')
 
@@ -106,6 +113,7 @@ $Portable = Join-Path $TargetDir "windows-package\lightcraft-$Version-windows-$A
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
 Copy-Item (Join-Path $Stage '*.exe') $Portable
+Copy-Item -Recurse (Join-Path $Stage 'assets'), (Join-Path $Stage 'docs') $Portable
 foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE') {
   $p = Join-Path $Root $f
   if (Test-Path $p) { Copy-Item $p $Portable }

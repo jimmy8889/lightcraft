@@ -16,6 +16,7 @@ mod edit;
 mod export;
 pub mod filters;
 pub mod keywords;
+mod lens_profiles;
 pub mod library;
 pub mod lut_profiles;
 pub mod manage;
@@ -120,6 +121,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(edit::specs());
         v.extend(library::specs());
         v.extend(develop::specs());
+        v.extend(lens_profiles::specs());
         v.extend(color::specs());
         v.extend(curves::specs());
         v.extend(masks::specs());

@@ -89,10 +89,20 @@ LightCraft's per-file camera JPEG colour estimate travels in private DNG XMP.
 Other editors use the DNG camera tags; matching external-editor colour has not
 been established. A measured camera calibration database remains required.
 
+## Measured optics
+
+The Optics panel exposes licensed, exact measured profiles for six Sony primes,
+including the kit's 14/24/50 GM. Enter actual capture crop and, for vignetting,
+a measured focus row. Coverage and per-effect limitations are in
+[lens-profiles.md](../lens-profiles.md). The 50 GM has no measured vignetting rows;
+GM II, 300 GM and converter combinations have no matching profile. Manual and
+embedded corrections remain available. Experimental working-RGB colour-fringe
+correction is a separate opt-in, and measured edits use the CPU renderer.
+
 ## Further quality work
 
-Automatic distortion, chromatic aberration and vignetting correction need
-exact, licensed lens calibration data. Lens-aware sharpening needs measured
+Broader automatic distortion, chromatic aberration and vignetting coverage needs
+additional exact, licensed calibration data. Lens-aware sharpening needs measured
 sharpness data. An actual learned RAW denoiser also needs licensable weights,
 camera-appropriate noise calibration, reference inference checks and full-size
 photo evaluation. Phone-camera calibration must not be applied to Sony ISO values.

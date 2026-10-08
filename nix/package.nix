@@ -163,6 +163,11 @@ rustPlatform.buildRustPackage {
     install -Dm644 -t "$doc" \
       README.md LICENSE-MIT LICENSE-APACHE NOTICE \
       assets/ATTRIBUTION.md assets/fonts/OFL-Inter.txt
+    install -d "$doc/assets/lens-profiles" "$doc/docs"
+    cp assets/ATTRIBUTION.md "$doc/assets/"
+    cp assets/lens-profiles/sony-e.json assets/lens-profiles/README.md \
+      assets/lens-profiles/LICENSE-CC-BY-SA-3.0.txt "$doc/assets/lens-profiles/"
+    cp docs/lens-profiles.md "$doc/docs/"
   ''
   + lib.optionalString (craft-fonts != null) ''
     for lic in ${toString craft-fonts}/fonts/*/OFL.txt; do
@@ -197,6 +202,7 @@ rustPlatform.buildRustPackage {
     license = with lib.licenses; [
       mit
       asl20
+      cc-by-sa-30
     ];
     sourceProvenance = with lib.sourceTypes; [ fromSource ];
     platforms = lib.platforms.linux ++ lib.platforms.darwin;

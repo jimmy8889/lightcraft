@@ -57,6 +57,8 @@ pub use tone::ToneMap;
 /// Facts about the source the settings are interpreted against.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceInfo {
+    /// Verified actual-source camera/lens/focal/aperture identity, never inferred from JPEG previews.
+    pub calibration_key: Option<lightcraft_develop::lens_profiles::CaptureIdentity>,
     /// Lens corrections embedded in the file (DNG opcodes), relative to the EXIF-oriented source.
     pub lens: Option<lightcraft_develop::EmbeddedLens>,
     /// Raw sources use absolute Kelvin white balance; rendered sources use a relative scale around
@@ -71,7 +73,7 @@ pub struct SourceInfo {
 
 impl Default for SourceInfo {
     fn default() -> Self {
-        Self { raw: false, as_shot_temp: 6500.0, as_shot_tint: 0.0, lens: None, relative_wb: false, camera_tone: None }
+        Self { calibration_key: None, raw: false, as_shot_temp: 6500.0, as_shot_tint: 0.0, lens: None, relative_wb: false, camera_tone: None }
     }
 }
 
@@ -159,8 +161,19 @@ pub fn native_output_size(src_w: usize, src_h: usize, s: &DevelopSettings) -> (f
 
 /// The geometric frame `render` uses for `src` (lens data, automatic CA estimate included).
 pub fn frame_for(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, apply_crop: bool) -> geometry::Frame {
-    let mut frame = geometry::Frame::with_lens(src.width, src.height, s, apply_crop, info.lens.as_ref());
-    if s.optics.remove_ca && s.section_enabled("optics") {
+    let guarded;
+    let settings = if s.optics.calibration.is_some_and(|c| !info.raw || info.calibration_key != Some(c.capture_key)) {
+        guarded = {
+            let mut copy = s.clone();
+            copy.optics.calibration = None;
+            copy
+        };
+        &guarded
+    } else {
+        s
+    };
+    let mut frame = geometry::Frame::with_lens(src.width, src.height, settings, apply_crop, info.lens.as_ref());
+    if s.optics.remove_ca && s.section_enabled("optics") && !frame.warp.as_ref().is_some_and(|w| w.calibration.is_some_and(|c| c.tca.is_some())) {
         frame.add_lateral_ca(optics::estimate_lateral_ca(src));
     }
     frame
@@ -507,3 +520,6 @@ mod tests;
 mod tests_geometry;
 #[cfg(test)]
 mod tests_local;
+
+#[cfg(test)]
+mod tests_calibrated;

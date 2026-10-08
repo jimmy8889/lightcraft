@@ -10,6 +10,7 @@ pub mod edit;
 pub mod filterbar;
 pub mod grid;
 pub mod left;
+pub mod lens_profiles;
 pub mod library_problem;
 pub mod masking;
 pub mod notices;

@@ -251,6 +251,9 @@ pub struct UiState {
     pub thumb_size: f32,
     /// Open Edit sections by id.
     pub open_sections: Vec<String>,
+    /// Explicit measured-lens capture assertions, staged for this photo only.
+    #[serde(skip)]
+    pub measured_lens: crate::panels::lens_profiles::Draft,
     /// Open flyouts (curve, mixer, grading…).
     pub open_flyouts: Vec<String>,
     /// Single-panel mode: opening one section closes the others.
@@ -580,6 +583,7 @@ impl Default for UiState {
             before_after: BeforeAfter::Off,
             thumb_size: 220.0,
             open_sections: vec!["light".into()],
+            measured_lens: Default::default(),
             open_flyouts: vec![],
             single_panel: false,
             show_clipping: false,

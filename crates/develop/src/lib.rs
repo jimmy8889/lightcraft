@@ -7,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod controls;
+pub mod lens_profiles;
 pub mod presets;
 pub mod segmask;
 pub mod settings;
@@ -86,6 +87,7 @@ impl DevelopSettings {
                 self.curve = d;
             }
             Section::Color => self.wb.mode = WbMode::AsShot,
+            Section::Optics => self.optics.calibration = None,
             _ => {}
         }
     }

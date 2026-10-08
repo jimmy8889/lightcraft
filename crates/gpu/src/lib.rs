@@ -292,6 +292,12 @@ pub fn stage_bytes(stages: &StageCache) -> usize {
 /// Render `src` with `s` on the GPU, reusing the device-resident stages kept with `stages` (the
 /// view's CPU stage cache). `None`: render on the CPU instead.
 pub fn render(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, stages: Option<&StageCache>) -> Option<Rendered> {
+    // The GPU warp currently implements embedded/manual optics only. Never silently drop
+    // measured corrections: the complete CPU pipeline has the calibrated equations.
+    if s.optics.calibration.is_some() && s.optics.lens_profile && s.section_enabled("optics") {
+        record_fallback("measured lens corrections use the CPU renderer".into());
+        return None;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         // the kernel writes 8-bit output: high-bit-depth exports (and soft proofs) render on the CPU

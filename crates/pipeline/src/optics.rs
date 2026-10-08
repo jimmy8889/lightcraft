@@ -11,11 +11,12 @@
 //! dimensionless scales), so a 400 px preview and a full-size export are warped identically.
 //!
 //! Also here: automatic lateral chromatic aberration estimation ([`estimate_lateral_ca`]) and [`defringe`].
-//! Profile corrections use only lens data embedded in DNG files (`WarpRectilinear` / `FixVignetteRadial`).
+//! Profiles use embedded DNG opcodes or exact licensed calibration data resolved in the settings.
 
 use std::sync::Mutex;
 
 use lightcraft_color::perceptual::{oklab_from_2020, oklab_to_2020};
+use lightcraft_develop::lens_profiles::{CalibratedLens, RadialDistortion};
 use lightcraft_develop::{DevelopSettings, EmbeddedLens, EmbeddedVignette, EmbeddedWarp};
 use lightcraft_geom::{Affine, Homography, Interval, Orientation, Point, Real};
 use lightcraft_raster::{Plane, Rgb32f};
@@ -47,6 +48,8 @@ pub struct Warp {
     pub ca: [f64; 3],
     /// Embedded DNG lens corrections (already in this oriented frame) and their strengths (1 = as recorded).
     pub lens: Option<EmbeddedLens>,
+    /// Resolved external calibration. Embedded opcodes take precedence, avoiding double correction.
+    pub calibration: Option<CalibratedLens>,
     pub lens_dist: f64,
     pub lens_vig: f64,
 }
@@ -63,6 +66,7 @@ impl Warp {
             vig_power: 4.0,
             ca: [0.0; 3],
             lens: None,
+            calibration: None,
             lens_dist: 0.0,
             lens_vig: 0.0,
         }
@@ -79,12 +83,14 @@ impl Warp {
         wp.vig_stops = VIGNETTE_STOPS * o.vignetting / 100.0;
         wp.vig_power = 1.0 + 6.0 * (o.vignetting_midpoint / 100.0).clamp(0.0, 1.0);
         wp.ca = [CA_SCALE * o.ca_red / 100.0, 0.0, CA_SCALE * o.ca_blue / 100.0];
-        if o.lens_profile
-            && let Some(l) = lens
-        {
-            wp.lens = Some(*l);
+        if o.lens_profile {
             wp.lens_dist = (o.profile_distortion / 100.0).clamp(0.0, 2.0);
             wp.lens_vig = (o.profile_vignetting / 100.0).clamp(0.0, 2.0);
+            if let Some(l) = lens {
+                wp.lens = Some(*l);
+            } else {
+                wp.calibration = o.calibration.filter(|c| c.valid() && c.fits_dimensions(w, h));
+            }
         }
         wp
     }
@@ -102,18 +108,22 @@ impl Warp {
         self.persp != Homography::IDENTITY
             || self.k1 != 0.0
             || self.ca.iter().any(|c| *c != 0.0)
-            || (self.lens_dist != 0.0 && self.lens.is_some_and(|l| l.warp.is_some()))
+            || (self.lens_dist != 0.0 && (self.lens.is_some_and(|l| l.warp.is_some()) || self.calibration.is_some_and(|c| c.distortion.is_some())))
+            || self.calibration.is_some_and(|c| c.tca.is_some())
     }
 
     /// Whether the colour planes are sampled at different positions.
     pub fn per_channel(&self) -> bool {
-        self.ca[0] != self.ca[1]
+        self.calibration.is_some_and(|c| c.tca.is_some())
+            || self.ca[0] != self.ca[1]
             || self.ca[1] != self.ca[2]
             || (self.lens_dist != 0.0 && self.lens.and_then(|l| l.warp).is_some_and(|w| w.planes[0] != w.planes[1] || w.planes[1] != w.planes[2]))
     }
 
     pub fn has_gain(&self) -> bool {
-        self.vig_stops != 0.0 || (self.lens_vig != 0.0 && self.lens.is_some_and(|l| l.vignette.is_some()))
+        (self.lens_vig != 0.0 && self.calibration.is_some_and(|c| c.vignetting.is_some()))
+            || self.vig_stops != 0.0
+            || (self.lens_vig != 0.0 && self.lens.is_some_and(|l| l.vignette.is_some()))
     }
 
     pub fn is_identity(&self) -> bool {
@@ -169,7 +179,38 @@ impl Warp {
             let (sx, sy) = embedded_warp_real(&wp, qx, qy, ch, self.w, self.h);
             (qx, qy) = (qx + (sx - qx) * self.lens_dist, qy + (sy - qy) * self.lens_dist);
         }
-        let k = self.ca[ch];
+        if let Some(cal) = self.calibration {
+            let norm = (self.w.min(self.h) / 2.0).max(1e-9);
+            if self.lens_dist != 0.0
+                && let Some(dist) = cal.distortion
+            {
+                let (dx, dy) = ((qx - c.x) / norm, (qy - c.y) / norm);
+                let r2 = dx * dx + dy * dy;
+                let scale = match dist {
+                    RadialDistortion::Poly3 { k1 } => r2 * k1 + (1.0 - k1),
+                    RadialDistortion::Poly5 { k1, k2 } => r2 * (r2 * k2 + k1) + 1.0,
+                    RadialDistortion::Ptlens { a, b, c } => {
+                        let r = r2.sqrt_nonnegative();
+                        r * (r * (r * a + b) + c) + (1.0 - a - b - c)
+                    }
+                };
+                let factor = (scale - 1.0) * self.lens_dist + 1.0;
+                (qx, qy) = (dx * factor * norm + c.x, dy * factor * norm + c.y);
+            }
+            if let Some(ca) = cal.tca
+                && let Some([b, cc, v]) = match ch {
+                    0 => Some(ca.red),
+                    2 => Some(ca.blue),
+                    _ => None,
+                }
+            {
+                let (dx, dy) = ((qx - c.x) / norm, (qy - c.y) / norm);
+                let r2 = dx * dx + dy * dy;
+                let scale = if cc == 0.0 { r2 * b + v } else { r2 * b + r2.sqrt_nonnegative() * cc + v };
+                (qx, qy) = (dx * scale * norm + c.x, dy * scale * norm + c.y);
+            }
+        }
+        let k = self.ca.get(ch).copied().unwrap_or_default();
         if k != 0.0 {
             (qx, qy) = ((qx - c.x) * (1.0 + k) + c.x, (qy - c.y) * (1.0 + k) + c.y);
         }
@@ -195,6 +236,21 @@ impl Warp {
             g *= 1.0 + (embedded_vignette_gain(&v, src, self.w, self.h) - 1.0) * self.lens_vig;
         }
         g as f32
+    }
+
+    /// Calibrated source attenuation is evaluated for each colour plane at its own source point,
+    /// before interpolation. This keeps devignetting before anti-TCA, including large test shifts.
+    pub fn calibrated_gain(&self, src: Point) -> f32 {
+        let Some(k) = self.calibration.and_then(|c| c.vignetting) else { return 1.0 };
+        if self.lens_vig == 0.0 {
+            return 1.0;
+        }
+        let hd = (self.w.hypot(self.h) / 2.0).max(1e-9);
+        let r2 = ((src.x - self.w / 2.0).powi(2) + (src.y - self.h / 2.0).powi(2)) / (hd * hd);
+        // Pixels outside the source are blank/clamped, never extrapolate a measured vignette.
+        let t = r2.clamp(0.0, 1.0);
+        let attenuation = 1.0 + t * (k[0] + t * (k[1] + t * k[2]));
+        (1.0 + (1.0 / attenuation - 1.0) * self.lens_vig) as f32
     }
 
     /// Whether a source position lies on the image (within [`edges`](Self::edges)).

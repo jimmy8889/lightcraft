@@ -207,6 +207,27 @@ impl Frame {
         let oriented = if self.orient == Orientation::Normal { None } else { Some(src.oriented(self.orient)) };
         let o = oriented.as_ref().unwrap_or(src);
         let plan = self.sample_plan(src.width, src.height, w, h);
+        // Correct linear source pixels before both minification and the per-channel lookup.
+        // This is devignetting → TCA → undistortion in the forward processing direction.
+        let devignetted;
+        let o = if let Some(warp) = self.warp.as_ref().filter(|wp| wp.lens_vig != 0.0 && wp.calibration.is_some_and(|c| c.vignetting.is_some())) {
+            devignetted = {
+                let mut corrected = o.clone();
+                let sx = corrected.width as f64 / self.ow;
+                let sy = corrected.height as f64 / self.oh;
+                par_rows(&mut corrected.data, corrected.width, |y, row| {
+                    for (x, px) in row.iter_mut().enumerate() {
+                        let point = Point::new((x as f64 + 0.5) / sx, (y as f64 + 0.5) / sy);
+                        let gain = warp.calibrated_gain(point);
+                        *px = px.map(|v| v * gain);
+                    }
+                });
+                corrected
+            };
+            &devignetted
+        } else {
+            o
+        };
         let base = match plan.prefilter {
             Some((nw, nh)) => std::borrow::Cow::Owned(resize(o, nw, nh, Filter::Mitchell)),
             None => std::borrow::Cow::Borrowed(o),

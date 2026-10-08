@@ -15,7 +15,7 @@ priority: optional
 maintainer: ${LIGHTCRAFT_MAINTAINER}
 vendor: Learning Machines LLC
 homepage: https://getartcraft.com/apps/lightcraft
-license: MIT OR Apache-2.0
+license: (MIT OR Apache-2.0) AND CC-BY-SA-3.0
 description: |-
   Open-source, native photo library and raw developer that works the way
   Lightroom users expect. Import, rate, keyword and organise photos; develop

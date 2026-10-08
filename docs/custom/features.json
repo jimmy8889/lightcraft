@@ -101,9 +101,27 @@
     {
       "id": "CUSTOM-005",
       "name": "Licensed calibrated distortion, chromatic aberration and vignetting profiles",
-      "status": "planned",
-      "files": [],
-      "checks": []
+      "status": "implemented",
+      "files": [
+        "crates/develop/src/lens_profiles.rs",
+        "crates/engine/src/cmd/lens_profiles.rs",
+        "crates/ui-egui/src/panels/lens_profiles.rs",
+        "assets/lens-profiles/sony-e.json"
+      ],
+      "checks": [
+        {
+          "file": "crates/develop/src/lens_profiles.rs",
+          "contains": "sony_official_names_and_codes_resolve_only_the_same_exact_gm_prime"
+        },
+        {
+          "file": "crates/engine/src/cmd/lens_profiles.rs",
+          "contains": "\"optics.applyProfile\""
+        },
+        {
+          "file": "crates/pipeline/src/tests_calibrated.rs",
+          "contains": "capture_key"
+        }
+      ]
     },
     {
       "id": "CUSTOM-006",

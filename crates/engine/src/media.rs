@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 12;
+pub const RENDER_CACHE_VERSION: u64 = 13;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -131,7 +131,17 @@ impl DecodedSource {
     /// What to render these pixels against: the decoder's facts, else `header` (the catalog's)
     /// with any stored camera tone curve.
     pub fn info_or(&self, header: SourceInfo) -> SourceInfo {
-        self.info.unwrap_or(SourceInfo { camera_tone: self.camera_tone.or(header.camera_tone), ..header })
+        match self.info {
+            Some(mut actual) => {
+                // Never replace independently decoded facts with stale catalog metadata. A
+                // catalog edit invalidates the measured profile until both identities agree.
+                if actual.calibration_key != header.calibration_key {
+                    actual.calibration_key = None;
+                }
+                actual
+            }
+            None => SourceInfo { calibration_key: None, camera_tone: self.camera_tone.or(header.camera_tone), ..header },
+        }
     }
 }
 
@@ -735,7 +745,21 @@ pub fn source_info(p: &Photo) -> SourceInfo {
     // balance and the display tone curve, like any other rendered file.
     if p.develops_raw() {
         let (temp, tint) = if p.relative_wb() { (6500.0, 0.0) } else { p.as_shot_wb.unwrap_or((5500.0, 0.0)) };
-        SourceInfo { raw: true, as_shot_temp: temp, as_shot_tint: tint, lens: p.embedded_lens, relative_wb: p.relative_wb(), ..Default::default() }
+        SourceInfo {
+            calibration_key: lightcraft_develop::lens_profiles::capture_identity(
+                &p.meta.camera,
+                &p.meta.lens,
+                p.meta.focal_mm,
+                p.meta.aperture,
+                p.content_hash.as_deref(),
+            ),
+            raw: true,
+            as_shot_temp: temp,
+            as_shot_tint: tint,
+            lens: p.embedded_lens,
+            relative_wb: p.relative_wb(),
+            ..Default::default()
+        }
     } else {
         SourceInfo::default()
     }
@@ -792,10 +816,12 @@ impl crate::Session {
             ^ (apply_crop as u64)
             ^ (level as u64) << 60
             ^ id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ content.rotate_left(17);
+            ^ content.rotate_left(17)
+            ^ source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default().rotate_left(31);
         let cache = thumb_bucket.map(|b| {
             let k = Hasher128::new()
                 .str(&content_key)
+                .u64(source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default())
                 .u64(settings_hash)
                 .u64(b as u64)
                 .u64(RENDER_CACHE_VERSION)
@@ -837,6 +863,7 @@ impl crate::Session {
     pub fn variant_key(p: &Photo, settings: &DevelopSettings, edge: usize) -> Hash128 {
         Hasher128::new()
             .str(&content_key(p))
+            .u64(source_info(p).calibration_key.map(|i| i.metadata).unwrap_or_default())
             .str("variant")
             .u64(settings.hash64())
             .u64(edge as u64)
@@ -923,6 +950,7 @@ impl crate::Session {
     fn view_key(p: &Photo, apply_crop: bool) -> Hash128 {
         Hasher128::new()
             .str(&content_key(p))
+            .u64(source_info(p).calibration_key.map(|i| i.metadata).unwrap_or_default())
             .str("view")
             .u64(p.develop.hash64())
             .u64(apply_crop as u64)
@@ -955,7 +983,13 @@ impl crate::Session {
         let small = self.thumb_job(id, THUMB_SIZES[THUMB_SIZES.len() - 1])?;
         // (the thumbnail job itself starts with the cached thumbnail, after the sharper embedded preview)
         let cached = vec![(self.media.rendered.clone(), Self::view_key(&p, apply_crop))];
-        let h = Hasher128::new().str(&content_key(&p)).str("quick").u64(p.develop.hash64()).u64(apply_crop as u64).finish();
+        let h = Hasher128::new()
+            .str(&content_key(&p))
+            .u64(source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default())
+            .str("quick")
+            .u64(p.develop.hash64())
+            .u64(apply_crop as u64)
+            .finish();
         let key = h.0 as u64;
         let embedded = self.embedded_of(&p).map(|(path, l)| (path, l, max_edge.clamp(1, SourceLevel::Preview.max_edge())));
         Some(QuickJob { request_id: 0, photo: id, key, cached, embedded, small: apply_crop.then(|| Box::new(small)) })
@@ -1089,10 +1123,16 @@ mod thumbnail_hash_tests {
             // Independent original formula: never asks the new hash cache for expected values.
             let settings = p.develop.hash64();
             let content = Hasher128::new().str(&content_key(&p)).finish().0 as u64;
-            let expected =
-                settings ^ ((b as u64) << 40) ^ ((b as u64) << 20) ^ 1 ^ p.id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ content.rotate_left(17);
+            let expected = settings
+                ^ ((b as u64) << 40)
+                ^ ((b as u64) << 20)
+                ^ 1
+                ^ p.id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ content.rotate_left(17)
+                ^ source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default().rotate_left(31);
             let disk = Hasher128::new()
                 .str(&content_key(&p))
+                .u64(source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default())
                 .u64(settings)
                 .u64(b as u64)
                 .u64(RENDER_CACHE_VERSION)

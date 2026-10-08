@@ -325,17 +325,18 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             if ui.checkbox(&mut lp, crate::i18n::tr("Enable Lens Corrections")).changed() {
                 let _ = app.run("develop.merge", json!({"settings": {"optics": {"lens_profile": lp}}, "label": "Lens Corrections"}));
             }
-            if lp && !has_lens {
+            if lp && !has_lens && d.optics.calibration.is_none() {
                 ui.label(
-                    egui::RichText::new(crate::i18n::tr("No lens data embedded in this file (DNG lens opcodes only)."))
+                    egui::RichText::new(crate::i18n::tr("No embedded lens data. Check measured profiles below."))
                         .size(11.0)
                         .color(Tokens::get(ui.ctx()).text_dim),
                 );
             }
         });
+        super::lens_profiles::show(app, ui, id);
         if d.optics.lens_profile {
             for c in ["optics.profileDistortion", "optics.profileVignetting"] {
-                control(app, ui, d, c, has_lens);
+                control(app, ui, d, c, has_lens || d.optics.calibration.is_some());
             }
         }
         sub_title(ui, crate::i18n::tr("Manual"));

@@ -21,9 +21,14 @@ pub trait Real:
 {
     /// `if |v| < tiny { tiny } else { v }`: the guard of a denominator against zero ([`crate::Homography::apply`]).
     fn clamp_tiny(self, tiny: f64) -> Self;
+    /// Square root of a mathematically nonnegative quantity (a squared radial distance).
+    fn sqrt_nonnegative(self) -> Self;
 }
 
 impl Real for f64 {
+    fn sqrt_nonnegative(self) -> f64 {
+        self.sqrt()
+    }
     fn clamp_tiny(self, tiny: f64) -> f64 {
         if self.abs() < tiny { tiny } else { self }
     }
@@ -161,6 +166,15 @@ impl Div<f64> for Interval {
 }
 
 impl Real for Interval {
+    fn sqrt_nonnegative(self) -> Interval {
+        // Interval multiplication may include negative values when a coordinate spans zero;
+        // a sum of squared coordinates is nevertheless nonnegative. Clipping that conservative
+        // lower bound is safe for this explicitly nonnegative operation. NaN stays undecided.
+        if !self.is_decided() || self.hi < 0.0 {
+            return Interval::UNDECIDED;
+        }
+        Interval::new(self.lo.max(0.0).sqrt().next_down().max(0.0), self.hi.sqrt().next_up())
+    }
     /// Unchanged when no value in the interval would be clamped, else undecided.
     fn clamp_tiny(self, tiny: f64) -> Interval {
         if self.lo >= tiny || self.hi <= -tiny { self } else { Interval::UNDECIDED }
@@ -202,6 +216,20 @@ mod tests {
             let c = ib.clamp_tiny(1.0);
             prop_assert!(!c.is_decided() || contains(c, b.clamp_tiny(1.0)));
         }
+    }
+
+    #[test]
+    fn radial_sqrt_bounds_include_points_and_refuse_unknown() {
+        for (lo, hi) in [(-1.0, 2.0), (-0.001, 0.001), (0.0, 0.0), (100.0, 110.0)] {
+            let i = Interval::new(lo, hi);
+            let radius = (i * i + i * i).sqrt_nonnegative();
+            for n in 0..=100 {
+                let p = lo + (hi - lo) * n as f64 / 100.0;
+                assert!(contains(radius, (p * p + p * p).sqrt()));
+            }
+        }
+        assert!(!Interval::UNDECIDED.sqrt_nonnegative().is_decided());
+        assert!(!Interval::new(-2.0, -1.0).sqrt_nonnegative().is_decided());
     }
 
     #[test]

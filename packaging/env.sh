@@ -51,6 +51,13 @@ copy_docs() {
   for f in README.md LICENSE LICENSE-MIT LICENSE-APACHE COPYRIGHT NOTICE; do
     if [ -f "$ROOT/$f" ]; then cp "$ROOT/$f" "$dest/"; fi
   done
+  # Keep the CC BY-SA data, legal text and modification/provenance notice together. Preserve
+  # repository-relative links in the notices, including the feature's usage documentation.
+  mkdir -p "$dest/assets/lens-profiles" "$dest/docs"
+  cp "$ROOT/assets/ATTRIBUTION.md" "$dest/assets/"
+  cp "$ROOT/assets/lens-profiles/sony-e.json" "$ROOT/assets/lens-profiles/README.md" \
+    "$ROOT/assets/lens-profiles/LICENSE-CC-BY-SA-3.0.txt" "$dest/assets/lens-profiles/"
+  cp "$ROOT/docs/lens-profiles.md" "$dest/docs/"
   copy_font_licences "$dest"
 }
 

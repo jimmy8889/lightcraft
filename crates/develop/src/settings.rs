@@ -502,6 +502,8 @@ impl Default for Detail {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Optics {
+    /// Exact measured coefficients, applied only to matching raw capture metadata.
+    pub calibration: Option<crate::lens_profiles::CalibratedLens>,
     pub remove_ca: bool,
     pub lens_profile: bool,
     pub profile_distortion: f64,
@@ -524,6 +526,7 @@ pub struct Optics {
 impl Default for Optics {
     fn default() -> Self {
         Self {
+            calibration: None,
             remove_ca: false,
             lens_profile: false,
             profile_distortion: 100.0,
