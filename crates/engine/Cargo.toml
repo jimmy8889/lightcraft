@@ -37,4 +37,5 @@ lightcraft-segment = { workspace = true, optional = true }
 sam = ["dep:lightcraft-segment"]
 
 [dev-dependencies]
+lightcraft-tiff = { workspace = true }
 libc = { workspace = true }

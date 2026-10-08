@@ -6,7 +6,7 @@ use lightcraft_tiff::tags as t;
 use lightcraft_tiff::{Ifd, Tiff, makernote};
 
 /// Whether `b` looks like a displayable (DCT) JPEG: SOI, and the first SOF marker is not lossless.
-fn is_dct_jpeg(b: &[u8]) -> bool {
+pub(super) fn is_dct_jpeg(b: &[u8]) -> bool {
     if b.len() < 4 || b[0] != 0xff || b[1] != 0xd8 {
         return false;
     }
@@ -135,7 +135,7 @@ fn cr3_preview_boxes(bytes: &[u8]) -> Option<&[u8]> {
 }
 
 /// Trim trailing garbage after the last EOI when a stored length over-reports.
-fn trim_eoi(s: &[u8]) -> &[u8] {
+pub(super) fn trim_eoi(s: &[u8]) -> &[u8] {
     let end = s.windows(2).rposition(|w| w == [0xff, 0xd9]).map(|p| p + 2).unwrap_or(s.len());
     &s[..end]
 }

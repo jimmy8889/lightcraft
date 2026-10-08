@@ -1,0 +1,107 @@
+{
+  "schema": 1,
+  "source": "https://raw.pixls.us/",
+  "verified_on": "2026-10-08",
+  "camera": "Sony ILCE-1M2",
+  "samples": [
+    {
+      "id": 7827,
+      "model": "ILCE-1M2",
+      "mode": "14bit uncompressed (3:2)",
+      "remark": "Uncompressed full-frame",
+      "license": "CC0-1.0",
+      "sha256": "7def3c8d80537f79af199052c6e13d86750203122dcb94888ada65291dabb793",
+      "url": "https://raw.pixls.us/getfile.php/7827/nice/Sony - ILCE-1M2 - 14bit uncompressed (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7827/exif/A1_07626_uncompressed_full_frame.ARW.exif.txt",
+      "file": "7827-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7828,
+      "model": "ILCE-1M2",
+      "mode": "14bit lossless (4:3)",
+      "remark": "Lossless compressed Large-Size full-frame Sony Alpha1 II",
+      "license": "CC0-1.0",
+      "sha256": "33ec5187659f8af4589113afbd138ec8d1cd14f6999d36a12de87ad5d8c7d439",
+      "url": "https://raw.pixls.us/getfile.php/7828/nice/Sony - ILCE-1M2 - 14bit lossless (4:3).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7828/exif/A1_07627_lossless_compressed_large_full_frame.ARW.exif.txt",
+      "file": "7828-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7829,
+      "model": "ILCE-1M2",
+      "mode": "lossless (4:3)",
+      "remark": "Lossless compressed Medium-Size Sony Alpha1 II",
+      "license": "CC0-1.0",
+      "sha256": "dfc66d4a6175378074bddf7deeb15f591083be1cb9fea1ccb7bac3c888db6e49",
+      "url": "https://raw.pixls.us/getfile.php/7829/nice/Sony - ILCE-1M2 - lossless (4:3).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7829/exif/A1_07628_lossless_compressed_medium_full_frame.ARW.exif.txt",
+      "file": "7829-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7830,
+      "model": "ILCE-1M2",
+      "mode": "lossless (3:2)",
+      "remark": "Lossless compressed Small-Size full-frame Sony Alpha1 II",
+      "license": "CC0-1.0",
+      "sha256": "84a94ab4198077d19f697585c4425868fc05f00ff7ae3d661f25d0f94a0aea7c",
+      "url": "https://raw.pixls.us/getfile.php/7830/nice/Sony - ILCE-1M2 - lossless (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7830/exif/A1_07629_lossless_compressed_small_full_frame.ARW.exif.txt",
+      "file": "7830-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7831,
+      "model": "ILCE-1M2",
+      "mode": "14bit Lossy (3:2)",
+      "remark": "Lossy compressed full-frame",
+      "license": "CC0-1.0",
+      "sha256": "bfe5113d3a6bc237ed0852a23d99da1c9733eb3f63056e362f40450fdd9644f8",
+      "url": "https://raw.pixls.us/getfile.php/7831/nice/Sony - ILCE-1M2 - 14bit Lossy (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7831/exif/A1_07630_lossy_compressed_full_frame.ARW.exif.txt",
+      "file": "7831-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7832,
+      "model": "ILCE-1M2",
+      "mode": "14bit uncompressed (3:2)",
+      "remark": "Uncompressed aps-c",
+      "license": "CC0-1.0",
+      "sha256": "780847d7bbe951b2271389d69f2e798aec03154799622df008914977665c9070",
+      "url": "https://raw.pixls.us/getfile.php/7832/nice/Sony - ILCE-1M2 - 14bit uncompressed (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7832/exif/A1_07631_uncompressed_apsc.ARW.exif.txt",
+      "file": "7832-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7833,
+      "model": "ILCE-1M2",
+      "mode": "14bit lossless (3:2)",
+      "remark": "Lossless compressed Medium-Size APS-C mode Sony Alpha1 II",
+      "license": "CC0-1.0",
+      "sha256": "3f4ce83f58b1809b9f0d70489091b44e9597a57ec80470bade3fcf53640c6469",
+      "url": "https://raw.pixls.us/getfile.php/7833/nice/Sony - ILCE-1M2 - 14bit lossless (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7833/exif/A1_07632_lossless_compressed_medium_apsc.ARW.exif.txt",
+      "file": "7833-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7834,
+      "model": "ILCE-1M2",
+      "mode": "lossless (3:2)",
+      "remark": "Lossless compressed Small-Size APS-C mode Sony Alpha1 II",
+      "license": "CC0-1.0",
+      "sha256": "006b477808b3edaaa41e58ce082653a36e544c4ddc0bfe1bc8a6ef39d93d8369",
+      "url": "https://raw.pixls.us/getfile.php/7834/nice/Sony - ILCE-1M2 - lossless (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7834/exif/A1_07633_lossless_compressed_small_apsc.ARW.exif.txt",
+      "file": "7834-ILCE-1M2.ARW"
+    },
+    {
+      "id": 7835,
+      "model": "ILCE-1M2",
+      "mode": "14bit Lossy (3:2)",
+      "remark": "Lossy compressed APS-C",
+      "license": "CC0-1.0",
+      "sha256": "050c924e5f78afd8479aa442f17b8650e0a5ebfa5757e57368cb0dc865ca2417",
+      "url": "https://raw.pixls.us/getfile.php/7835/nice/Sony - ILCE-1M2 - 14bit Lossy (3:2).ARW",
+      "exif_url": "https://raw.pixls.us/getfile.php/7835/exif/A1_07634_lossy_compressed_apsc.ARW.exif.txt",
+      "file": "7835-ILCE-1M2.ARW"
+    }
+  ]
+}

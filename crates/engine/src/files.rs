@@ -403,22 +403,133 @@ pub fn load_embedded_preview(bytes: &[u8], max_edge: usize) -> Option<(Rgb32f, S
     Some((img.oriented(preview_orientation(bytes, d.orientation)), SourceInfo::default()))
 }
 
-/// The embedded preview of a raw file for display (sRGB, oriented, no larger than `max_edge`): the
-/// loupe and grid show it until the raw itself has been developed ([`crate::media::QuickJob`]).
-pub fn embedded_preview_srgb(bytes: &[u8], max_edge: usize) -> Option<lightcraft_raster::Rgba8> {
-    let jpeg = lightcraft_raw::embedded_preview(bytes)?;
-    let mut d = lightcraft_codecs::decode(&jpeg, lightcraft_codecs::DecodeOptions::fit(max_edge as u32, max_edge as u32)).ok()?;
+// Display previews have stricter bounds than full-resolution RAW development. Unknown containers
+// retain the existing extractor, but its source read cannot grow past 256 MiB.
+const PREVIEW_MAX_SOURCE: u64 = 256 * 1024 * 1024;
+const PREVIEW_MAX_JPEG: usize = 32 * 1024 * 1024;
+const PREVIEW_MAX_PIXELS: u64 = 80 * 1024 * 1024;
+const PREVIEW_MAX_EDGE: usize = 16384;
+
+/// Frame dimensions before allocating decoder images; bounded marker walking, no entropy decode.
+fn preview_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut at = 2usize;
+    let mut dimensions = None;
+    for _ in 0..4096 {
+        if bytes.get(at) != Some(&0xff) {
+            return None;
+        }
+        let marker = *bytes.get(at.checked_add(1)?)?;
+        if marker == 0xff {
+            at = at.checked_add(1)?;
+            continue;
+        }
+        if marker == 0xda || marker == 0xd9 {
+            return dimensions;
+        }
+        if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            at = at.checked_add(2)?;
+            continue;
+        }
+        let length = u16::from_be_bytes([*bytes.get(at.checked_add(2)?)?, *bytes.get(at.checked_add(3)?)?]) as usize;
+        if length < 2 {
+            return None;
+        }
+        let end = at.checked_add(2)?.checked_add(length)?;
+        let segment = bytes.get(at.checked_add(4)?..end)?;
+        if matches!(marker, 0xc0..=0xc2) {
+            if dimensions.is_some() {
+                return None;
+            }
+            let h = u32::from(u16::from_be_bytes([*segment.get(1)?, *segment.get(2)?]));
+            let w = u32::from(u16::from_be_bytes([*segment.get(3)?, *segment.get(4)?]));
+            if w == 0 || h == 0 || w.max(h) as usize > PREVIEW_MAX_EDGE || u64::from(w).checked_mul(u64::from(h))? > PREVIEW_MAX_PIXELS {
+                return None;
+            }
+            dimensions = Some((w, h));
+        }
+        at = end;
+    }
+    None
+}
+
+fn preview_work(bytes: usize) -> crate::memory::Permit<'static> {
+    let gate = crate::memory::work_gate();
+    if crate::memory::is_background() { gate.acquire(bytes) } else { gate.acquire_urgent(bytes) }
+}
+
+fn preview_jpeg_srgb(jpeg: &[u8], max_edge: usize, raw_orientation: impl FnOnce() -> Orientation) -> Option<lightcraft_raster::Rgba8> {
+    if jpeg.len() > PREVIEW_MAX_JPEG || max_edge == 0 || max_edge > PREVIEW_MAX_EDGE {
+        return None;
+    }
+    let (w, h) = preview_jpeg_dimensions(jpeg)?;
+    // Account for compressed bytes, native JPEG coefficients (including progressive scans),
+    // linear colour conversion and resampling. Background previews yield to interactive loads.
+    let work = u64::from(w).checked_mul(u64::from(h))?.checked_mul(48)?.checked_add(u64::try_from(jpeg.len()).ok()?)?;
+    let _permit = preview_work(usize::try_from(work).ok()?);
+    let edge = u32::try_from(max_edge).ok()?;
+    let mut d =
+        lightcraft_codecs::decode(jpeg, lightcraft_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: PREVIEW_MAX_PIXELS }).ok()?;
     if d.image.width.max(d.image.height) > max_edge {
         d.image = fit(&d.image, max_edge, max_edge, Filter::Box);
         d.alpha = None;
     }
-    let o = preview_orientation(bytes, d.orientation);
-    Some(d.to_srgb8().oriented(o))
+    let orientation = if d.orientation > 1 { Orientation::from_exif(d.orientation) } else { raw_orientation() };
+    Some(d.to_srgb8().oriented(orientation))
 }
 
-/// Filesystem-backed embedded-preview hook (native).
+/// The original camera JPEG for display (sRGB, oriented, bounded, no larger than `max_edge`).
+/// Its colour and pixels do not use the photo's develop/denoise settings.
+pub fn embedded_preview_srgb(bytes: &[u8], max_edge: usize) -> Option<lightcraft_raster::Rgba8> {
+    let jpeg = lightcraft_raw::embedded_preview(bytes)?;
+    preview_jpeg_srgb(&jpeg, max_edge, || preview_orientation(bytes, 1))
+}
+
+fn fs_preview(path: &str, max_edge: usize) -> Option<lightcraft_raster::Rgba8> {
+    use std::io::{Read, Seek, SeekFrom};
+    if max_edge == 0 || max_edge > PREVIEW_MAX_EDGE {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let preview = {
+        // Tables and at most one 32 MiB candidate plus the trimmed result are live at a time.
+        let _permit = preview_work(96 * 1024 * 1024);
+        lightcraft_raw::embedded_preview_reader(&mut file)
+    };
+    if let Some((jpeg, orientation)) = preview {
+        return preview_jpeg_srgb(&jpeg, max_edge, || Orientation::from_exif(orientation));
+    }
+    let (jpeg, orientation) = {
+        let length = file.metadata().ok()?.len();
+        if length > PREVIEW_MAX_SOURCE {
+            return None;
+        }
+        // The existing TIFF parser's value budget is 8× source bytes + 1 MiB. Reserve that
+        // expansion plus input/extraction while it runs; drop it before reserving decode work
+        // so a background load never waits on its own permit.
+        let _permit = preview_work(usize::try_from(length.checked_mul(10)?.checked_add(1024 * 1024)?).ok()?);
+        file.seek(SeekFrom::Start(0)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(PREVIEW_MAX_SOURCE + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > PREVIEW_MAX_SOURCE {
+            return None;
+        }
+        let jpeg = lightcraft_raw::embedded_preview(&bytes)?;
+        if jpeg.len() > PREVIEW_MAX_JPEG {
+            return None;
+        }
+        let orientation = preview_orientation(&bytes, 1);
+        (jpeg, orientation)
+    };
+    preview_jpeg_srgb(&jpeg, max_edge, || orientation)
+}
+
+/// Filesystem camera previews use bounded TIFF seeks before the bounded container fallback.
+/// Import metadata and full-file content hashes still use the ordinary probe hooks.
 pub fn fs_preview_loader() -> PreviewLoader {
-    Arc::new(|path: &str, max_edge: usize| embedded_preview_srgb(&std::fs::read(path).ok()?, max_edge))
+    Arc::new(fs_preview)
 }
 
 /// Filesystem-backed hooks (native). On the web the host installs bytes-based hooks instead.
@@ -478,6 +589,67 @@ mod tests {
         b.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
         b.extend_from_slice(&jpeg);
         b
+    }
+
+    #[test]
+    fn filesystem_preview_seeks_preserve_camera_pixels_orientation_and_resize() {
+        use lightcraft_tiff::{ByteOrder, IfdBuilder, ImageData, TiffWriter, Value, tags};
+        let root = std::env::temp_dir().join(format!("lc-seek-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let rgb: Vec<u8> = (0..80 * 48).flat_map(|i| [(i % 251) as u8, 128, 200]).collect();
+        let mut exif = IfdBuilder::new();
+        exif.set(tags::ORIENTATION, Value::Short(vec![8]));
+        let exif = TiffWriter::default().write(&[exif]).unwrap();
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            for jpeg_orientation in [false, true] {
+                let jpeg = encode_jpeg(
+                    &EncodeImage::new(80, 48, 3, Samples::U8(&rgb)),
+                    90,
+                    ChromaSubsampling::S444,
+                    &EncodeMeta { exif: jpeg_orientation.then_some(exif.as_slice()), ..Default::default() },
+                )
+                .unwrap();
+                let mut ifd = IfdBuilder::new();
+                ifd.set(tags::COMPRESSION, Value::Short(vec![6]));
+                ifd.set(tags::IMAGE_WIDTH, Value::Long(vec![80]));
+                ifd.set(tags::IMAGE_LENGTH, Value::Long(vec![48]));
+                ifd.set(tags::ORIENTATION, Value::Short(vec![6]));
+                ifd.set_image(ImageData::Strips { rows_per_strip: 48, strips: vec![jpeg] });
+                let bytes = TiffWriter { order, bigtiff: false }.write(&[ifd]).unwrap();
+                let path = root.join(format!("{order:?}-{jpeg_orientation}.ARW"));
+                std::fs::write(&path, &bytes).unwrap();
+                // Above the fallback cap: only the seek path can succeed on this sparse RAW.
+                std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(PREVIEW_MAX_SOURCE + 1).unwrap();
+                let expected = embedded_preview_srgb(&bytes, 32).unwrap();
+                let actual = fs_preview_loader()(&path.to_string_lossy(), 32).unwrap();
+                assert_eq!((actual.width, actual.height), (expected.width, expected.height));
+                assert_eq!(actual.as_bytes(), expected.as_bytes(), "seek preview keeps original JPEG colour and orientation");
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_preview_fallback_and_decode_budgets_are_bounded() {
+        let root = std::env::temp_dir().join(format!("lc-preview-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("preview.CR3");
+        let bytes = cr3_with_preview(48, 32);
+        std::fs::write(&path, &bytes).unwrap();
+        let expected = embedded_preview_srgb(&bytes, 24).unwrap();
+        let actual = fs_preview_loader()(&path.to_string_lossy(), 24).unwrap();
+        assert_eq!(actual.as_bytes(), expected.as_bytes(), "unsupported seek layout uses the original container extractor");
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(PREVIEW_MAX_SOURCE + 1).unwrap();
+        assert!(fs_preview_loader()(&path.to_string_lossy(), 24).is_none(), "oversized unsupported sources are never read whole");
+        assert!(fs_preview_loader()(&path.to_string_lossy(), usize::MAX).is_none());
+        assert!(embedded_preview_srgb(&bytes, 0).is_none());
+        let mut oversized = lightcraft_raw::embedded_preview(&bytes).unwrap();
+        let sof = oversized.windows(2).position(|marker| marker == [0xff, 0xc0]).unwrap();
+        oversized[sof + 5..sof + 9].fill(0xff);
+        assert!(preview_jpeg_dimensions(&oversized).is_none(), "hostile JPEG dimensions refuse before decode allocation");
+        assert!(preview_jpeg_srgb(&oversized, 24, || Orientation::Normal).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Issue #138: a DNG's own profile look (hue/saturation map, look table, tone curve) is

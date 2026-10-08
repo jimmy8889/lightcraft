@@ -3,6 +3,7 @@
 //! - [`probe`] recognises raw containers; [`decode`] turns a file into a [`RawImage`] (sensor data + everything
 //!   needed to render it: CFA, black/white levels, active area, default crop, orientation, DNG colour tags,
 //!   opcode lists, [`Metadata`]); [`embedded_preview`] returns the largest embedded JPEG.
+//!   [`embedded_preview_reader`] extracts the original camera JPEG with bounded seeks for supported TIFF layouts.
 //! - [`RawImage::normalized`] subtracts black, scales white to 1.0 and crops to the active area (applying DNG
 //!   `OpcodeList1`/`OpcodeList2`); [`demosaic`] turns CFA data into camera-RGB [`Rgb32f`];
 //!   [`RawImage::develop`] does all of it plus `OpcodeList3` and the default crop; [`RawImage::develop_binned`]
@@ -32,6 +33,7 @@ pub mod highlight;
 pub mod ljpeg;
 pub mod opcodes;
 mod preview;
+mod preview_seek;
 pub mod profile;
 mod tiffraw;
 mod unpack;
@@ -45,6 +47,7 @@ pub use lightcraft_meta::Metadata;
 pub use lightcraft_raster::Rgb32f;
 pub use opcodes::{Opcode, OpcodeLists};
 pub use preview::embedded_preview;
+pub use preview_seek::embedded_preview_reader;
 
 use lightcraft_color::Xy;
 use lightcraft_tiff::{Tiff, TiffError};

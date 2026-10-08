@@ -132,9 +132,22 @@
     {
       "id": "CUSTOM-007",
       "name": "Bounded camera JPEG reads for fast RAW culling",
-      "status": "in-progress",
-      "files": [],
-      "checks": []
+      "status": "implemented",
+      "files": [
+        "crates/raw/src/preview_seek.rs",
+        "crates/engine/src/files.rs",
+        "docs/custom/A1-II-CORPUS.json"
+      ],
+      "checks": [
+        {
+          "file": "crates/raw/src/preview_seek.rs",
+          "contains": "aggregate_read_bytes_and_request_budgets_are_enforced"
+        },
+        {
+          "file": "crates/engine/src/files.rs",
+          "contains": "filesystem_preview_seeks_preserve_camera_pixels_orientation_and_resize"
+        }
+      ]
     },
     {
       "id": "CUSTOM-008",

@@ -7,7 +7,8 @@ and how future creator updates are tested without replacing custom work.
 
 ## Working directly in a folder
 
-The target camera is the **Sony A1 II (ILCE-1M2)**. The target kit is Sony
+The target camera is the **Sony A1 II (ILCE-1M2)**;
+[verified corpus coverage](A1-II-COVERAGE.md) records nine tested RAW variants. The target kit is Sony
 FE 14mm F1.8 GM, FE 24mm F1.4 GM, FE 50mm F1.4 GM, FE 70–200mm
 F2.8 GM OSS II, FE 300mm F2.8 GM OSS and the Viltrox Sony E 2× converter
 (TC-2.0X). Lens recognition, RAW decoding and measured optical calibration
@@ -32,6 +33,9 @@ RAW pixels. The view labels which source is displayed.
 
 Folders are queued in natural filename order and imported in small background
 batches, so the first images appear before the whole folder finishes importing.
+A bounded TIFF seek reader retrieves camera JPEG previews without loading sensor
+payloads. It matched the previous largest-JPEG choice on 17 Sony samples,
+including all nine A1 II samples. Unsupported containers use a bounded fallback.
 Metadata probing and catalog content hashing still read original files. Rejection
 and Undo wait until that scan/import completes to prevent late batches from
 reintroducing moved paths. The 100% view also depends on the GPU texture limit;

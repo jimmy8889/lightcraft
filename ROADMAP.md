@@ -9,6 +9,8 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 The Windows/Linux custom fork adds journaled folder rejection and recovery for RAW/XMP/DOP groups.
 The direct-folder workspace adds natural filename navigation, camera-JPEG Fit previews,
 physical 100% inspection, ratings, rejection/Undo and cancellable cleaned-DNG jobs.
+Bounded seek previews match exact JPEG/orientation on 17 Sony samples; catalog
+metadata and hashing still read full originals, so ingestion latency remains separate.
 Persisted XMP fingerprints preserve external edits and keep conflicts/save failures visible.
 Linux fault and restart tests cover byte preservation and collision refusal; Windows tests
 cross-compile, with native storage/power-loss acceptance still open. Custom feature status and
