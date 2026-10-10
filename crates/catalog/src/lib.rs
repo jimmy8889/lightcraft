@@ -14,6 +14,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod dates;
+pub mod folders;
 pub mod journal;
 pub mod keywords;
 pub mod local;
@@ -29,6 +30,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use dates::{DateRun, GroupBy};
+pub use folders::FolderNode;
 pub use journal::{Journal, LoadReport, PersistStats, SnapshotPolicy, SnapshotTiming};
 pub use keywords::KeywordNode;
 use lightcraft_develop::DevelopSettings;
@@ -133,6 +135,11 @@ pub enum Op {
     MoveAlbum {
         id: AlbumId,
         parent: Option<AlbumId>,
+    },
+    /// Where the album stands among its siblings (`None`: by name). Format version 3.
+    SetAlbumOrder {
+        id: AlbumId,
+        order: Option<u32>,
     },
     SetAlbumPhotos {
         id: AlbumId,
@@ -279,6 +286,28 @@ impl Catalog {
     }
     pub fn albums(&self) -> impl Iterator<Item = &Album> {
         self.albums.values()
+    }
+    /// The albums and folders directly inside `parent` (`None`: the top level), in the order the
+    /// sidebar lists them: folders first, then by their place if the user ordered them (those
+    /// without one after, by name), else by name.
+    pub fn album_children(&self, parent: Option<AlbumId>) -> Vec<&Album> {
+        let mut kids: Vec<&Album> = self.albums.values().filter(|a| a.parent == parent).collect();
+        kids.sort_by_cached_key(|a| album_order_key(a));
+        kids
+    }
+    /// [`Self::album_children`] of every folder (and of the top level, under `None`) in one pass:
+    /// what a tree view that draws all of them wants each frame.
+    pub fn album_children_by_parent(&self) -> std::collections::HashMap<Option<AlbumId>, Vec<&Album>> {
+        let mut map: std::collections::HashMap<Option<AlbumId>, Vec<&Album>> = std::collections::HashMap::new();
+        for a in self.albums.values() {
+            map.entry(a.parent).or_default().push(a);
+        }
+        map.values_mut().for_each(|kids| kids.sort_by_cached_key(|a| album_order_key(a)));
+        map
+    }
+    /// Whether anything inside `parent` has a place of its own (the folder is ordered by hand).
+    pub fn album_children_are_ordered(&self, parent: Option<AlbumId>) -> bool {
+        self.albums.values().any(|a| a.parent == parent && a.order.is_some())
     }
     /// The Quick Collection, once something was added to it.
     pub fn quick_collection(&self) -> Option<AlbumId> {
@@ -477,7 +506,20 @@ impl Catalog {
                     }
                 }
                 let a = self.album_mut(id)?;
-                Op::MoveAlbum { id, parent: std::mem::replace(&mut a.parent, parent) }
+                if a.parent == parent {
+                    return Ok(Op::MoveAlbum { id, parent });
+                }
+                // its place belonged to the old neighbours: the undo gives it back with the folder
+                let old_order = a.order.take();
+                let old_parent = std::mem::replace(&mut a.parent, parent);
+                match old_order {
+                    Some(_) => Op::Batch { ops: vec![Op::MoveAlbum { id, parent: old_parent }, Op::SetAlbumOrder { id, order: old_order }] },
+                    None => Op::MoveAlbum { id, parent: old_parent },
+                }
+            }
+            Op::SetAlbumOrder { id, order } => {
+                let a = self.album_mut(id)?;
+                Op::SetAlbumOrder { id, order: std::mem::replace(&mut a.order, order) }
             }
             Op::SetAlbumPhotos { id, photos } => {
                 let a = self.album_mut(id)?;
@@ -612,6 +654,22 @@ impl Catalog {
         Op::Batch { ops }
     }
 
+    /// [`Self::delete_permanently_ops`] for several photos at once. One op list built against the
+    /// catalog as it is now: albums lose all of them in one write each, and stacks are shortened
+    /// (or dissolved) once, however many of their photos go.
+    pub fn delete_photos_permanently_ops(&self, ids: &[PhotoId]) -> Op {
+        let gone: std::collections::HashSet<PhotoId> = ids.iter().copied().collect();
+        let mut ops: Vec<Op> = self
+            .albums
+            .values()
+            .filter(|a| a.photos.iter().any(|p| gone.contains(p)))
+            .map(|a| Op::SetAlbumPhotos { id: a.id, photos: a.photos.iter().copied().filter(|p| !gone.contains(p)).collect() })
+            .collect();
+        ops.extend(self.remove_from_stacks_ops(ids));
+        ops.extend(gone.iter().map(|id| Op::RemovePhoto { id: *id }));
+        Op::Batch { ops }
+    }
+
     // ---- persistence
 
     /// Full snapshot as JSON.
@@ -650,10 +708,20 @@ impl Catalog {
     }
 }
 
+/// How siblings are listed: folders first, then the ones with a place of their own by it, then by
+/// name; the id settles any tie.
+fn album_order_key(a: &Album) -> (bool, bool, u32, String, AlbumId) {
+    (!a.folder, a.order.is_none(), a.order.unwrap_or(0), a.name.to_lowercase(), a.id)
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_album_order;
+#[cfg(test)]
 mod tests_background;
+#[cfg(test)]
+mod tests_folders;
 #[cfg(test)]
 mod tests_format_version;
 #[cfg(test)]

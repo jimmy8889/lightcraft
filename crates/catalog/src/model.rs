@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use lightcraft_develop::DevelopSettings;
+use lightcraft_develop::{DevelopSettings, WbMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -336,12 +336,13 @@ impl Photo {
     pub fn develops_raw(&self) -> bool {
         self.kind == MediaKind::Raw && self.preview_only.is_none()
     }
-    /// The current ARW, NEF and RW2 readers have vendor WB multipliers but no measured camera
+    /// The current ARW, NEF, RW2, RAF, CR3, CR2, PEF and SRW readers have vendor WB multipliers but no measured camera
     /// illuminant. Use adjustments relative to the camera's as-shot look, as for rendered
     /// photographs (the engine's `camera_preview::file_local_look` covers the same formats; RWL and
     /// RAW are Leica's and the oldest Panasonic bodies' names for RW2 files).
     pub fn relative_wb(&self) -> bool {
-        self.develops_raw() && ["ARW", "NEF", "NRW", "RW2", "RWL", "RAW"].iter().any(|f| self.format.eq_ignore_ascii_case(f))
+        self.develops_raw()
+            && ["ARW", "NEF", "NRW", "RW2", "RWL", "RAW", "RAF", "CR3", "CR2", "PEF", "SRW"].iter().any(|f| self.format.eq_ignore_ascii_case(f))
     }
     /// The develop settings import gave this photo: [`Photo::camera_defaults`], or the user's
     /// default preset applied on top of them ([`Photo::import_look`]).
@@ -370,7 +371,12 @@ impl Photo {
     }
     /// Edited by the user: settings differ from what import gave the photo.
     pub fn is_edited(&self) -> bool {
-        *self.develop != self.import_defaults() && !self.develop.is_unedited()
+        let mut defaults = self.import_defaults();
+        // As Shot reads the source's current WB; stored numbers can predate a decoder update.
+        if self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot {
+            defaults.wb = self.develop.wb;
+        }
+        *self.develop != defaults && !self.develop.is_unedited()
     }
     /// Capture time if known, else import time (sort key).
     pub fn date(&self) -> &str {
@@ -399,12 +405,16 @@ pub struct Album {
     /// The Quick Collection: a regular album that B adds to (one per library).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quick: bool,
+    /// Its place among the albums of the same kind in its folder, once the user ordered them by
+    /// hand (see [`crate::Catalog::album_children`]); `None`: listed by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
 }
 
 impl Album {
     /// A regular (manual) album.
     pub fn new(id: AlbumId, name: impl Into<String>) -> Album {
-        Album { id, name: name.into(), parent: None, folder: false, photos: Vec::new(), cover: None, smart: None, quick: false }
+        Album { id, name: name.into(), parent: None, folder: false, photos: Vec::new(), cover: None, smart: None, quick: false, order: None }
     }
     pub fn is_smart(&self) -> bool {
         self.smart.is_some()
@@ -430,7 +440,7 @@ mod edited_tests {
     }
 
     #[test]
-    fn sony_and_nikon_raws_use_relative_white_balance() {
+    fn supported_raws_use_relative_white_balance() {
         for (name, format, relative) in [
             ("a.arw", "ARW", true),
             ("a.nef", "NEF", true),
@@ -438,6 +448,9 @@ mod edited_tests {
             ("a.rw2", "RW2", true),
             ("a.rwl", "RWL", true),
             ("a.raw", "RAW", true),
+            ("a.raf", "rAf", true),
+            ("a.cr3", "cr3", true),
+            ("a.srw", "SRW", true),
             ("a.dng", "DNG", false),
         ] {
             let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, name, format, 10, 10, "2026-10-01T00:00:00");
@@ -446,6 +459,12 @@ mod edited_tests {
             assert_eq!(p.relative_wb(), relative, "{format}");
             let wb = p.camera_defaults().wb;
             assert_eq!((wb.temp, wb.tint), if relative { (6500.0, 0.0) } else { (5200.0, 4.0) }, "{format}");
+            p.develop = Arc::new(DevelopSettings::for_raw(5200.0, 4.0));
+            assert!(!p.is_edited(), "{format}: old As Shot values are not an edit");
+            let mut custom = (*p.develop).clone();
+            custom.wb.mode = WbMode::Custom;
+            p.develop = Arc::new(custom);
+            assert!(p.is_edited(), "{format}: Custom WB is still an edit");
             // shown from the embedded preview: a rendered image, not a relative-WB raw
             p.preview_only = Some("unsupported".into());
             assert!(!p.relative_wb());

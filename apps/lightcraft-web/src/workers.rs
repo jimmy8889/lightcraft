@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use js_sys::{Array, Object, Reflect, Uint8Array, Uint32Array};
 use lightcraft_engine::catalog::PhotoId;
-use lightcraft_engine::media::{DISK_CACHE_BYTES, RenderJob, RenderResult, SourceLevel};
+use lightcraft_engine::media::{RenderJob, RenderResult, SourceLevel};
 use lightcraft_engine::pipeline::Rendered;
 use lightcraft_preview::{Hash128, PreviewCache};
 use lightcraft_raster::{Histogram, Rgba8};
@@ -183,6 +183,9 @@ struct Inner {
     /// (photo, level) → worker that last decoded it.
     affinity: HashMap<(PhotoId, SourceLevel), usize>,
     index: ThumbIndex,
+    /// The session's thumbnail cache budget in bytes. Kept here because the prune happens on a
+    /// worker message, where the session is out of reach; the app refreshes it every frame.
+    budget: u64,
     backend: Option<Backend>,
     ctx: egui::Context,
     /// Jobs finished by workers / inline (for diagnostics).
@@ -214,7 +217,15 @@ impl Workers {
     /// Start `n` workers (none: every job runs inline). `store` is the backend kind for workers.
     /// `index` lists the stored thumbnails of `cache`, the session's rendered-thumbnail cache
     /// now: watching it from the start, a clear before the first render request still counts.
-    pub fn start(n: usize, store: &str, backend: Option<Backend>, index: ThumbIndex, cache: &Arc<PreviewCache>, ctx: egui::Context) -> Workers {
+    pub fn start(
+        n: usize,
+        store: &str,
+        backend: Option<Backend>,
+        index: ThumbIndex,
+        cache: &Arc<PreviewCache>,
+        budget: u64,
+        ctx: egui::Context,
+    ) -> Workers {
         let w = Workers(Rc::new(RefCell::new(Inner {
             preview_generation: CacheWatch::new(cache),
             workers: Vec::new(),
@@ -222,6 +233,7 @@ impl Workers {
             next_id: 0,
             affinity: HashMap::new(),
             index,
+            budget,
             backend,
             ctx,
             remote_done: 0,
@@ -328,7 +340,10 @@ impl Workers {
             }
             if stored > 0 {
                 g.index.insert(&hex, stored);
-                let gone = g.index.prune(DISK_CACHE_BYTES);
+                // The session's own budget (`library.preferences ▸ cacheMb`), not the native
+                // default: the browser accepted the setting, so it has to be the one enforced
+                // (#245).
+                let gone = g.index.prune(g.budget);
                 if !gone.is_empty()
                     && let Some(be) = g.backend.clone()
                 {
@@ -385,6 +400,12 @@ impl Workers {
         let alive = g.workers.iter().filter(|w| !w.dead).count();
         let ready = g.workers.iter().filter(|w| w.ready && !w.dead).count();
         (alive, ready, g.remote_done, g.inline_done)
+    }
+
+    /// The budget the thumbnail index is pruned to. The app refreshes it from the session every
+    /// frame, so `library.preferences ▸ cacheMb` applies to the next stored thumbnail.
+    pub fn set_budget(&self, bytes: u64) {
+        self.0.borrow_mut().budget = bytes;
     }
 }
 

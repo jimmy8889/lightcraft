@@ -54,8 +54,21 @@ fn wrap(r: Result<Value, String>) -> Outcome {
 }
 
 pub fn all_commands(app: &LightcraftApp) -> Value {
-    let mut v: Vec<Value> = app.session.commands().into_iter().map(|c| serde_json::to_value(c).unwrap_or_default()).collect();
+    let keymap = &app.ui.settings.keymap;
+    let mut v: Vec<Value> = app
+        .session
+        .commands()
+        .into_iter()
+        .map(|c| {
+            let mut v = serde_json::to_value(&c).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("shortcut".into(), json!(crate::shortcuts::shortcut_of(keymap, c.id)));
+            }
+            v
+        })
+        .collect();
     for (id, label, sc, menu) in crate::menus::ui_commands() {
+        let sc = crate::shortcuts::binding(keymap, id, *sc);
         v.push(json!({"id": id, "label": label, "shortcut": sc, "menu": [menu], "enabled": crate::menus::ui_enabled(app, id), "ui": true}));
     }
     Value::Array(v)
@@ -79,19 +92,31 @@ pub fn inspect(app: &LightcraftApp, ctx: &egui::Context) -> Value {
         "activeMask": app.session.active_mask,
         "widgetCount": app.widgets.len(),
         "perf": {"frameMs": app.perf.frame_ms, "logicMs": app.perf.logic_ms, "updateMs": app.perf.update_ms, "maxUpdateMs": app.perf.max_update_ms, "fps": app.perf.fps, "lastRenderMs": app.renderer.last_main_ms, "renderQueue": app.renderer.queued(), "rendersInFlight": app.renderer.in_flight(), "pendingSlots": app.renderer.pending_slots(), "mergeRunning": app.merge.busy(), "lastMerge": app.merge.last_result, "rendersDone": app.renderer.completed, "thumbTextures": app.renderer.thumb_textures(), "variantTextures": app.renderer.variant_textures(), "gpu": (lightcraft_engine::gpu::ready() && lightcraft_engine::gpu::available()).then(lightcraft_engine::gpu::adapter_name).flatten(), "gpuReason": lightcraft_engine::gpu::unavailable_reason(), "gpuFallback": lightcraft_engine::gpu::last_fallback()},
-        "loupe": app.loupe_shown.map(|(p, src)| json!({"photo": p.0, "source": src, "pending": app.renderer.is_pending(crate::render::Slot::Main)})),
+        "loupe": app.loupe_shown.map(|(p, src)| json!({
+            "photo": p.0,
+            "source": src,
+            "pending": app.renderer.is_pending(crate::render::Slot::Main),
+            // zoomed past the whole-frame render: the window rendered at no more than 100 % (pixels of its frame)
+            "region": app.region_view.map(|r| json!({"full": [r.full.0, r.full.1], "window": [r.window.x, r.window.y, r.window.w, r.window.h], "pending": app.renderer.is_pending(crate::render::Slot::Region)})),
+            // …and the same for the Before side of a Before/After view
+            "regionBefore": app.region_before_view.map(|r| json!({"full": [r.full.0, r.full.1], "window": [r.window.x, r.window.y, r.window.w, r.window.h], "pending": app.renderer.is_pending(crate::render::Slot::RegionBefore)})),
+        })),
         "hoverPreview": app.hover_preview.as_ref().map(|h| h.label.clone()),
         "status": app.ui.status,
         "notices": app.notices,
         "quitPrompt": app.quit_prompt,
         "rawProcessing": crate::processed_raw::status(app),
         "sidecars": app.session.sidecar_status(),
+        // how hard the background face scan may work right now, and why it is judged so (see `panels::faces::scan_pace`)
+        "faceScan": {"pace": app.caches.faces_pace, "focused": app.caches.faces_in_front, "pending": app.caches.faces_pending, "indexed": app.caches.faces_indexed},
         "unsaved": app.session.unsaved().map(|(n, e)| json!({"ops": n, "error": e})),
         "libraryProblem": app.library_problem.as_ref().map(crate::panels::library_problem::LibraryProblem::to_json),
         "scan": app.scan.as_ref().map(crate::import::ScanTask::status),
         "export": {"running": app.export.as_ref().map(crate::export_task::ExportTask::status), "last": app.last_export_result},
         "import": app.import.as_ref().map(crate::import::ImportTask::status),
         "tasks": app.tasks.labels(),
+        // commands waiting on a native file dialog shown off the UI thread (`pick`)
+        "fileDialogs": app.pending_picks.iter().map(|p| p.command.clone()).collect::<Vec<_>>(),
         "memory": memory(app),
     })
 }
@@ -264,6 +289,14 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
             ctx.request_repaint();
             ok(Value::Null)
         }
+        "ui.zoom" => {
+            let Some(factor) = f("factor").map(|v| v as f32).filter(|v| v.is_finite() && *v > 0.0) else {
+                return err("ui.zoom: factor must be a finite positive number (1 = unchanged)");
+            };
+            app.synthetic.push(egui::Event::Zoom(factor));
+            ctx.request_repaint();
+            ok(Value::Null)
+        }
         "ui.set" => {
             let mut v = serde_json::to_value(&app.ui).unwrap_or_default();
             lightcraft_develop::presets::deep_merge(&mut v, p);
@@ -298,8 +331,18 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
             ok(Value::Null)
         }
         "ui.resize" => {
+            for name in ["width", "height"] {
+                if p.get(name).is_some() && f(name).is_none() {
+                    return err(format!("ui.resize: {name} must be a number"));
+                }
+            }
             let w = f("width").unwrap_or(1600.0) as f32;
             let h = f("height").unwrap_or(1000.0) as f32;
+            let zoom = ctx.zoom_factor();
+            let native_scale = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or_else(|| ctx.pixels_per_point() / zoom);
+            if let Err(e) = crate::headless::resized_viewport([w, h], native_scale, zoom) {
+                return err(e);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             ok(Value::Null)
         }
@@ -358,7 +401,7 @@ pub fn default_export_dir() -> String {
 pub fn export_active(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
     use lightcraft_engine::export::{Destination, ExportOptions, export_batch};
     let p = &app.session.export_params(p)?;
-    let mut opts = ExportOptions::from_json(p);
+    let mut opts = ExportOptions::from_params(p).map_err(|e| e.to_string())?;
     if let (Some(path), None) = (p.get("path").and_then(Value::as_str), p.get("format")) {
         let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
         opts.format = lightcraft_engine::export::ExportFormat::parse(ext).unwrap_or(opts.format);

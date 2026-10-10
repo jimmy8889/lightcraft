@@ -40,6 +40,19 @@ pub fn unpack_lsb(src: &[u8], bits: u32, out: &mut [u16]) {
     }
 }
 
+/// Unpack MSB-first packed samples of `bits` from a stream of 32-bit words stored in `order` (a word is read as a
+/// number first, then its bits are taken from the top): the layout of some cameras' uncompressed 12- and 14-bit
+/// data, which is not the byte-wise MSB stream of [`unpack_msb`] unless `order` is big-endian. A short last word
+/// is padded with zeros.
+pub fn unpack_words32_msb(src: &[u8], order: ByteOrder, bits: u32, out: &mut [u16]) {
+    let words = src.chunks(4).flat_map(|c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        order.u32(w).to_be_bytes()
+    });
+    unpack_msb(&words.collect::<Vec<u8>>(), bits, out);
+}
+
 pub fn read_u16s(src: &[u8], order: ByteOrder, out: &mut [u16]) {
     for (o, c) in out.iter_mut().zip(src.as_chunks::<2>().0) {
         *o = order.u16([c[0], c[1]]);
@@ -127,6 +140,30 @@ pub fn undo_float_predictor(row: &mut [u8], n: usize, bytes_per: usize, stride: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn words32_are_read_as_numbers_then_msb_first() {
+        // eight 12-bit samples occupy 96 bits = three 32-bit words, filled from the top
+        let samples: [u16; 8] = [0x123, 0x456, 0x789, 0xabc, 0xdef, 0x012, 0x345, 0x678];
+        let stream = samples.iter().fold(0u128, |acc, &v| (acc << 12) | v as u128);
+        let words = [(stream >> 64) as u32, (stream >> 32) as u32, stream as u32];
+        let le: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let be: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let mut o = [0u16; 8];
+        unpack_words32_msb(&le, ByteOrder::Little, 12, &mut o);
+        assert_eq!(o, samples);
+        o = [0; 8];
+        unpack_words32_msb(&be, ByteOrder::Big, 12, &mut o);
+        assert_eq!(o, samples);
+        // read as a plain byte stream the little-endian words give different samples
+        o = [0; 8];
+        unpack_msb(&le, 12, &mut o);
+        assert_ne!(o, samples);
+        // a short last word is zero padded
+        let mut o = [9u16; 2];
+        unpack_words32_msb(&[0x34, 0x12], ByteOrder::Little, 12, &mut o);
+        assert_eq!(o, [0x000, 0x012]); // the word 0x00001234, top bits first
+    }
 
     #[test]
     fn packing() {

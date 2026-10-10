@@ -120,6 +120,38 @@ fn path_writes_never_replace_an_original() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Issue #181: a misspelled or unreadable `app.export` param is an error through the headless
+/// backend (what `lightcraft-cli run` and the MCP `export` tool use), not a silent default.
+#[test]
+fn export_refuses_unknown_params_and_bad_values() {
+    let mut b = Headless::demo();
+    let out = "/nonexistent-lc-test/x.jpg";
+    let e = b.call("app.export", json!({"path": out, "longEdgee": 400})).unwrap_err();
+    assert!(e.contains("unknown parameter `longEdgee` (did you mean `longEdge`?)"), "{e}");
+    let e = b.call("app.export", json!({"path": out, "longEdge": "banana"})).unwrap_err();
+    assert!(e.contains("`longEdge` must be a number"), "{e}");
+    let e = b.call("app.export", json!({"path": out, "watermark": {"text": "x", "size": 3}})).unwrap_err();
+    assert!(e.contains("`watermark.size` must be a number 0.005..0.5"), "{e}");
+    // `export` tool and preset expansion go through the same check
+    let r = call_tool(&mut b, "export", &json!({"path": out, "quality": 101}));
+    assert!(r.is_error, "{r:?}");
+    let e = b.session.execute("export.savePreset", &json!({"name": "Typo", "params": {"qualty": 5}})).unwrap_err().to_string();
+    assert!(e.contains("did you mean `quality`"), "{e}");
+}
+
+/// Every option the `export` tool advertises reaches `app.export` (they were accepted, then dropped).
+#[test]
+fn export_tool_forwards_its_advertised_options() {
+    let mut b = Headless::demo();
+    let base = std::env::temp_dir().join(format!("lc-mcp-export-fwd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let r = call_tool(&mut b, "export", &json!({"dir": base.to_string_lossy(), "subfolder": "sub", "longEdge": 64, "format": "png"}));
+    assert!(!r.is_error, "{r:?}");
+    let files: Vec<_> = std::fs::read_dir(base.join("sub")).unwrap().collect();
+    assert_eq!(files.len(), 1, "written into the subfolder");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// The `import` helper moves: renamed into the folder template, the source removed.
 #[test]
 fn import_tool_moves_with_a_folder_template() {
@@ -196,7 +228,7 @@ fn resources() {
     let mut s = server();
     let r = rpc(&mut s, 1, "resources/list", json!({}));
     let list = r["result"]["resources"].as_array().unwrap();
-    assert_eq!(list.len(), 5);
+    assert_eq!(list.len(), 7);
     for (i, res) in list.iter().enumerate() {
         let uri = res["uri"].as_str().unwrap();
         let r = rpc(&mut s, 10 + i as u64, "resources/read", json!({"uri": uri}));
@@ -204,4 +236,138 @@ fn resources() {
         serde_json::from_str::<Value>(text).unwrap();
     }
     assert_eq!(rpc(&mut s, 99, "resources/read", json!({"uri": "lightcraft://nope"}))["error"]["code"], -32002);
+}
+
+/// `select_photos` with an id that is not in the library is a tool error, and the photo that was
+/// active stays active (#182).
+#[test]
+fn select_photos_rejects_unknown_ids_and_keeps_the_active_photo() {
+    let mut b = Headless::demo();
+    let first = b.session.visible_cloned()[0];
+    let r = call_tool(&mut b, "select_photos", &json!({"ids": [first.0]}));
+    assert!(!r.is_error, "{r:?}");
+    let r = call_tool(&mut b, "select_photos", &json!({"ids": [9999]}));
+    assert!(r.is_error, "{r:?}");
+    assert!(r.content[0]["text"].as_str().unwrap().contains("no such photo 9999"), "{r:?}");
+    assert_eq!(b.session.active(), Some(first));
+    let r = call_tool(&mut b, "get_develop", &json!({}));
+    assert!(!r.is_error, "{r:?}");
+    let r = call_tool(&mut b, "get_develop", &json!({"id": 9999}));
+    assert!(r.is_error, "{r:?}");
+    let r = call_tool(&mut b, "set_develop", &json!({"id": 9999, "values": {"light.exposure": 1.0}}));
+    assert!(r.is_error, "{r:?}");
+    assert_eq!(b.session.active(), Some(first));
+}
+
+#[test]
+fn core_tools_have_hints_and_reject_unknown_keys() {
+    for compact in [false, true] {
+        let mut s = server().with_command_tools(!compact);
+        let list = rpc(&mut s, 1, "tools/list", json!({}));
+        let tools = list["result"]["tools"].as_array().unwrap();
+        for name in ["command_list", "command_run", "command_batch", "doc_inspect", "render_preview", "list_commands", "run_command", "render_photo"]
+        {
+            assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
+        }
+        for t in tools {
+            assert!(!t["title"].as_str().unwrap().is_empty());
+            for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+                assert!(t["annotations"][hint].is_boolean(), "{t}");
+            }
+        }
+        for name in ["command_list", "command_run", "command_batch", "doc_inspect", "render_preview", "query_photos", "run_command"] {
+            let r = rpc(&mut s, 2, "tools/call", json!({"name":name,"arguments":{"misspelled":true}}));
+            assert_eq!(r["error"]["code"], -32602, "{r}");
+            assert!(r["error"]["message"].as_str().unwrap().contains("misspelled"), "{r}");
+        }
+        let preview = tools.iter().find(|t| t["name"] == "render_preview").unwrap();
+        assert_eq!(preview["annotations"]["readOnlyHint"], true);
+        assert!(preview["inputSchema"]["properties"].get("path").is_none());
+        let writer = tools.iter().find(|t| t["name"] == "render_photo").unwrap();
+        assert_eq!(writer["annotations"]["readOnlyHint"], false);
+        let export = tools.iter().find(|t| t["name"] == "export").unwrap();
+        for key in lightcraft_engine::export::OPTION_PARAMS.iter().chain(lightcraft_engine::export::TARGET_PARAMS) {
+            assert!(export["inputSchema"]["properties"].get(*key).is_some(), "missing export argument {key}");
+        }
+        let before = rpc(&mut s, 2, "resources/read", json!({"uri":"lightcraft://library"}));
+        let image = rpc(&mut s, 2, "tools/call", json!({"name":"render_preview","arguments":{"max_side":64}}));
+        assert_eq!(image["result"]["isError"], false, "{image}");
+        assert!(image["result"]["content"].as_array().unwrap().iter().any(|c| c["type"] == "image"));
+        assert_eq!(before, rpc(&mut s, 2, "resources/read", json!({"uri":"lightcraft://library"})));
+        let batch = json!({"steps":[{"id":"catalog.stats"},{"id":"no.such"},{"id":"catalog.stats"}],"stop_on_error":false});
+        let r = rpc(&mut s, 3, "tools/call", json!({"name":"command_batch","arguments":batch}));
+        assert_eq!(r["result"]["isError"], true);
+        assert_eq!(r["result"]["structuredContent"]["completed"], 2);
+        assert_eq!(r["result"]["structuredContent"]["failed"], 1);
+        let r = rpc(&mut s, 4, "tools/call", json!({"name":"command_batch","arguments":{"steps":[{"id":"no.such"},{"id":"catalog.stats"}]}}));
+        assert_eq!(r["result"]["structuredContent"]["completed"], 0);
+        assert_eq!(r["result"]["structuredContent"]["results"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn core_resources_match_tools_after_parse_error() {
+    let mut s = server();
+    let bad: Value = serde_json::from_str(&s.handle_line("{bad").unwrap()).unwrap();
+    assert_eq!(bad["error"]["code"], -32700);
+    assert!(bad["id"].is_null());
+    let list = rpc(&mut s, 1, "resources/list", json!({}));
+    for (uri, tool) in [("lightcraft://document", "doc_inspect"), ("lightcraft://commands", "command_list")] {
+        assert!(list["result"]["resources"].as_array().unwrap().iter().any(|r| r["uri"] == uri));
+        let resource = rpc(&mut s, 2, "resources/read", json!({"uri":uri}));
+        let call = rpc(&mut s, 3, "tools/call", json!({"name":tool,"arguments":{}}));
+        let a: Value = serde_json::from_str(resource["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+        let b: Value = serde_json::from_str(call["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(a, b);
+    }
+    let old = rpc(&mut s, 4, "resources/read", json!({"uri":"lightcraft://library"}));
+    assert!(old["result"]["contents"].is_array(), "{old}");
+}
+
+#[test]
+fn escaped_tool_panic_is_an_error_and_session_survives() {
+    struct Faulty {
+        inner: Headless,
+        fail: bool,
+    }
+    impl Backend for Faulty {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            if method == "engine.execute" && params["command"] == "catalog.stats" && std::mem::take(&mut self.fail) {
+                panic!("synthetic backend panic");
+            }
+            self.inner.call(method, params)
+        }
+        fn has_ui(&self) -> bool {
+            false
+        }
+        fn describe(&self) -> String {
+            "test".into()
+        }
+    }
+    let mut s = Server::new(Box::new(Faulty { inner: Headless::demo(), fail: true }));
+    let params = json!({"name":"run_command","arguments":{"command":"catalog.stats"}});
+    let r = rpc(&mut s, 1, "tools/call", params.clone());
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r.to_string().contains("synthetic backend panic"));
+    assert_eq!(rpc(&mut s, 2, "tools/call", params)["result"]["isError"], false);
+    assert!(rpc(&mut s, 3, "ping", json!({}))["result"].is_object());
+}
+
+#[test]
+fn modern_requests_receive_result_and_cache_fields() {
+    let mut s = server();
+    let meta = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28"});
+    for (method, mut params) in [
+        ("tools/list", json!({})),
+        ("resources/list", json!({})),
+        ("resources/templates/list", json!({})),
+        ("resources/read", json!({"uri":"lightcraft://library"})),
+    ] {
+        params["_meta"] = meta.clone();
+        let r = rpc(&mut s, 1, method, params);
+        assert_eq!(r["result"]["resultType"], "complete", "{r}");
+        assert_eq!(r["result"]["cacheScope"], "private");
+        assert_eq!(r["result"]["ttlMs"], if method == "resources/read" { 0 } else { 600_000 });
+    }
+    assert!(rpc(&mut s, 2, "tools/list", json!({}))["result"].get("resultType").is_none());
 }

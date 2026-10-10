@@ -14,32 +14,50 @@ pub mod headless;
 pub mod i18n;
 pub mod icons;
 pub mod import;
+pub mod lightroom_import;
 pub mod links;
+pub mod menu_level;
 pub mod menubar;
 pub mod menus;
 pub mod merge;
+mod model_setup;
 pub mod panels;
+pub mod pick;
 pub mod processed_raw;
+pub mod region;
 pub mod render;
 pub mod shortcuts;
 pub mod softpaint;
 pub mod state;
 pub mod tasks;
 pub mod theme;
+pub mod titlebar;
 pub mod widgets;
 
 #[cfg(test)]
 mod tests_curve;
 #[cfg(test)]
+mod tests_filmstrip;
+#[cfg(test)]
 mod tests_grid;
+#[cfg(test)]
+mod tests_keymap;
+#[cfg(test)]
+mod tests_labels;
 #[cfg(test)]
 mod tests_library_problem;
 #[cfg(test)]
 mod tests_masking;
 #[cfg(test)]
+mod tests_masking_layout;
+#[cfg(test)]
+mod tests_menubar;
+#[cfg(test)]
 mod tests_offline;
 #[cfg(test)]
 mod tests_panels;
+#[cfg(test)]
+mod tests_preview_limit;
 #[cfg(test)]
 mod tests_quit_unsaved;
 #[cfg(test)]
@@ -47,7 +65,11 @@ mod tests_scroll;
 #[cfg(test)]
 mod tests_switch_library;
 #[cfg(test)]
+mod tests_titlebar;
+#[cfg(test)]
 mod tests_unsaved;
+#[cfg(test)]
+mod tests_zoom;
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -56,6 +78,8 @@ use serde_json::Value;
 
 pub use control::{ControlRequest, ControlResponse};
 pub use state::UiState;
+
+const TOAST_SECONDS: f64 = 1.4;
 
 pub type PickFiles = Box<dyn FnMut() -> Vec<String>>;
 /// A save dialog: suggested file name → chosen path (`None` = cancelled).
@@ -79,8 +103,16 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
 /// Platform services injected by the host app (desktop or web).
 #[derive(Default)]
 pub struct Services {
+    /// Native file dialogs for commands, shown off the UI thread and answered later
+    /// (`pick`; #191). With it, the synchronous pickers below serve only the buttons inside
+    /// dialogs; without it (the web, tests) they answer the commands too.
+    pub picker: Option<pick::Picker>,
     /// Show an open dialog for photos; returns paths.
     pub pick_files: Option<PickFiles>,
+    /// Local ONNX model; a manifest must accompany it.
+    pub pick_denoise_model: Option<PickFiles>,
+    /// Open dialog for a face model (`.onnx`; Settings ▸ Faces ▸ Add a model file…).
+    pub pick_model_file: Option<PickFiles>,
     /// Open dialog for preset files (`.lcpreset`, `.xmp`, `.lrtemplate`, `.zip`, `.dng`, Luminar `.lmp` / `.mplumpack`).
     pub pick_preset_files: Option<PickFiles>,
     /// Open dialog for a GPS track log (`.gpx`; Photo ▸ Auto-Tag from Tracklog…).
@@ -98,8 +130,13 @@ pub struct Services {
     pub png: Option<PngEncode>,
     /// Show a file in the system file manager (desktop only).
     pub reveal: Option<RevealFn>,
+    /// The host's current log file (`<settings>/logs/lightcraft.log`), which Help ▸ Open Log
+    /// Folder reveals (#260). None where no log is kept: the web, `--memory`, `LIGHTCRAFT_NO_PREFS`.
+    pub log_file: Option<String>,
     /// Choose a folder (Settings → General → Open Library…; desktop only).
     pub pick_folder: Option<PickFolder>,
+    /// Open a Lightroom Classic `.lrcat` catalog for read-only import.
+    pub pick_lightroom_catalog: Option<PickFolder>,
     /// Open a web link in the browser (Help menu, About, Discord button).
     pub open_url: Option<OpenUrlFn>,
     /// Open a file in an external editor (Edit in External Editor; desktop only).
@@ -127,6 +164,7 @@ pub struct Perf {
 }
 
 pub struct LightcraftApp {
+    pub(crate) model_setup: model_setup::Pending,
     /// Per-catalog-revision caches of library-wide results the panels show every frame
     /// (expensive on big libraries).
     pub caches: Caches,
@@ -142,6 +180,9 @@ pub struct LightcraftApp {
     /// Shortcuts the native menu bar currently handles (`Cmd+Z`, `G`…): the egui shortcut handler
     /// leaves them alone so nothing fires twice.
     pub native_shortcuts: std::collections::HashSet<String>,
+    /// The keyboard shortcuts editor is waiting for a key press for this command: no shortcut
+    /// fires (the native menu bar drops its accelerators too) until it gets one or is cancelled.
+    pub recording_shortcut: Option<String>,
     /// The host is [`headless::Headless`] (it answers viewport screenshot commands itself).
     pub headless_host: bool,
     /// Warnings to show one at a time (damaged settings files…, issue #103).
@@ -157,6 +198,8 @@ pub struct LightcraftApp {
     shadow: Option<headless::HeadlessView>,
     /// Synthetic input events (from the control channel) injected one step per frame.
     pub synthetic: Vec<egui::Event>,
+    /// Native file dialogs up for commands (`pick`): each command runs again when its closes.
+    pub(crate) pending_picks: Vec<pick::Pending>,
     /// Modifiers announced for synthetic input (held from a button down to its release).
     synthetic_mods: egui::Modifiers,
     /// Clear `synthetic_mods` on the next frame.
@@ -165,6 +208,8 @@ pub struct LightcraftApp {
     /// The language the installed fonts were built for: the CJK fallback order follows the UI
     /// language's script, so switching language reinstalls them.
     font_language: i18n::Locale,
+    /// Browser font loaded separately from WASM so the module stays below its host's size limit.
+    chinese_font: Option<std::sync::Arc<egui::FontData>>,
     fonts_ready: bool,
     last_time: f64,
     /// Rect of the photo canvas and the displayed image (screen points) from the last frame.
@@ -181,12 +226,26 @@ pub struct LightcraftApp {
     /// What the loupe drew last frame: photo and source ("render", "cached", "embedded", "small",
     /// "thumb", "none").
     pub loupe_shown: Option<(lightcraft_catalog::PhotoId, &'static str)>,
+    /// The window render the loupe asked for last, by job key (see [`region`]); kept for the few
+    /// windows whose textures can be on screen, and for the inspector.
+    pub region_view: Option<region::RegionView>,
+    /// The same for the Before side of a Before/After view.
+    pub region_before_view: Option<region::RegionView>,
+    /// The loupe's render sizes while a pinch or two-finger scroll runs.
+    pub(crate) size_hold: region::SizeHold,
+    /// (photo, look, window frame size) a window was refused for: it reads more than one render holds.
+    pub(crate) window_refused: Option<(lightcraft_catalog::PhotoId, u64, usize)>,
+    pub(crate) region_tiles: std::collections::HashMap<(bool, u64), region::RegionView>,
     /// Photo Merge dialog previews and background merges.
     pub merge: merge::MergeState,
     /// An import in progress (the import review dialog's batches).
     pub import: Option<import::ImportTask>,
     /// A folder scan in progress (feeds the import review).
     pub scan: Option<import::ScanTask>,
+    /// A Lightroom catalog inspect/import in progress.
+    pub lightroom: Option<lightroom_import::LightroomTask>,
+    /// Last terminal Lightroom result, exposed by the command's status/wait response.
+    pub lightroom_last: Option<Value>,
     /// A background export in progress.
     pub export: Option<export_task::ExportTask>,
     /// Background file-system work of other commands (Find Missing Photos, auto import…).
@@ -222,6 +281,7 @@ impl LightcraftApp {
             integrated_titlebar: false,
             native_menu: false,
             native_shortcuts: Default::default(),
+            recording_shortcut: None,
             headless_host: false,
             notices: vec![],
             quit_prompt: None,
@@ -231,10 +291,12 @@ impl LightcraftApp {
             screenshot_token: 0,
             shadow: None,
             synthetic: vec![],
+            pending_picks: vec![],
             synthetic_mods: egui::Modifiers::NONE,
             synthetic_mods_release: false,
             styled: false,
             font_language: i18n::Locale::En,
+            chinese_font: None,
             fonts_ready: false,
             last_time: 0.0,
             canvas_rect: None,
@@ -244,9 +306,16 @@ impl LightcraftApp {
             widgets: vec![],
             gesture: None,
             loupe_shown: None,
+            region_view: None,
+            region_before_view: None,
+            size_hold: Default::default(),
+            window_refused: None,
+            region_tiles: Default::default(),
             merge: merge::MergeState::default(),
             import: None,
             scan: None,
+            lightroom: None,
+            lightroom_last: None,
             export: None,
             tasks: Default::default(),
             processed_raw: Default::default(),
@@ -256,7 +325,16 @@ impl LightcraftApp {
             gpu_applied: None,
             memory_applied: None,
             library_problem: None,
+            model_setup: Default::default(),
         }
+    }
+
+    /// Supply the browser's separately downloaded Simplified Chinese font before the first frame.
+    pub fn with_chinese_font(mut self, bytes: Vec<u8>) -> Self {
+        if !bytes.is_empty() {
+            self.chinese_font = Some(std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        }
+        self
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
@@ -274,13 +352,38 @@ impl LightcraftApp {
         if let Some(r) = folder::run(self, id, &params) {
             return r;
         }
+        if let Some(result) = model_setup::intercept(self, id, &params) {
+            return result;
+        }
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
         }
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
-        if let Err(e) = &r {
-            log::warn!("{id}: {e}");
-            self.ui.status = e.clone();
+        if r.is_ok() && id == "photo.label" {
+            let label = params.get("label").and_then(Value::as_str).and_then(lightcraft_catalog::ColorLabel::parse);
+            let text = match label {
+                Some(label) => {
+                    let name =
+                        self.session.catalog.custom_label_name(label).map(str::to_owned).unwrap_or_else(|| i18n::tr(&format!("{label:?}")).into());
+                    i18n::tr_format!("{name} Label", name = name)
+                }
+                None => i18n::tr("Color label cleared").into(),
+            };
+            // Native menu clicks can arrive before logic() updates last_time after an idle gap.
+            let now = self.tasks.repaint.as_ref().map(|ctx| ctx.input(|i| i.time)).unwrap_or(self.last_time);
+            self.ui.toast = Some((text, now + TOAST_SECONDS, label));
+        }
+        match &r {
+            Err(e) => {
+                log::warn!("{id}: {e}");
+                self.ui.status = e.clone();
+                // no detector yet: offer it (its terms first) instead of only saying so
+                if id == "faces.detect" && e.contains("Settings > Faces") {
+                    panels::faces::offer_detector(self);
+                }
+            }
+            Ok(v) if id == "faces.detect" => self.ui.status = detect_summary(v),
+            Ok(_) => {}
         }
         r
     }
@@ -322,11 +425,13 @@ impl LightcraftApp {
                 let plural = if done == 1 { "" } else { "s" };
                 let mut msg = match (b.error(), b.what) {
                     (Some(e), what) => format!("{}: {e}", if what.is_empty() { "previews" } else { what }),
-                    (None, "") => format!("Previews ready for {done} photo{plural}"),
-                    (None, what) => format!("Done ({what}): {done} photo{plural}"),
+                    (None, "") => crate::i18n::tr_format!("Previews ready for {done} photo{plural}", done = done, plural = plural),
+                    (None, what) => {
+                        crate::i18n::tr_format!("Done ({what}): {done} photo{plural}", done = done, plural = plural, what = crate::i18n::tr(what))
+                    }
                 };
                 if failed > 0 {
-                    msg.push_str(&format!(" · {failed} couldn't be rendered"));
+                    msg.push_str(&crate::i18n::tr_format!(" · {failed} couldn't be rendered", failed = failed));
                 }
                 self.toast(ctx, msg);
             }
@@ -334,8 +439,8 @@ impl LightcraftApp {
             if self.ui.preview_build_seen != Some((key, false)) {
                 self.ui.preview_build_seen = Some((key, false));
                 let msg = match b.what {
-                    "" => format!("Building previews for {} photos…", b.total),
-                    what => format!("Working on {what} for {} photos…", b.total),
+                    "" => crate::i18n::tr_format!("Building previews for {} photos…", b.total),
+                    what => crate::i18n::tr_format!("Working on {what} for {} photos…", b.total, what = crate::i18n::tr(what)),
                 };
                 self.toast(ctx, msg);
             }
@@ -351,8 +456,16 @@ impl LightcraftApp {
             (Some((n, e)), false) => {
                 self.ui.unsaved_seen = true;
                 let t = ctx.input(|i| i.time);
-                let what = if n == 1 { "1 change".to_string() } else { format!("{n} changes") };
-                self.ui.toast = Some((format!("{what} saved in memory but not written to disk: {e} — LightCraft will retry"), t + 6.0));
+                self.ui.toast = Some((
+                    crate::i18n::tr_format!(
+                        "{n} change{} saved in memory but not written to disk: {e} — LightCraft will retry",
+                        if n == 1 { "" } else { "s" },
+                        n = n,
+                        e = e
+                    ),
+                    t + 6.0,
+                    None,
+                ));
             }
             (None, true) => {
                 self.ui.unsaved_seen = false;
@@ -374,13 +487,13 @@ impl LightcraftApp {
     }
 
     pub fn toast(&mut self, ctx: &egui::Context, text: impl Into<String>) {
-        self.toast_for(ctx, text, 1.4);
+        self.toast_for(ctx, text, TOAST_SECONDS);
     }
 
     /// A toast that stays `secs` seconds (messages that say where to look or what to do next).
     pub fn toast_for(&mut self, ctx: &egui::Context, text: impl Into<String>, secs: f64) {
         let t = ctx.input(|i| i.time);
-        self.ui.toast = Some((text.into(), t + secs));
+        self.ui.toast = Some((text.into(), t + secs, None));
     }
 
     /// AI masks: apply finished background requests (clicks, descriptions, detail passes) and
@@ -415,7 +528,7 @@ impl LightcraftApp {
                 (Some(e), false) if e.contains("cancelled") => {
                     self.toast(ctx, crate::i18n::tr("SAM 3 download stopped: it resumes where it left off next time."))
                 }
-                (Some(e), false) => self.toast_error(ctx, format!("The SAM 3 download failed: {e}")),
+                (Some(e), false) => self.toast_error(ctx, crate::i18n::tr_format!("The SAM 3 download failed: {e}", e = e)),
                 (None, false) if download.finished => {
                     self.toast_error(ctx, crate::i18n::tr("The SAM 3 model is installed: Object and Describe masks are ready."))
                 }
@@ -458,7 +571,7 @@ impl LightcraftApp {
     /// A toast for an error the user has to read and act on (stays 6 s).
     pub fn toast_error(&mut self, ctx: &egui::Context, text: impl Into<String>) {
         let t = ctx.input(|i| i.time);
-        self.ui.toast = Some((text.into(), t + 6.0));
+        self.ui.toast = Some((text.into(), t + 6.0, None));
     }
 
     fn drain_control(&mut self, ctx: &egui::Context) {
@@ -542,7 +655,10 @@ impl LightcraftApp {
         let mut view = self.shadow.take().unwrap_or_default();
         let size = main.input(|i| i.content_rect()).size();
         let size = if size.x >= 1.0 && size.y >= 1.0 { size } else { egui::vec2(1600.0, 1000.0) };
-        let ppp = main.pixels_per_point();
+        // Feed native viewport points; the shadow context applies the copied UI zoom.
+        let zoom = main.zoom_factor();
+        let size = size * zoom;
+        let ppp = main.pixels_per_point() / zoom;
         let time = main.input(|i| i.time);
         if view.frames() == 0 {
             // warm-up pass: activates our fonts (pending font definitions live in `Memory`, which
@@ -600,7 +716,7 @@ impl LightcraftApp {
 
     fn logic_inner(&mut self, ctx: &egui::Context) {
         if !self.styled {
-            theme::install_fonts(ctx);
+            theme::install_fonts_with_chinese(ctx, self.chinese_font.as_ref());
             theme::apply(ctx);
             // File → Add from Device lists cards scanned in the background: show hot-plugs
             let repaint = ctx.clone();
@@ -614,7 +730,7 @@ impl LightcraftApp {
         } else if self.font_language != self.ui.language {
             // Shared Han characters take the active language's forms (Japanese faces for 日本語,
             // the Simplified Chinese face for 简体中文): rebuild the fallback order.
-            theme::install_fonts(ctx);
+            theme::install_fonts_with_chinese(ctx, self.chinese_font.as_ref());
             self.font_language = self.ui.language;
         } else {
             self.fonts_ready = true;
@@ -639,11 +755,13 @@ impl LightcraftApp {
         merge::poll(self, ctx);
         import::poll_scan(self, ctx);
         import::tick(self, ctx);
+        lightroom_import::tick(self, ctx);
         tasks::poll(self, ctx);
         folder::tick(self);
         self.preview_build_status(ctx);
         self.save_status(ctx);
         self.slideshow_tick(ctx);
+        panels::faces::pump(self, ctx);
         // back from an external editor: pick up the files it saved
         let focused = ctx.input(|i| i.focused);
         if focused && !self.ui.was_focused && !self.ui.external_edits.is_empty() {
@@ -661,7 +779,7 @@ impl LightcraftApp {
         if let Some(folder) = self.session.import_defaults.auto_folder.clone() {
             const LABEL: &str = "Auto Import";
             let now = ctx.input(|i| i.time);
-            if now - self.ui.auto_import_at >= 3.0 && self.import.is_none() && !self.tasks.is_running(LABEL) {
+            if now - self.ui.auto_import_at >= 3.0 && self.import.is_none() && self.lightroom.is_none() && !self.tasks.is_running(LABEL) {
                 self.ui.auto_import_at = now;
                 let work = move || lightcraft_engine::cmd::library::list_auto_import_folder(&folder);
                 let done = |app: &mut LightcraftApp, _ctx: &egui::Context, listing: Result<Vec<(String, u64)>, String>| {
@@ -687,6 +805,9 @@ impl LightcraftApp {
             ctx.request_repaint_after(std::time::Duration::from_secs(3));
         }
         self.session.persist_if_dirty();
+        panels::denoise::pump(self, ctx);
+        model_setup::pump(self, ctx);
+        panels::faces::pump(self, ctx);
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
         if self.fonts_ready {
@@ -697,6 +818,13 @@ impl LightcraftApp {
             let dropped: Vec<String> =
                 ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().to_string()).filter(|p| !p.is_empty()).collect());
             // preset files import as presets, everything else as photos
+            // a dropped face model opens its licence dialog; presets and photos as before
+            let (models, dropped): (Vec<String>, Vec<String>) = dropped.into_iter().partition(|p| is_model_file(p));
+            if let Some(model) = models.first()
+                && let Err(e) = panels::faces::open_dialog(self, model)
+            {
+                self.toast(ctx, e);
+            }
             let (presets, photos): (Vec<String>, Vec<String>) = dropped.into_iter().partition(|p| is_preset_file(p));
             if !presets.is_empty() {
                 let _ = self.run("file.importPresets", serde_json::json!({"paths": presets}));
@@ -853,9 +981,12 @@ impl LightcraftApp {
         panels::library_problem::show(self, &ctx);
         import::progress(self, &ctx);
         import::scan_progress(self, &ctx);
+        lightroom_import::progress(self, &ctx);
         export_task::poll(self, &ctx);
         processed_raw::show(self, &ctx);
+        pick::poll(self, &ctx);
         panels::grid::drag_feedback(self, &ctx);
+        panels::left::album_drag_feedback(self, &ctx);
         panels::toast(self, &ctx);
         self.widgets = widgets::take_registry(&ctx);
         self.end_frame(t0);
@@ -900,6 +1031,25 @@ pub fn is_bw(d: &lightcraft_develop::DevelopSettings) -> bool {
     d.treatment == lightcraft_develop::Treatment::Bw || d.profile.id == "lc.mono" || d.profile.id.starts_with("lc.bw.")
 }
 
+/// "Found 3 faces in 2 photos" for a `faces.detect` result.
+fn detect_summary(v: &Value) -> String {
+    let photos = v["photos"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let counts: Vec<usize> = photos.iter().map(|p| p["faces"].as_array().map_or(0, Vec::len)).collect();
+    let (faces, with) = (counts.iter().sum::<usize>(), counts.iter().filter(|n| **n > 0).count());
+    let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+    match (faces, photos.len()) {
+        (0, 1) => "No faces found".into(),
+        (0, n) => format!("No faces found in {}", plural(n, "photo")),
+        (f, 1) => format!("Found {}", plural(f, "face")),
+        (f, _) => format!("Found {} in {}", plural(f, "face"), plural(with, "photo")),
+    }
+}
+
+/// A dropped face model file (`.onnx`).
+pub fn is_model_file(path: &str) -> bool {
+    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("onnx"))
+}
+
 /// Files dropped on the window that are presets rather than photos.
 pub fn is_preset_file(path: &str) -> bool {
     let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
@@ -908,6 +1058,28 @@ pub fn is_preset_file(path: &str) -> bool {
 
 #[cfg(test)]
 mod drop_tests {
+    #[test]
+    fn detection_results_are_summarised_in_words() {
+        let r =
+            |counts: &[usize]| serde_json::json!({"photos": counts.iter().map(|n| serde_json::json!({"faces": vec![0; *n]})).collect::<Vec<_>>()});
+        assert_eq!(super::detect_summary(&r(&[0])), "No faces found");
+        assert_eq!(super::detect_summary(&r(&[1])), "Found 1 face");
+        assert_eq!(super::detect_summary(&r(&[3])), "Found 3 faces");
+        assert_eq!(super::detect_summary(&r(&[0, 0])), "No faces found in 2 photos");
+        assert_eq!(super::detect_summary(&r(&[2, 0, 1])), "Found 3 faces in 2 photos");
+        assert_eq!(super::detect_summary(&serde_json::json!({})), "No faces found in 0 photos");
+    }
+
+    #[test]
+    fn dropped_face_models_are_told_apart() {
+        for p in ["/a/model.onnx", "/a/dir/M.ONNX"] {
+            assert!(super::is_model_file(p), "{p}");
+        }
+        for p in ["/a/model.onnx.jpg", "/a/onnx", "/a/b.png"] {
+            assert!(!super::is_model_file(p), "{p}");
+        }
+    }
+
     #[test]
     fn dropped_presets_are_told_apart_from_photos() {
         for p in ["/a/Look.lrtemplate", "/a/b.XMP", "/a/pack.zip", "/a/x.lcpreset", "/a/Magic Hour.mplumpack", "/a/Pop.lmp", "/a/Bundle.LMP"] {
@@ -923,6 +1095,7 @@ mod drop_tests {
 #[derive(Default)]
 pub struct Caches {
     keyword_tree: Option<(u64, std::sync::Arc<Vec<lightcraft_catalog::KeywordNode>>)>,
+    folder_tree: Option<(u64, std::sync::Arc<Vec<lightcraft_catalog::FolderNode>>)>,
     people: Option<(u64, lightcraft_catalog::Filter, std::sync::Arc<Vec<lightcraft_catalog::Person>>)>,
     suggestions: Option<(u64, std::sync::Arc<Vec<String>>)>,
     counts: Option<(u64, LibraryCounts)>,
@@ -931,6 +1104,33 @@ pub struct Caches {
     album_counts: Option<(u64, std::sync::Arc<std::collections::HashMap<lightcraft_catalog::AlbumId, usize>>)>,
     /// How often the album counts were recomputed (tests check that unchanged frames don't).
     pub album_count_scans: usize,
+    /// AI denoise: what the pump last saw, the model list and the downloads being watched.
+    pub denoise: panels::denoise::Ui,
+    /// Bumped when a face model is installed, removed or chosen, so Settings re-reads the list at once.
+    pub faces_epoch: u64,
+    /// Face model downloads the user started, followed until installed (see `panels::faces::pump`).
+    pub faces_dl_watch: Vec<String>,
+    /// Whether the background face indexer is running, how many faces it has embedded, how many photos are left, and
+    /// when to ask it again.
+    pub faces_active: bool,
+    pub faces_indexed: u64,
+    pub faces_pending: u64,
+    pub faces_next_pump: f64,
+    /// When the user last dragged, typed or scrolled, and when they last moved the pointer (egui time).
+    pub last_input: f64,
+    /// The pace the face scan was last given, and whether the window was in front then (for `ui.inspect`).
+    pub faces_pace: &'static str,
+    pub faces_in_front: bool,
+    pub last_move: f64,
+    /// Name suggestions for the photo in the loupe: (photo, catalog revision, faces indexed, suggestions by region).
+    pub face_hints: Option<(u64, u64, u64, std::sync::Arc<panels::faces::Hints>)>,
+    /// The open person page: (name, catalog revision, faces indexed, when it was asked for, the page).
+    pub person_page: Option<(String, u64, u64, f64, std::sync::Arc<panels::person::PersonPage>)>,
+    /// The unnamed faces: (catalog revision, faces indexed, when it was asked for, the list).
+    pub unnamed: Option<(u64, u64, f64, std::sync::Arc<panels::unnamed::Unnamed>)>,
+    /// The most photos the face scan has had left at once since it last finished (the progress bar's whole).
+    pub faces_peak: u64,
+    person_names: Option<(u64, std::sync::Arc<Vec<String>>)>,
     /// The grid's date runs, layout and indexes (by the visible list's generation).
     pub grid: panels::grid::GridCache,
     /// What the grid did on its frames (benchmarks and tests check unchanged frames stay cheap).
@@ -959,6 +1159,17 @@ pub(crate) fn key_of(parts: impl std::hash::Hash) -> u64 {
 }
 
 impl Caches {
+    /// The folders the library's photos were imported from.
+    pub fn folder_tree(&mut self, cat: &lightcraft_catalog::Catalog) -> std::sync::Arc<Vec<lightcraft_catalog::FolderNode>> {
+        match &self.folder_tree {
+            Some((r, t)) if *r == cat.revision => t.clone(),
+            _ => {
+                let t = std::sync::Arc::new(cat.folder_tree());
+                self.folder_tree = Some((cat.revision, t.clone()));
+                t
+            }
+        }
+    }
     /// The library's keyword tree.
     pub fn keyword_tree(&mut self, cat: &lightcraft_catalog::Catalog) -> std::sync::Arc<Vec<lightcraft_catalog::KeywordNode>> {
         match &self.keyword_tree {
@@ -1007,6 +1218,17 @@ impl Caches {
         }
         self.counts = Some((cat.revision, c));
         c
+    }
+    /// Everyone named on a face in the library (for completing a name as it is typed).
+    pub fn person_names(&mut self, cat: &lightcraft_catalog::Catalog) -> std::sync::Arc<Vec<String>> {
+        match &self.person_names {
+            Some((r, v)) if *r == cat.revision => v.clone(),
+            _ => {
+                let v = std::sync::Arc::new(cat.people().into_iter().map(|p| p.name).collect::<Vec<_>>());
+                self.person_names = Some((cat.revision, v.clone()));
+                v
+            }
+        }
     }
     /// The By Date tree.
     pub fn date_groups(&mut self, cat: &lightcraft_catalog::Catalog) -> std::sync::Arc<Vec<lightcraft_catalog::DateGroup>> {
@@ -1145,3 +1367,6 @@ mod cache_tests {
         assert_eq!(c.album_count_scans, 1);
     }
 }
+
+#[cfg(test)]
+mod tests_model_setup;

@@ -71,6 +71,39 @@ Every stdio MCP client takes the same shape: a `command` plus `args`. For exampl
 During development you can also point the client at `cargo run --release -p lightcraft-cli -- mcp`
 (with `"cwd"` set to the repository), at the cost of a slower start.
 
+## Shared core tools
+
+These follow the same conventions as [filmcraft #28](https://github.com/storytold/filmcraft/pull/28).
+They are listed in both full and compact mode; existing documented helpers remain listed too.
+There are no hidden compatibility aliases.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `command_list` | `filter?`, `enabled_only?` | Command catalog |
+| `command_run` | `id`, `params?` | Command result |
+| `command_batch` | `steps: [{id, params?}]`, `stop_on_error?` | Counts and per-step results; stops on error by default |
+| `doc_inspect` | none | Library state and catalog counts |
+| `render_preview` | `id?`, `max_side?`, `format?` | Image; neither changes selection nor saves a file |
+
+Each edit in a batch has its own undo step. Connect mode also lists `ui_inspect` and
+`ui_screenshot` (the latter has no output-path argument). The existing `inspect_ui`,
+`screenshot`, `list_commands`, `run_command` and `render_photo` keep their documented arguments.
+Ports and connect mode are unchanged.
+
+Every listed tool has a title and all four MCP hints. Generated command tools are conservatively
+marked as edits. Helpers with optional output paths are marked as writers; `export` is not
+idempotent because the default conflict policy chooses a new filename on repeated calls.
+Unknown helper argument keys return JSON-RPC `-32602` naming the key and accepted arguments.
+Generated `cmd_*` tools and nested command params remain free-form: the registry has prose
+parameter docs, not machine-readable schemas. Existing command validation (including strict
+export options) is preserved. Escaped tool panics return `isError: true`, and the session keeps
+serving; backend panics during resource reads or tool listing return an internal error.
+The headless backend owns its session directly, without a session mutex.
+
+`lightcraft://document` and `lightcraft://commands` contain JSON matching `doc_inspect` and
+`command_list`. Existing resources remain available. Requests declaring MCP 2026-07-28 in
+per-request `_meta` receive `resultType: complete` and list/read cache hints; reads are not cached.
+
 ## Tools
 
 ### Helpers
@@ -81,7 +114,7 @@ During development you can also point the client at `cargo run --release -p ligh
 | `run_command {command, params?}` | Run any command by id |
 | `import {paths, album?, mode?, destination?, organize?, rename?}` | Import files/folders (folders are scanned recursively); the first new photo becomes active. `mode: "copy"` copies into `destination` (default: the library's Originals/), `mode: "move"` moves there (each original and its XMP sidecars are removed from the source only after the copy is verified and catalogued; duplicates and failures keep their sources; the result's `moved` / `kept` list what moved and what stayed, and why; undo leaves the moved files at the destination), filed by `organize`: `date` (YYYY/YYYY-MM-DD), `month`, `flat` or a folder template such as `{date:%Y}/{date:%Y%m%d}` (→ `2026/20260114`; capture date, else the import date; always inside the destination), and named by the `rename` template (`run_command photo.renameTokens` lists the tags) |
 | `query_photos {filter?, sort?, offset?, limit?}` | Photos in the current view (or matching a catalog `Filter`) |
-| `select_photos {ids, active?, mode?}` | Set the selection / active photo |
+| `select_photos {ids, active?, mode?}` | Set the selection / active photo. Every id (and `active`) must be in the library: an unknown id is a tool error (`no such photo 9999`) and the selection and active photo are left as they were |
 | `list_controls {section?}` | Every develop slider: id (`light.exposure`…), range, default, current value |
 | `get_develop {id?}` | Full develop-settings JSON |
 | `set_develop {id?, values?, settings?, label?}` | `values`: `{controlId: number}`; `settings`: partial develop JSON deep-merged. Undoable |
@@ -186,3 +219,20 @@ lightcraft-cli calibrate --max 300 ~/Pictures/2026   # camera colour profiles (d
   (`Remote`) against a stand-in control server; also import → render → JPEG export of a real file.
 - `apps/lightcraft-cli/tests/cli.rs` — spawns `lightcraft-cli mcp` with real pipes; `render`;
   `commands`.
+
+## Export progress and cancellation
+
+Headless direct `export`, `command_run` / `run_command` with `app.export`, and `cmd_app_export`
+calls report photo-count progress when `params._meta.progressToken` is a string or number.
+Notifications are strictly increasing, at most ten per second plus the final total. No token
+means no notifications. `ping` is answered at photo boundaries; other requests wait in order
+until the export ends. EOF lets a pending export finish and preserves queued requests.
+
+`notifications/cancelled` with `params.requestId` stops the matching export before its next
+photo, suppressing its response. Unknown/completed request ids are ignored. A photo already
+being processed finishes first: completed photos remain, each written with the existing atomic
+file writer, and there are no partial files to delete. Unrelated outputs and earlier exports
+are untouched. A failed export is an `isError` tool result. Transport mutexes recover poisoning.
+
+Connect mode and exports inside `command_batch` remain synchronous and do not report MCP
+progress or cancellation. Use a direct headless export call for this behavior.

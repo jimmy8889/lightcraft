@@ -1,10 +1,10 @@
 //! Olympus ORF — uncompressed variants.
 //!
-//! Sources: TIFF 6.0 (the `IIRO`/`MMOR` container is a TIFF with a different magic number), the ExifTool
-//! Olympus tag-name documentation (maker-note sub-directories `0x2020` CameraSettings — `0x0101/0x0102`
-//! PreviewImageStart/Length — and `0x2040` ImageProcessing — `0x0100` WB_RBLevels, `0x0600` BlackLevel2,
-//! `0x0612–0x0615` CropLeft/Top/Width/Height) and our own black-box analysis of CC0 samples from raw.pixls.us
-//! (E-1, E-400, XZ-2):
+//! Sources: TIFF 6.0 (the `IIRO`/`MMOR` container is a TIFF with a different magic number), Exif 2.3 (`CFAPattern`,
+//! tag `0xa302`), the ExifTool Olympus tag-name documentation (maker-note sub-directories `0x2020` CameraSettings —
+//! `0x0101/0x0102` PreviewImageStart/Length — and `0x2040` ImageProcessing — `0x0100` WB_RBLevels, `0x0600`
+//! BlackLevel2, `0x0612–0x0615` CropLeft/Top/Width/Height) and our own black-box analysis of CC0 samples from
+//! raw.pixls.us (E-1, E-400, XZ-2):
 //!
 //! - 16 bits per sample: little-endian words; some bodies (E-1, E-400) store 12-bit values in the top bits (the low
 //!   four bits zero in more than 99% of samples), which we shift down.
@@ -12,14 +12,16 @@
 //!   candidate bit orders for the smoothest image).
 //! - Olympus's compressed ORF (most interchangeable-lens bodies since ~2008) is not decoded: no permissively
 //!   licensed description exists. It reports [`RawError::Unsupported`]; the embedded preview still works.
-//! - The files carry no CFA tag. The green diagonal is found from the data (the diagonal whose two samples differ
-//!   least); bodies with greens on the main diagonal (E-1, E-400) are GRBG, the others (XZ-2) RGGB — verified by
-//!   colour renders.
+//! - The colour-filter layout is the file's Exif `CFAPattern`: GRBG on the E-1 and E-400, RGGB on the XZ-2, where
+//!   the colours of the decoded mosaic follow the embedded JPEG best with exactly that layout
+//!   (`corpus_orf_cfa_patterns`). The samples' active areas start at even offsets, so they can't tell whether the
+//!   pattern is anchored at the sensor origin (assumed) or at the active area. Files without a usable tag fall back
+//!   to the green diagonal found from the data, which can't tell red from blue (GRBG or RGGB is assumed).
 
-use super::white_from_data;
+use super::{cfa_from_exif, white_from_data};
 use crate::tiffraw::{Packing, read_image};
 use crate::unpack::unpack_msb;
-use crate::{BlackLevel, Cfa, ColorData, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result};
+use crate::{BlackLevel, Cfa, ColorData, Mode, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result};
 use lightcraft_geom::Orientation;
 use lightcraft_tiff::image::chunk_bytes;
 use lightcraft_tiff::makernote::MakerNote;
@@ -66,23 +68,37 @@ pub(crate) fn unpack_row_le32_msb(src: &[u8], bits: u32, out: &mut [u16]) {
     unpack_msb(&swapped, bits, out);
 }
 
-/// GRBG when the greens sit on the main diagonal of the 2×2 cell at the sensor origin, else RGGB.
+/// The layout found from the samples, for files without the Exif tag: GRBG when the greens sit on the main
+/// diagonal of the 2×2 cell at the sensor origin, else RGGB. Over 32×32-pixel blocks of `a` (every fourth in both
+/// directions) it compares the block totals of the two sites on each diagonal: the two greens of a block see the
+/// same light, red and blue rarely do. Totals rather than single pixels, so that fine texture, which makes
+/// neighbouring greens differ, doesn't outweigh a small difference between red and blue.
 pub(crate) fn cfa_from_data(d: &[u16], w: usize, a: Rect) -> Cfa {
-    let (x0, y0) = (a.x + ((a.width / 8) & !1), a.y + ((a.height / 8) & !1));
-    let (x1, y1) = (a.x + a.width * 7 / 8, a.y + a.height * 7 / 8);
+    const BLOCK: usize = 32;
+    let (x0, y0) = (a.x.saturating_add(1) & !1, a.y.saturating_add(1) & !1);
+    let across = a.x.saturating_add(a.width).min(w).saturating_sub(x0) / BLOCK;
+    let down = a.y.saturating_add(a.height).saturating_sub(y0) / BLOCK;
     let (mut main, mut anti) = (0u64, 0u64);
-    for y in (y0..y1.saturating_sub(1)).step_by(16) {
-        for x in (x0..x1.saturating_sub(1)).step_by(8) {
-            let (x, y) = (x & !1, y & !1);
-            let p = |dx: usize, dy: usize| d[(y + dy) * w + x + dx] as i64;
-            main += (p(0, 0) - p(1, 1)).unsigned_abs();
-            anti += (p(1, 0) - p(0, 1)).unsigned_abs();
+    for by in (0..down).step_by(4) {
+        for bx in (0..across).step_by(4) {
+            let mut sums = [0i64; 4];
+            for y in 0..BLOCK {
+                let row = (y0 + by * BLOCK + y).checked_mul(w).and_then(|r| r.checked_add(x0 + bx * BLOCK));
+                // rows past the end of the samples: nothing more to read
+                let Some(row) = row.and_then(|start| d.get(start..start.checked_add(BLOCK)?)) else { break };
+                for (x, &v) in row.iter().enumerate() {
+                    sums[(y & 1) * 2 + (x & 1)] += v as i64;
+                }
+            }
+            let [s0, s1, s2, s3] = sums;
+            main += (s0 - s3).unsigned_abs();
+            anti += (s1 - s2).unsigned_abs();
         }
     }
     Cfa::bayer_static(if main < anti { "GRBG" } else { "RGGB" })
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
+pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     let tiff = Tiff::parse(bytes)?;
     let ifd0 = &tiff.ifds[0];
     let info = ifd0.image()?;
@@ -90,6 +106,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
     let n = w.checked_mul(h).filter(|n| *n > 0 && *n <= crate::MAX_SAMPLES).ok_or(RawError::Limit("image too large"))?;
     let chunks = info.chunks(bytes.len() as u64);
     let total: u64 = chunks.iter().map(|c| c.len).sum();
+    let stated = cfa_from_exif(&tiff);
     let (mut data, bits) = if info.compression != 1 {
         return Err(RawError::Unsupported(format!("ORF compression {}", info.compression)));
     } else if total >= (n as u64) * 2 {
@@ -97,9 +114,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
         (d, 16)
     } else if total * 8 >= (n as u64) * 12 && total * 8 < (n as u64) * 13 && chunks.len() == 1 {
         let src = chunk_bytes(bytes, &chunks[0]).ok_or_else(|| RawError::Corrupt("ORF strip outside file".into()))?;
-        let stride = src.len() / h;
-        let mut d = vec![0u16; n];
-        d.par_chunks_mut(w).enumerate().for_each(|(y, row)| unpack_row_le32_msb(&src[y * stride..(y + 1) * stride], 12, row));
+        // the depth is fixed here, so a header-only probe needs the samples only when the file doesn't state its
+        // colour-filter layout
+        let d = if mode == Mode::Full || stated.is_none() {
+            let stride = src.len() / h;
+            let mut d = vec![0u16; n];
+            d.par_chunks_mut(w).enumerate().for_each(|(y, row)| unpack_row_le32_msb(&src[y * stride..(y + 1) * stride], 12, row));
+            d
+        } else {
+            Vec::new()
+        };
         (RawData::U16(d), 12)
     } else {
         return Err(RawError::Unsupported("Olympus compressed ORF".into()));
@@ -128,7 +152,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
         Some([Some(x), Some(y), Some(cw), Some(ch)]) if cw > 0 && ch > 0 && x + cw <= w && y + ch <= h => Rect::new(x, y, cw, ch),
         _ => Rect::new(0, 0, w, h),
     };
-    let cfa = cfa_from_data(samples, w, active);
+    let cfa = stated.unwrap_or_else(|| cfa_from_data(samples, w, active));
     let black = match ip.as_ref().and_then(|i| i.f64s(BLACK)).as_deref() {
         Some(v @ [_, _, _, _]) => {
             let a = cfa.shifted(active.x, active.y);
@@ -165,7 +189,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
         opcodes: OpcodeLists::default(),
         metadata,
     };
-    img.validate()?;
+    img.validate_for(mode)?;
     Ok(img)
 }
 
@@ -182,9 +206,15 @@ pub(crate) fn preview(bytes: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::EXIF_CFA_PATTERN;
     use lightcraft_tiff::{ByteOrder, IfdBuilder, ImageData, TiffWriter};
 
     fn orf(w: u32, h: u32, bits: u16, strip: Vec<u8>) -> Vec<u8> {
+        orf_with(w, h, bits, strip, None)
+    }
+
+    /// A minimal ORF with one strip in IFD0 and, optionally, an Exif `CFAPattern`.
+    fn orf_with(w: u32, h: u32, bits: u16, strip: Vec<u8>, cfa_pattern: Option<&[u8]>) -> Vec<u8> {
         let mut ifd = IfdBuilder::new();
         ifd.set(t::IMAGE_WIDTH, Value::Long(vec![w]));
         ifd.set(t::IMAGE_LENGTH, Value::Long(vec![h]));
@@ -193,10 +223,118 @@ mod tests {
         ifd.set(t::PHOTOMETRIC, Value::Short(vec![1]));
         ifd.set(t::MAKE, Value::Ascii("OLYMPUS IMAGING CORP.".into()));
         ifd.set_image(ImageData::Strips { rows_per_strip: h, strips: vec![strip] });
+        if let Some(p) = cfa_pattern {
+            let mut exif = IfdBuilder::new();
+            exif.set(EXIF_CFA_PATTERN, Value::Undefined(p.to_vec()));
+            ifd.set_child(t::EXIF_IFD, exif);
+        }
         let mut b = TiffWriter::new(ByteOrder::Little, false).write(&[ifd]).unwrap();
         b[2] = b'R';
         b[3] = b'O';
         b
+    }
+
+    /// A 12-bit mosaic stored as 16-bit words: `site(cx, cy)` gives the four values of the 2×2 cell at (cx, cy).
+    fn mosaic(w: usize, h: usize, site: impl Fn(usize, usize) -> [u16; 4]) -> Vec<u8> {
+        (0..w * h).flat_map(|i| site(i % w / 2, i / w / 2)[((i / w) & 1) * 2 + ((i % w) & 1)].to_le_bytes()).collect()
+    }
+
+    /// Smooth scene texture shared by the four sites of a cell.
+    fn shade(cx: usize, cy: usize) -> u16 {
+        ((cx * 7 + cy * 13) % 23) as u16
+    }
+
+    const BGGR: &[u8] = &[2, 0, 2, 0, 2, 1, 1, 0];
+    const GRBG: &[u8] = &[2, 0, 2, 0, 1, 0, 2, 1];
+    // repeat counts in the other byte order
+    const RGGB: &[u8] = &[0, 2, 0, 2, 0, 1, 1, 2];
+    const GBRG: &[u8] = &[0, 2, 0, 2, 1, 2, 0, 1];
+
+    fn layout(bytes: &[u8]) -> String {
+        let r = crate::decode(bytes).unwrap();
+        assert_eq!(crate::probe_info(bytes).unwrap(), r.info());
+        r.cfa.unwrap().name()
+    }
+
+    #[test]
+    fn exif_cfa_pattern_states_the_layout() {
+        let (w, h) = (160usize, 144usize);
+        // samples whose green diagonal alone would say RGGB
+        let px = mosaic(w, h, |cx, cy| [600, 1000, 1000, 300].map(|v| v + shade(cx, cy)));
+        for (tag, name) in [(BGGR, "BGGR"), (GRBG, "GRBG"), (RGGB, "RGGB"), (GBRG, "GBRG")] {
+            assert_eq!(layout(&orf_with(w as u32, h as u32, 16, px.clone(), Some(tag))), name);
+        }
+        // not a 2×2 Bayer cell (four greens, greens side by side, a fourth colour), other repeat counts, wrong
+        // lengths: the samples decide
+        let unusable: [&[u8]; 8] = [
+            &[2, 0, 2, 0, 1, 1, 1, 1],
+            &[2, 0, 2, 0, 1, 1, 0, 2],
+            &[2, 0, 2, 0, 0, 1, 1, 3],
+            &[3, 0, 3, 0, 0, 1, 1, 2],
+            &[2, 2, 2, 0, 0, 1, 1, 2],
+            &[2, 0, 2, 0, 1, 0],
+            &[2, 0, 2, 0, 2, 1, 1, 0, 0],
+            &[],
+        ];
+        for (site, name) in [([600, 1000, 1000, 300], "RGGB"), ([1000, 600, 300, 1000], "GRBG")] {
+            let px = mosaic(w, h, |cx, cy| site.map(|v| v + shade(cx, cy)));
+            assert_eq!(layout(&orf(w as u32, h as u32, 16, px.clone())), name);
+            for tag in unusable {
+                assert_eq!(layout(&orf_with(w as u32, h as u32, 16, px.clone(), Some(tag))), name, "{tag:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_12_bit_probe_agrees_with_decode() {
+        let (w, h) = (16usize, 4usize);
+        let strip: Vec<u8> = (0..w * h * 3 / 2).map(|i| (i * 37 % 251) as u8).collect();
+        for tag in [Some(BGGR), None] {
+            let bytes = orf_with(w as u32, h as u32, 12, strip.clone(), tag);
+            let r = crate::decode(&bytes).unwrap();
+            assert_eq!((r.bits, r.data.len()), (12, w * h));
+            assert_eq!(r.cfa.as_ref().unwrap().name(), if tag.is_some() { "BGGR" } else { "RGGB" });
+            assert_eq!(crate::probe_info(&bytes).unwrap(), r.info());
+        }
+    }
+
+    #[test]
+    fn data_fallback_looks_past_fine_texture() {
+        let (w, h) = (160usize, 144usize);
+        // greens on the main diagonal, red and blue close; a checkerboard of detail makes the two greens of a cell
+        // differ by far more than red differs from blue
+        let detail = |cx: usize, cy: usize| if (cx + cy) & 1 == 0 { 150 } else { -150i32 };
+        let site = |cx: usize, cy: usize| {
+            let (g, d) = (1000 + shade(cx, cy) as i32, detail(cx, cy));
+            [(g + d) as u16, 500, 520, (g - d) as u16]
+        };
+        assert_eq!(layout(&orf(w as u32, h as u32, 16, mosaic(w, h, site))), "GRBG");
+        // the same scene with the greens on the other diagonal
+        let px = mosaic(w, h, |cx, cy| {
+            let [g0, r, b, g1] = site(cx, cy);
+            [r, g0, g1, b]
+        });
+        assert_eq!(layout(&orf(w as u32, h as u32, 16, px)), "RGGB");
+    }
+
+    #[test]
+    fn data_fallback_survives_any_area() {
+        let d = vec![100u16; 64 * 64];
+        let big = usize::MAX;
+        for a in [
+            Rect::new(0, 0, 64, 64),
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 31, 31),
+            Rect::new(63, 63, 1, 1),
+            Rect::new(0, 0, 4096, 4096),
+            Rect::new(big, big, big, big),
+            Rect::new(0, big - 40, 64, 40),
+        ] {
+            for w in [64, 0, 1, big] {
+                assert_eq!(cfa_from_data(&d, w, a).name(), "RGGB", "{a:?} width {w}");
+                assert_eq!(cfa_from_data(&[], w, a).name(), "RGGB", "{a:?} width {w}");
+            }
+        }
     }
 
     #[test]

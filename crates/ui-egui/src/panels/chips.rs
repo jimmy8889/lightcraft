@@ -28,6 +28,52 @@ fn chip_width(ui: &egui::Ui, label: &str, font: egui::FontId) -> f32 {
     ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::WHITE).size().x + 12.0 + 22.0
 }
 
+/// Localise generated chip labels without rewriting search text or metadata values.
+pub(crate) fn display_label(chip: &FilterChip, filter: &lightcraft_catalog::Filter, catalog: &lightcraft_catalog::Catalog) -> String {
+    use crate::i18n::{date_group_label, rules_label, tr};
+    if crate::i18n::language() == crate::i18n::Locale::En {
+        return chip.label.clone();
+    }
+    if chip.clear.get("ruleSet").is_some()
+        && let Some(rules) = &filter.rule_set
+    {
+        return format!("{}: {}", tr("Rules"), rules_label(rules));
+    }
+    if chip.clear.get("label").is_some() {
+        let mut labels = filter.labels.clone();
+        labels.extend(filter.label.filter(|label| !labels.contains(label)));
+        let names = labels.iter().map(|label| crate::i18n::color_label(catalog, *label)).collect::<Vec<_>>();
+        return format!("{}: {}", tr("Label"), names.join(&format!(" {} ", tr("or"))));
+    }
+    if chip.clear.get("dateFrom").is_some() || chip.clear.get("dateTo").is_some() {
+        return match (&filter.date_from, &filter.date_to) {
+            (Some(from), Some(to)) => format!("{} {} – {}", tr("Captured"), date_group_label(from, false), date_group_label(to, false)),
+            (Some(from), None) => format!("{} {}", tr("Captured from"), date_group_label(from, false)),
+            (None, Some(to)) => format!("{} {}", tr("Captured until"), date_group_label(to, false)),
+            _ => chip.label.clone(),
+        };
+    }
+    if chip.clear.get("only").is_some() {
+        return format!("{} {}", tr("Only"), crate::i18n::tr_format!("{n} photos", n = filter.only.len()));
+    }
+    if let Some((prefix, value)) = chip.label.split_once(": ") {
+        let value = if matches!(prefix, "Flag" | "Type") {
+            tr(value).to_string()
+        } else if prefix == "Date" {
+            filter.date.as_ref().map_or_else(|| value.to_string(), |date| date_group_label(date, false))
+        } else if prefix == "Imported" {
+            filter.imported.as_ref().map_or_else(|| value.to_string(), |date| date_group_label(date, false))
+        } else {
+            value.to_string()
+        };
+        return format!("{}: {value}", tr(prefix));
+    }
+    if let Some(value) = chip.label.strip_prefix("Rating ") {
+        return format!("{} {value}", tr("Rating"));
+    }
+    tr(&chip.label).to_string()
+}
+
 /// Draws the strip; does nothing without chips.
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, chips: &[FilterChip]) {
     if chips.is_empty() {
@@ -42,7 +88,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, chips: &[FilterChip]) {
     let mut x = bar.left() + 20.0;
     let mut shown = 0;
     for (i, c) in chips.iter().enumerate() {
-        let w = chip_width(ui, &c.label, font.clone());
+        let label = display_label(c, &app.session.filter, &app.session.catalog);
+        let w = chip_width(ui, &label, font.clone());
         // always show the first chip; keep room for the tail unless this is the last one that fits
         let room = right - x - if i + 1 == chips.len() { 90.0 } else { TAIL };
         if i > 0 && w > room {
@@ -51,7 +98,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, chips: &[FilterChip]) {
         let r = Rect::from_min_size(pos2(x, bar.center().y - 11.0), vec2(w.min(right - x), 22.0));
         ui.painter().rect(r, 11.0, t.field, Stroke::new(1.0, t.accent.gamma_multiply(0.6)), StrokeKind::Inside);
         let text_r = Rect::from_min_max(r.min, pos2(r.right() - 22.0, r.max.y));
-        ui.painter().with_clip_rect(text_r).text(pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, &c.label, font.clone(), t.text);
+        ui.painter().with_clip_rect(text_r).text(pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, &label, font.clone(), t.text);
         let xr = Rect::from_center_size(pos2(r.right() - 12.0, r.center().y), vec2(18.0, 18.0));
         let resp = ui.interact(xr, egui::Id::new(("filter-chip-x", i)), Sense::click()).on_hover_text(crate::i18n::tr("Remove this filter"));
         register(ui.ctx(), format!("chip:{i}"), xr);
@@ -77,10 +124,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, chips: &[FilterChip]) {
     child.spacing_mut().item_spacing.x = 8.0;
     let hidden = &chips[shown..];
     if !hidden.is_empty() {
-        let more = crate::widgets::text_button(&mut child, "chipsMore", &format!("+{} more", hidden.len()), false);
+        let more = crate::widgets::text_button(&mut child, "chipsMore", &crate::i18n::tr_format!("+{} more", hidden.len()), false);
         egui::Popup::menu(&more).show(|ui| {
             for c in hidden {
-                if ui.button(format!("{}  ✕", c.label)).on_hover_text(crate::i18n::tr("Remove this filter")).clicked() {
+                if ui
+                    .button(format!("{}  ✕", display_label(c, &app.session.filter, &app.session.catalog)))
+                    .on_hover_text(crate::i18n::tr("Remove this filter"))
+                    .clicked()
+                {
                     let _ = app.run("library.filter", c.clear.clone());
                     if c.clear.get("text").is_some() {
                         app.ui.search.clear();

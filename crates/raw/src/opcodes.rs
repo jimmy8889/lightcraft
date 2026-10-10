@@ -98,6 +98,13 @@ impl Opcode {
     pub fn is_applied(&self) -> bool {
         !matches!(self, Opcode::Unknown { .. } | Opcode::TrimBounds { .. } | Opcode::WarpFisheye { .. })
     }
+
+    /// Whether this is a lens correction (`WarpRectilinear`, `FixVignetteRadial`): from a DNG, or the equivalent of
+    /// a camera's own correction recorded in its raw (Panasonic RW2). Developers that apply these through the
+    /// "profile corrections" of the develop settings remove them before demosaicing.
+    pub fn is_lens_correction(&self) -> bool {
+        matches!(self, Opcode::WarpRectilinear { .. } | Opcode::FixVignetteRadial { .. })
+    }
 }
 
 /// The three opcode lists of a DNG raw IFD.

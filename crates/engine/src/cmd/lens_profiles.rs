@@ -205,7 +205,7 @@ mod tests {
         let info = crate::media::source_info(&photo);
         s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
         s.selection = Selection::single(id);
-        s.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(60, 40, [0.2; 3]), info))));
+        s.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(60, 40, [0.2; 3]), info.clone()))));
         (s, id)
     }
     #[test]
@@ -242,16 +242,18 @@ mod tests {
     fn lens_profiles_stale_catalog_and_unverified_source_do_not_apply() {
         let (mut s, id) = fixture();
         let actual = SourceInfo { raw: true, calibration_key: None, ..Default::default() };
-        s.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(60, 40, [0.2; 3]), actual))));
+        let loaded = actual.clone();
+        s.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(60, 40, [0.2; 3]), loaded.clone()))));
         assert!(s.execute("optics.applyProfile", &json!({"crop_factor":1})).is_err());
         assert!(s.develop_of(id).unwrap().optics.calibration.is_none());
         let (mut s, id) = fixture();
         let mut actual = crate::media::source_info(s.catalog.photo(id).unwrap());
         actual.calibration_key.as_mut().unwrap().content[0] ^= 1; // external byte-stream replacement, identical EXIF
-        s.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(60, 40, [0.2; 3]), actual))));
+        let loaded = actual.clone();
+        s.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(60, 40, [0.2; 3]), loaded.clone()))));
         assert!(s.execute("optics.applyProfile", &json!({"crop_factor":1})).is_err());
         let header = crate::media::source_info(s.catalog.photo(id).unwrap());
-        assert!(DecodedSource::new(Arc::new(Rgb32f::new(3, 2)), None).info_or(header).calibration_key.is_none());
+        assert!(DecodedSource::new(Arc::new(Rgb32f::new(3, 2)), None).info_or(header.clone()).calibration_key.is_none());
         assert!(DecodedSource::new(Arc::new(Rgb32f::new(3, 2)), Some(actual)).info_or(header).calibration_key.is_none());
     }
     #[test]

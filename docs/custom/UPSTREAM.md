@@ -10,8 +10,8 @@ base. Do not replace upstream source trees with vendored copies or rewrite histo
 From a clean custom checkout with Python 3.11 or newer:
 
 ```sh
-python3 scripts/upstream-update.py --ref v0.4.0 --plan
-python3 scripts/upstream-update.py --ref v0.4.0
+python3 scripts/upstream-update.py --ref v0.5.0 --plan
+python3 scripts/upstream-update.py --ref v0.5.0
 ```
 
 Use an actual newer release tag when one is available, or `main` to test the

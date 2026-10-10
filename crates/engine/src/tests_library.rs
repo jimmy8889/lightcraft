@@ -212,6 +212,39 @@ fn profile_favorites_and_recent_survive_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn the_shown_library_folder_survives_reopen() {
+    let dir = temp_dir("libfolder");
+    let mut s = open(&dir, true);
+    let id = s.catalog.alloc_photo_id();
+    let p = lightcraft_catalog::Photo::new(
+        id,
+        lightcraft_catalog::Source::File { path: "/pics/trip/a.jpg".into() },
+        "a.jpg",
+        "JPEG",
+        60,
+        40,
+        "2026-01-01T10:00:00",
+    );
+    s.commit("Add", lightcraft_catalog::Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    s.execute("library.source", &json!({"kind": "libraryFolder", "path": "/pics/trip"})).unwrap();
+    s.save_view();
+    drop(s);
+    let s = open(&dir, false);
+    assert_eq!((s.source, s.library_folder.as_deref()), (crate::LibrarySource::LibraryFolder, Some("/pics/trip")));
+    drop(s);
+    // a folder that holds none of the library's photos any more opens on everything too
+    std::fs::write(dir.join("view.json"), br#"{"source": {"kind": "libraryFolder"}, "library_folder": "/no/such/folder"}"#).unwrap();
+    let s = open(&dir, false);
+    assert_eq!((s.source, s.library_folder.clone()), (crate::LibrarySource::All, None));
+    drop(s);
+    // a view file that names the source but no folder opens on everything, never an empty grid
+    std::fs::write(dir.join("view.json"), br#"{"source": {"kind": "libraryFolder"}}"#).unwrap();
+    let s = open(&dir, false);
+    assert_eq!((s.source, s.library_folder), (crate::LibrarySource::All, None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Smart albums with a rule set: all / any / none, nested groups, validation, live updates.
 #[test]
 fn smart_album_rule_sets() {

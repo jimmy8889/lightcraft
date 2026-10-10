@@ -155,7 +155,7 @@ impl Catalog {
         let date_of = |id: &PhotoId| -> String {
             let Some(p) = self.photo(*id) else { return String::new() };
             let d = match key {
-                SortKey::CaptureDate => Some(p.date()),
+                SortKey::CaptureDate => p.captured.as_deref(),
                 SortKey::ImportDate => Some(p.imported.as_str()),
                 SortKey::EditDate => p.edited.as_deref(),
                 _ => None,
@@ -222,7 +222,7 @@ mod tests {
         }
         let shape = |r: &[DateRun]| r.iter().map(|r| (r.key.clone(), r.start, r.count)).collect::<Vec<_>>();
         let day = c.date_runs(&ids, SortKey::CaptureDate, GroupBy::Day);
-        // the undated photo falls back to its import date
+        // the undated photo is grouped under Unknown Date
         assert_eq!(
             shape(&day),
             vec![
@@ -230,16 +230,20 @@ mod tests {
                 ("2026-09-29".into(), 2, 1),
                 ("2026-08-01".into(), 3, 1),
                 ("2025-12-31".into(), 4, 1),
-                ("2026-10-01".into(), 5, 1)
+                (String::new(), 5, 1)
             ]
         );
         assert_eq!(day[0].label, "Wednesday, 30 September 2026");
+        assert_eq!(day[4].label, "Unknown Date");
         assert_eq!(c.date_runs(&ids, SortKey::CaptureDate, GroupBy::Auto), day);
         assert_eq!(
-            shape(&c.date_runs(&ids[..5], SortKey::CaptureDate, GroupBy::Month)),
-            vec![("2026-09".into(), 0, 3), ("2026-08".into(), 3, 1), ("2025-12".into(), 4, 1)]
+            shape(&c.date_runs(&ids, SortKey::CaptureDate, GroupBy::Month)),
+            vec![("2026-09".into(), 0, 3), ("2026-08".into(), 3, 1), ("2025-12".into(), 4, 1), (String::new(), 5, 1)]
         );
-        assert_eq!(shape(&c.date_runs(&ids[..5], SortKey::CaptureDate, GroupBy::Year)), vec![("2026".into(), 0, 4), ("2025".into(), 4, 1)]);
+        assert_eq!(
+            shape(&c.date_runs(&ids, SortKey::CaptureDate, GroupBy::Year)),
+            vec![("2026".into(), 0, 4), ("2025".into(), 4, 1), (String::new(), 5, 1)]
+        );
         assert!(c.date_runs(&ids, SortKey::FileName, GroupBy::Day).is_empty());
         assert!(c.date_runs(&ids, SortKey::CaptureDate, GroupBy::None).is_empty());
         // edit date: unedited photos have no date

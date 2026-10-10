@@ -2,13 +2,95 @@
 //!
 //! Shapes are defined in normalized oriented-image coordinates; sizes are in "long-edge units".
 //! Components combine with Add (max), Subtract (a·(1−c)) and Intersect (a·c).
+//!
+//! AI shapes (Sky, Subject, Background, People) use the segmentation [`Mattes`] the source carries
+//! (DNG semantic masks, e.g. iPhone ProRAW's) when it has a matching one, else a heuristic.
 
 use lightcraft_develop::{BrushStroke, LocalAdjustments, Mask, MaskOp, MaskShape, SegMask};
-use lightcraft_geom::Point;
-use lightcraft_raster::{Plane, Rgb32f};
+use lightcraft_geom::{Orientation, Point};
+use lightcraft_raster::{Image, Plane, Rgb32f};
 
 use crate::for_rows;
 use crate::geometry::Frame;
+
+/// What an embedded segmentation matte selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatteKind {
+    Sky,
+    /// A whole person (all people in the photo).
+    Person,
+    Skin,
+    Hair,
+    Teeth,
+    Glasses,
+}
+
+/// Segmentation mattes that came with the source: 0..255 alpha planes, each covering the whole
+/// (EXIF-oriented) source image at its own resolution. Several mattes of one kind (e.g. one per
+/// person) are combined with max.
+#[derive(Clone, Default, PartialEq)]
+pub struct Mattes {
+    mattes: Vec<(MatteKind, Image<u8>)>,
+}
+
+impl std::fmt::Debug for Mattes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.mattes.iter().map(|(k, m)| (k, m.width, m.height))).finish()
+    }
+}
+
+impl Mattes {
+    /// Add a matte (empty ones are ignored).
+    pub fn push(&mut self, kind: MatteKind, matte: Image<u8>) {
+        if matte.width > 0 && matte.height > 0 && matte.data.len() == matte.width * matte.height {
+            self.mattes.push((kind, matte));
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mattes.is_empty()
+    }
+
+    /// Memory held (bytes).
+    pub fn bytes(&self) -> usize {
+        self.mattes.iter().map(|(_, m)| m.data.len()).sum()
+    }
+
+    fn of(&self, kinds: &[MatteKind]) -> Vec<&Image<u8>> {
+        self.mattes.iter().filter(|(k, _)| kinds.contains(k)).map(|(_, m)| m).collect()
+    }
+
+    /// The mattes a shape uses instead of its heuristic (empty: none fits).
+    fn for_shape(&self, shape: &MaskShape) -> Vec<&Image<u8>> {
+        use MatteKind::*;
+        // the whole person: a person matte, else the union of the parts
+        let person = || {
+            let p = self.of(&[Person]);
+            if p.is_empty() { self.of(&[Skin, Hair, Teeth, Glasses]) } else { p }
+        };
+        match shape {
+            MaskShape::Sky => self.of(&[Sky]),
+            MaskShape::Subject => person(),
+            MaskShape::People { parts, .. } => {
+                let wanted: Vec<MatteKind> = parts
+                    .iter()
+                    .filter_map(|p| {
+                        let p = p.to_ascii_lowercase();
+                        [("skin", Skin), ("hair", Hair), ("teeth", Teeth), ("glasses", Glasses)]
+                            .into_iter()
+                            .find(|(n, _)| p.contains(n))
+                            .map(|(_, k)| k)
+                    })
+                    .collect();
+                let whole =
+                    parts.is_empty() || parts.iter().any(|p| matches!(p.to_ascii_lowercase().as_str(), "person" | "entire person" | "entireperson"));
+                // parts without a matte (lips, clothes, …) keep the heuristic
+                if whole { person() } else { self.of(&wanted) }
+            }
+            _ => Vec::new(),
+        }
+    }
+}
 
 pub struct Evaluated {
     /// The mask's id ([`Mask::id`]).
@@ -23,22 +105,24 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The visible masks with components, evaluated in order.
-pub fn evaluate(masks: &[Mask], frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32) -> Vec<Evaluated> {
+/// The visible masks with components, evaluated in order (`mattes`: the source's, see [`Mattes`]).
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate(masks: &[Mask], frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Vec<Evaluated> {
     masks
         .iter()
         .filter(|m| m.visible && !m.components.is_empty())
-        .map(|m| Evaluated { id: m.id, alpha: evaluate_one(m, frame, w, h, img, log_l, ev), adjust: m.adjust })
+        .map(|m| Evaluated { id: m.id, alpha: evaluate_one(m, frame, w, h, img, log_l, ev, mattes), adjust: m.adjust })
         .collect()
 }
 
 /// The alpha plane of mask `m` (whether visible or not): its components combined, inverted and
 /// scaled by its amount.
-pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32) -> Plane {
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Plane {
     let mut alpha = Plane::new(w, h);
     let mut first = true;
     for comp in &m.components {
-        let mut c = shape_alpha(&comp.shape, frame, w, h, img, log_l, ev);
+        let mut c = shape_alpha(&comp.shape, frame, w, h, img, log_l, ev, mattes);
         if comp.invert {
             c.data.iter_mut().for_each(|v| *v = 1.0 - *v);
         }
@@ -60,7 +144,7 @@ pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, l
         // Refine Edges: the mask's edges follow the photo's (window up to ~4 % of the long edge,
         // the width of a soft brush edge or gradient)
         let k = (m.refine / 100.0).clamp(0.0, 1.0) as f32;
-        let sigma = (0.04 * w.max(h) as f32 * k).max(1.0);
+        let sigma = (0.04 * frame.output_long(w, h) as f32 * k).max(1.0);
         let refined = guided_cross(log_l, &alpha, sigma, 0.02);
         for (a, r) in alpha.data.iter_mut().zip(&refined.data) {
             *a += (r - *a) * k.sqrt();
@@ -88,7 +172,13 @@ fn for_each_pos(frame: &Frame, w: usize, h: usize, out: &mut Plane, f: impl Fn(P
     });
 }
 
-pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32) -> Plane {
+/// The alpha plane of one component shape. AI shapes use the source's matching `mattes`, if any.
+#[allow(clippy::too_many_arguments)]
+pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Plane {
+    let fitting = mattes.map(|m| m.for_shape(shape)).unwrap_or_default();
+    if !fitting.is_empty() {
+        return matte_alpha(&fitting, frame, w, h);
+    }
     let mut out = Plane::new(w, h);
     let to_long = |p: Point| frame.norm_to_long(p);
     // `img`/`log_l` are before exposure: range masks select on the exposed values.
@@ -127,7 +217,7 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
             }
         }
         MaskShape::ColorRange { samples, refine } => {
-            let tol = 0.04 + 0.16 * (*refine as f32 / 100.0);
+            let tol = color_range_tolerance(*refine);
             let samples: Vec<[f32; 3]> = samples.iter().map(|s| [s[0] as f32, s[1] as f32, s[2] as f32]).collect();
             for (v, c) in out.data.iter_mut().zip(&img.data) {
                 let lab = lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(c.map(|v| v * gain)));
@@ -180,7 +270,7 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
             smooth_plane(&mut out, 0.015 * frame_px(frame, w));
         }
         MaskShape::Background => {
-            let mut s = shape_alpha(&MaskShape::Subject, frame, w, h, img, log_l, ev);
+            let mut s = shape_alpha(&MaskShape::Subject, frame, w, h, img, log_l, ev, mattes);
             s.data.iter_mut().for_each(|v| *v = 1.0 - *v);
             out = s;
         }
@@ -252,9 +342,89 @@ fn smooth_plane(p: &mut Plane, sigma: f32) {
     *p = lightcraft_raster::blur::gaussian(p, sigma.max(0.5));
 }
 
+/// The union (max) of `mattes` (0..255, over the EXIF-oriented source) at output resolution,
+/// sampled like the image: user orientation, lens / perspective warp, crop and flips; area-averaged
+/// first when the output is much smaller than the matte, bilinear otherwise.
+fn matte_alpha(mattes: &[&Image<u8>], frame: &Frame, w: usize, h: usize) -> Plane {
+    let mut out = Plane::new(w, h);
+    let o2t = frame.out_to_oriented(w, h);
+    let ppl = frame.px_per_long(w).max(1e-9);
+    for m in mattes {
+        let oriented =
+            if frame.orient == Orientation::Normal { std::borrow::Cow::Borrowed(*m) } else { std::borrow::Cow::Owned(m.oriented(frame.orient)) };
+        // matte px per output px
+        let k = oriented.width as f64 / frame.ow * frame.ow.max(frame.oh) / ppl;
+        let base = box_down(&oriented, if k >= 2.0 { (k.floor() as usize).min(64) } else { 1 });
+        let (sx, sy) = ((base.width as f64 / frame.ow) as f32, (base.height as f64 / frame.oh) as f32);
+        for_rows(&mut out.data, w, |y, row| {
+            for (x, v) in row.iter_mut().enumerate() {
+                let s = match &frame.warp {
+                    Some(wp) => {
+                        let Some((_, s)) = wp.frame(&o2t, x, y) else {
+                            continue;
+                        };
+                        s
+                    }
+                    None => o2t.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5)),
+                };
+                *v = v.max(bilinear(&base, s.x as f32 * sx, s.y as f32 * sy) / 255.0);
+            }
+        });
+    }
+    out
+}
+
+/// `m` area-averaged by `f × f` (0..255 values kept); `f == 1` converts only.
+fn box_down(m: &Image<u8>, f: usize) -> Plane {
+    let f = f.max(1);
+    let (bw, bh) = (m.width.div_ceil(f).max(1), m.height.div_ceil(f).max(1));
+    let mut out = Plane::new(bw, bh);
+    for_rows(&mut out.data, bw, |by, row| {
+        let rows = by * f..((by + 1) * f).min(m.height);
+        for (bx, v) in row.iter_mut().enumerate() {
+            let cols = bx * f..((bx + 1) * f).min(m.width);
+            let (mut sum, mut n) = (0u32, 0u32);
+            for y in rows.clone() {
+                for x in cols.clone() {
+                    sum += m.data.get(y * m.width + x).copied().unwrap_or(0) as u32;
+                    n += 1;
+                }
+            }
+            *v = sum as f32 / n.max(1) as f32;
+        }
+    });
+    out
+}
+
+/// Bilinear sample at continuous pixel coordinates (pixel centres at +0.5), edges extended.
+fn bilinear(p: &Plane, x: f32, y: f32) -> f32 {
+    let (fx, fy) = (x - 0.5, y - 0.5);
+    let (x0, y0) = (fx.floor(), fy.floor());
+    let (tx, ty) = (fx - x0, fy - y0);
+    let (x0, y0) = (x0 as isize, y0 as isize);
+    let a = p.get_clamped(x0, y0) + (p.get_clamped(x0 + 1, y0) - p.get_clamped(x0, y0)) * tx;
+    let b = p.get_clamped(x0, y0 + 1) + (p.get_clamped(x0 + 1, y0 + 1) - p.get_clamped(x0, y0 + 1)) * tx;
+    a + (b - a) * ty
+}
+
 /// A rough display mapping for colour picking (so samples taken on screen match).
 pub(crate) fn tonemap_for_select(c: [f32; 3]) -> [f32; 3] {
     c.map(|v| v / (1.0 + v))
+}
+
+/// Colour range: the OkLab distance (a, b at full weight, L at a quarter) at which a pixel leaves
+/// the selection for a Refine amount of 0..100. A pixel is fully selected up to half of it and
+/// fades out over the other half (CPU here, `mask.wgsl` kind 3; both take this value).
+///
+/// Issue #157: `0.04 + 0.16·refine` selected the whole photo. Through [`tonemap_for_select`] a
+/// slightly teal mid-grey (sRGB 120,150,155) and a neutral light grey (200,198,195) are only ~0.063
+/// apart — L 0.60 vs 0.72, a/b ≤ 0.02 — so at the default Refine 50 (full selection below 0.06)
+/// the grey patch was 99 % selected, and at Refine 85 / 100 still most of it. A JND is ~0.01 on
+/// this scale, so Refine 50 now holds a surface up to ~2 JND from its sample and drops everything
+/// beyond ~4.5 (full to 0.0225, gone at 0.045); Refine 85 is gone at 0.066, past that grey patch;
+/// Refine 100 reaches 0.075 and Refine 0 is the sample's own shade (full to 0.0075, gone at 0.015).
+pub fn color_range_tolerance(refine: f64) -> f32 {
+    0.015 + 0.06 * (refine / 100.0).clamp(0.0, 1.0) as f32
 }
 
 /// A brush stroke resolved to output pixels: dab centres (spacing r/4 along the path), radius,
@@ -321,11 +491,13 @@ pub fn auto_similarity(l: f32, ch: [f32; 3], rl: f32, rch: [f32; 3]) -> f32 {
     1.0 - smooth(0.5, 1.0, (dl * dl + dc * dc).sqrt())
 }
 
-/// The output pixel a dab at `d` samples its reference colour from.
+/// The output pixel a dab at `d` samples its reference colour from. The position is taken at f32
+/// precision (like the GPU kernel): a dab on a pixel boundary must not fall on either side of it
+/// by an f64 rounding error, which depends on where the window of a zoomed view starts.
 #[inline]
 pub fn dab_pixel(d: Point, w: usize, h: usize) -> usize {
-    let x = (d.x.floor().max(0.0) as usize).min(w - 1);
-    let y = (d.y.floor().max(0.0) as usize).min(h - 1);
+    let x = ((d.x as f32).floor().max(0.0) as usize).min(w - 1);
+    let y = ((d.y as f32).floor().max(0.0) as usize).min(h - 1);
     y * w + x
 }
 
@@ -419,7 +591,7 @@ mod tests {
         let f = frame(100, 50);
         let img = Rgb32f::new(100, 50);
         let l = Plane::new(100, 50);
-        let a = shape_alpha(&MaskShape::Linear { start: Point::new(0.0, 0.0), end: Point::new(1.0, 0.0) }, &f, 100, 50, &img, &l, 0.0);
+        let a = shape_alpha(&MaskShape::Linear { start: Point::new(0.0, 0.0), end: Point::new(1.0, 0.0) }, &f, 100, 50, &img, &l, 0.0, None);
         assert!(a.get(1, 25) > 0.99 && a.get(98, 25) < 0.01);
         assert!((a.get(50, 25) - 0.5).abs() < 0.05);
     }
@@ -435,7 +607,7 @@ mod tests {
             MaskShape::Prompt { text: "left".into(), seg: Some(seg.clone()), detail: vec![], edge: 0.0 },
         ] {
             for (w, h) in [(40, 20), (400, 200)] {
-                let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0);
+                let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0, None);
                 assert!(a.get(1, h / 2) > 0.99 && a.get(w - 2, h / 2) < 0.01, "{w}×{h}");
                 if w >= 400 {
                     let soft = (0..w).filter(|x| (0.05..0.95).contains(&a.get(*x, h / 2))).count();
@@ -448,7 +620,7 @@ mod tests {
         d.crop.geometry.rect = lightcraft_geom::Rect::from_center(Point::new(0.75, 0.5), 0.5, 1.0);
         let f = Frame::new(40, 20, &d, true);
         let shape = MaskShape::Prompt { text: "left".into(), seg: Some(seg), detail: vec![], edge: 0.0 };
-        let a = shape_alpha(&shape, &f, 20, 20, &Rgb32f::new(20, 20), &Plane::new(20, 20), 0.0);
+        let a = shape_alpha(&shape, &f, 20, 20, &Rgb32f::new(20, 20), &Plane::new(20, 20), 0.0, None);
         assert!(a.data.iter().all(|v| *v < 0.05));
     }
 
@@ -461,7 +633,7 @@ mod tests {
         let patch = SegMask::from_logits_in(side, &l, [0.5, 0.0, 1.0, 1.0]);
         let shape = MaskShape::Object { hint: vec![Point::new(0.6, 0.5)], exclude: vec![], seg: Some(coarse), detail: vec![patch], edge: 0.0 };
         let (w, h) = (200, 100);
-        let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0);
+        let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0, None);
         assert!(a.get(20, 50) < 0.01, "outside the patch: the coarse mask");
         assert!(a.get(120, 50) > 0.99, "inside the patch, its selected half");
         assert!(a.get(190, 50) < 0.01, "inside the patch, its unselected half");
@@ -477,7 +649,7 @@ mod tests {
         let shape = MaskShape::Object { hint: vec![Point::new(0.2, 0.5)], exclude: vec![], seg: None, detail: vec![patch; 20_000], edge: 0.0 };
         let (w, h) = (64, 32);
         let t = std::time::Instant::now();
-        let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0);
+        let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0, None);
         assert!(a.get(5, 16) > 0.99 && a.get(60, 16) < 0.01);
         assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
     }
@@ -490,7 +662,7 @@ mod tests {
         let (w, h) = (400, 40);
         let soft_px = |edge: f64| {
             let shape = MaskShape::Prompt { text: "x".into(), seg: Some(seg.clone()), detail: vec![], edge };
-            let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0);
+            let a = shape_alpha(&shape, &frame(w, h), w, h, &Rgb32f::new(w, h), &Plane::new(w, h), 0.0, None);
             assert!(a.get(2, h / 2) > 0.9 && a.get(w - 3, h / 2) < 0.1, "still the same selection at {edge}");
             (0..w).filter(|x| (0.1..0.9).contains(&a.get(*x, h / 2))).count()
         };
@@ -507,7 +679,7 @@ mod tests {
             MaskShape::Prompt { text: "sky".into(), seg: None, detail: vec![], edge: 0.0 },
             MaskShape::Prompt { text: "sky".into(), seg: Some(SegMask { side: 4, data: "damaged!".into(), rect: None }), detail: vec![], edge: 0.0 },
         ] {
-            assert!(shape_alpha(&shape, &f, 30, 30, &img, &l, 0.0).data.iter().all(|v| *v == 0.0));
+            assert!(shape_alpha(&shape, &f, 30, 30, &img, &l, 0.0, None).data.iter().all(|v| *v == 0.0));
         }
     }
 
@@ -517,10 +689,10 @@ mod tests {
         let img = Rgb32f::new(100, 100);
         let l = Plane::new(100, 100);
         let shape = MaskShape::Radial { center: Point::new(0.5, 0.5), rx: 0.2, ry: 0.2, angle: 0.0, feather: 20.0, invert: false };
-        let a = shape_alpha(&shape, &f, 100, 100, &img, &l, 0.0);
+        let a = shape_alpha(&shape, &f, 100, 100, &img, &l, 0.0, None);
         assert!(a.get(50, 50) > 0.99 && a.get(5, 5) < 0.01);
         let m = Mask { components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: true, shape }], ..Default::default() };
-        let e = evaluate(&[m], &f, 100, 100, &img, &l, 0.0);
+        let e = evaluate(&[m], &f, 100, 100, &img, &l, 0.0, None);
         assert!(e[0].alpha.get(50, 50) < 0.01);
     }
 
@@ -535,7 +707,7 @@ mod tests {
             components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape: MaskShape::Brush { strokes: vec![stroke, erase] } }],
             ..Default::default()
         };
-        let e = evaluate(&[m], &f, 200, 100, &img, &l, 0.0);
+        let e = evaluate(&[m], &f, 200, 100, &img, &l, 0.0, None);
         let a = &e[0].alpha;
         assert!(a.get(40, 50) > 0.9, "{}", a.get(40, 50));
         assert!(a.get(100, 50) < 0.05, "erased centre {}", a.get(100, 50));
@@ -557,8 +729,8 @@ mod tests {
             ..Default::default()
         };
         let comp = |auto| MaskShape::Brush { strokes: vec![stroke(auto)] };
-        let plain = shape_alpha(&comp(false), &f, w, h, &img, &l, 0.0);
-        let auto = shape_alpha(&comp(true), &f, w, h, &img, &l, 0.0);
+        let plain = shape_alpha(&comp(false), &f, w, h, &img, &l, 0.0, None);
+        let auto = shape_alpha(&comp(true), &f, w, h, &img, &l, 0.0, None);
         // without Auto Mask the brush spills over the edge; with it, it stays on the dark side
         assert!(plain.get(105, 50) > 0.9, "{}", plain.get(105, 50));
         assert!(auto.get(105, 50) < 0.05, "spill {}", auto.get(105, 50));
@@ -568,8 +740,8 @@ mod tests {
         // on a flat area Auto Mask paints like the plain brush
         let flat = Rgb32f::from_fn(w, h, |_, _| [0.2; 3]);
         let fl = flat.map(crate::local::log_lum);
-        let a = shape_alpha(&comp(true), &f, w, h, &flat, &fl, 0.0);
-        let b = shape_alpha(&comp(false), &f, w, h, &flat, &fl, 0.0);
+        let a = shape_alpha(&comp(true), &f, w, h, &flat, &fl, 0.0, None);
+        let b = shape_alpha(&comp(false), &f, w, h, &flat, &fl, 0.0, None);
         assert!((a.get(94, 50) - b.get(94, 50)).abs() < 0.02, "{} vs {}", a.get(94, 50), b.get(94, 50));
     }
 
@@ -592,10 +764,107 @@ mod tests {
         };
         let refined = Mask { refine: 100.0, ..soft.clone() };
         let step = |m: &Mask| {
-            let a = evaluate_one(m, &f, w, h, &img, &log_l, 0.0);
+            let a = evaluate_one(m, &f, w, h, &img, &log_l, 0.0, None);
             a.data[40 * w + 63] - a.data[40 * w + 56]
         };
         let (plain, sharp) = (step(&soft), step(&refined));
         assert!(sharp > plain * 1.5 && sharp > 0.1, "the edge in the mask follows the photo's: {plain} → {sharp}");
+    }
+
+    /// Issue #157: a colour-range sample of one flat patch must not select a clearly different
+    /// patch. The two patches are the ones from the report (sRGB 120,150,155 and 200,198,195),
+    /// sampled the way `mask.sampleColor` does (3×3 mean of the selection-space OkLab).
+    #[test]
+    fn color_range_keeps_to_the_sampled_colour() {
+        use lightcraft_color::{REC2020, SRGB, transfer::decode_srgb8};
+        let (w, h) = (120usize, 40usize);
+        let m = SRGB.to_space(&REC2020);
+        let patch = |rgb: [u8; 3]| m.apply_f32(rgb.map(decode_srgb8));
+        let (left, right) = (patch([120, 150, 155]), patch([200, 198, 195]));
+        let img = Rgb32f::from_fn(w, h, |x, _| if x < 60 { left } else { right });
+        let log_l = img.map(crate::local::log_lum);
+        let f = Frame::new(w, h, &Default::default(), true);
+        let mut sample = [0f64; 3];
+        for y in 19..=21 {
+            for x in 29..=31 {
+                let lab = lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(img.data[y * w + x]));
+                for k in 0..3 {
+                    sample[k] += lab[k] as f64 / 9.0;
+                }
+            }
+        }
+        let alpha = |refine| {
+            let shape = MaskShape::ColorRange { samples: vec![sample], refine };
+            let a = shape_alpha(&shape, &f, w, h, &img, &log_l, 0.0, None);
+            (a.get(30, 20), a.get(90, 20))
+        };
+        for refine in [0.0, 50.0, 85.0] {
+            let (l, r) = alpha(refine);
+            assert!(l > 0.95, "refine {refine}: sampled patch {l}");
+            assert!(r < 0.05, "refine {refine}: other patch {r}");
+        }
+        // Refine 100 reaches furthest (the grey is ~0.063 away, the fade ends at 0.075), but the
+        // other patch stays mostly out
+        let (l, r) = alpha(100.0);
+        assert!(l > 0.95 && r < 0.3, "refine 100: {l} vs {r}");
+    }
+
+    /// A half-resolution matte selecting the left `frac` of a `w × h` source.
+    fn left_matte(w: usize, h: usize, frac: f64) -> Image<u8> {
+        Image::from_fn(w / 2, h / 2, |x, _| if (x as f64 + 0.5) < frac * (w / 2) as f64 { 255 } else { 0 })
+    }
+
+    /// The Sky mask follows the source's sky matte where it has one (here: the bottom-left of a
+    /// uniformly bright blue photo, where the heuristic sees no sky, and not its top right, where
+    /// it does), through user orientation, at any output size; without one it keeps the heuristic.
+    #[test]
+    fn sky_uses_the_sources_matte() {
+        let (w, h) = (200, 100);
+        let img = Rgb32f::filled(w, h, [0.5, 0.7, 1.4]);
+        let l = img.map(crate::local::log_lum);
+        let mut mattes = Mattes::default();
+        mattes.push(MatteKind::Sky, left_matte(w, h, 0.5));
+        let f = frame(w, h);
+        let heuristic = shape_alpha(&MaskShape::Sky, &f, w, h, &img, &l, 0.0, None);
+        let matte = shape_alpha(&MaskShape::Sky, &f, w, h, &img, &l, 0.0, Some(&mattes));
+        assert!(heuristic.get(150, 5) > 0.9 && heuristic.get(25, 90) < 0.1, "{} {}", heuristic.get(150, 5), heuristic.get(25, 90));
+        assert!(matte.get(150, 5) < 0.01 && matte.get(25, 90) > 0.99, "{} {}", matte.get(150, 5), matte.get(25, 90));
+        // mattes of other kinds leave the heuristic alone
+        let mut hair = Mattes::default();
+        hair.push(MatteKind::Hair, left_matte(w, h, 0.5));
+        assert_eq!(shape_alpha(&MaskShape::Sky, &f, w, h, &img, &l, 0.0, Some(&hair)), heuristic);
+        // rotated 90° clockwise, the source's left half is the top half; a preview and a larger
+        // render agree
+        let s = lightcraft_develop::DevelopSettings { orientation: Orientation::Rotate90, ..Default::default() };
+        let f = Frame::new(w, h, &s, true);
+        for (ow, oh) in [(100, 200), (25, 50)] {
+            let small = Rgb32f::filled(ow, oh, [0.5, 0.7, 1.4]);
+            let a = shape_alpha(&MaskShape::Sky, &f, ow, oh, &small, &small.map(crate::local::log_lum), 0.0, Some(&mattes));
+            let at = |x: f64, y: f64| a.get((x * ow as f64) as usize, (y * oh as f64) as usize);
+            assert!(at(0.5, 0.2) > 0.99 && at(0.5, 0.8) < 0.01, "{ow}×{oh}: {} {}", at(0.5, 0.2), at(0.5, 0.8));
+        }
+    }
+
+    /// Subject, Background and People use person mattes: the whole person is the union of the
+    /// parts; a People part without a matte keeps the heuristic.
+    #[test]
+    fn people_and_subject_use_person_mattes() {
+        let (w, h) = (200, 100);
+        let img = Rgb32f::filled(w, h, [0.2; 3]);
+        let l = img.map(crate::local::log_lum);
+        let mut mattes = Mattes::default();
+        mattes.push(MatteKind::Skin, left_matte(w, h, 0.25));
+        let right: Image<u8> = Image::from_fn(w / 2, h / 2, |x, _| if x >= 75 { 255 } else { 0 });
+        mattes.push(MatteKind::Hair, right);
+        let f = frame(w, h);
+        let eval = |shape: &MaskShape| shape_alpha(shape, &f, w, h, &img, &l, 0.0, Some(&mattes));
+        let subject = eval(&MaskShape::Subject);
+        assert!(subject.get(10, 50) > 0.99 && subject.get(190, 50) > 0.99 && subject.get(100, 50) < 0.01);
+        let background = eval(&MaskShape::Background);
+        assert!(background.get(100, 50) > 0.99 && background.get(10, 50) < 0.01);
+        let hair = eval(&MaskShape::People { person: 0, parts: vec!["Hair".into()] });
+        assert!(hair.get(190, 50) > 0.99 && hair.get(10, 50) < 0.01);
+        let lips = MaskShape::People { person: 0, parts: vec!["Lips".into()] };
+        assert_eq!(eval(&lips), shape_alpha(&lips, &f, w, h, &img, &l, 0.0, None));
     }
 }

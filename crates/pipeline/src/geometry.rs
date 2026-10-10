@@ -31,6 +31,18 @@ pub struct Frame {
     pub flip_v: bool,
     /// Lens corrections / perspective (None = identity).
     pub warp: Option<Warp>,
+    /// Set when this frame draws only a window of a larger output (see [`Frame::window`]).
+    pub view: Option<ViewWindow>,
+}
+
+/// Where a windowed [`Frame`]'s pixels sit in the full output: its offset and the full output's
+/// size, for effects defined by the whole frame (post-crop vignette).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewWindow {
+    pub x: f64,
+    pub y: f64,
+    pub full_w: f64,
+    pub full_h: f64,
 }
 
 impl Frame {
@@ -62,6 +74,7 @@ impl Frame {
             flip_h: apply_crop && s.crop.flip_h,
             flip_v: apply_crop && s.crop.flip_v,
             warp: (!warp.is_identity()).then_some(warp),
+            view: None,
         };
         if apply_crop && s.geometry.constrain_crop {
             f.constrain_to_image();
@@ -95,6 +108,30 @@ impl Frame {
         let t = lo.max(0.02);
         let r = self.crop.rect;
         self.crop.rect = Rect::from_center(r.center(), r.width() * t, r.height() * t);
+    }
+
+    /// Long edge, in pixels, of the whole output this frame draws (its own size unless it is a
+    /// window of a larger one): what size-relative effects (noise reduction, edge refinement)
+    /// must scale with, so a window matches the same pixels of the whole render.
+    pub fn output_long(&self, w: usize, h: usize) -> usize {
+        self.view.map_or(w.max(h), |v| v.full_w.max(v.full_h) as usize)
+    }
+
+    /// This frame narrowed to `win` of its `full_w × full_h` output: the same mapping, but the
+    /// output is only that window (the crop rectangle shrinks to it; flips are as drawn).
+    pub fn window(&self, full_w: usize, full_h: usize, win: crate::PixelWindow) -> Frame {
+        let (fw, fh) = (full_w.max(1) as f64, full_h.max(1) as f64);
+        let (x0, x1) = (win.x as f64 / fw, (win.x + win.w) as f64 / fw);
+        let (y0, y1) = (win.y as f64 / fh, (win.y + win.h) as f64 / fh);
+        // flips happen on the output before it maps onto the crop: undo them for the range
+        let (x0, x1) = if self.flip_h { (1.0 - x1, 1.0 - x0) } else { (x0, x1) };
+        let (y0, y1) = if self.flip_v { (1.0 - y1, 1.0 - y0) } else { (y0, y1) };
+        let r = self.crop.rect;
+        let (rw, rh) = (r.width(), r.height());
+        let mut f = self.clone();
+        f.crop.rect = Rect { x0: r.x0 + x0 * rw, y0: r.y0 + y0 * rh, x1: r.x0 + x1 * rw, y1: r.y0 + y1 * rh };
+        f.view = Some(ViewWindow { x: win.x as f64, y: win.y as f64, full_w: fw, full_h: fh });
+        f
     }
 
     /// Add automatically estimated lateral CA (`[α_R, α_B]`, see [`crate::optics::estimate_lateral_ca`]).

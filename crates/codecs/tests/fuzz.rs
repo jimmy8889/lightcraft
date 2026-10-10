@@ -30,8 +30,10 @@ fn try_all(bytes: &[u8]) {
     if let Some(f) = sniff(bytes) {
         let _ = decode_unguarded(bytes, f, &small_opts());
         let _ = decode_unguarded(bytes, f, &DecodeOptions { max_size: Some((8, 8)), max_pixels: 1 << 22 });
+        let _ = read_header_unguarded(bytes, f);
     }
     let _ = decode(bytes, small_opts());
+    let _ = read_header(bytes);
     let _ = decode_thumbnail_with(bytes, &ThumbnailOptions { max_pixels: small_opts().max_pixels, ..ThumbnailOptions::new(16) });
     let _ = lightcraft_codecs::icc::parse(bytes);
 }

@@ -58,12 +58,22 @@ fn albums_and_folders() {
     let a = photo(&mut c, "a.jpg", "2026-04-01");
     let f = c.alloc_album_id();
     c.apply(Op::AddAlbum {
-        album: Album { id: f, name: "Trips".into(), parent: None, folder: true, photos: vec![], cover: None, smart: None, quick: false },
+        album: Album { id: f, name: "Trips".into(), parent: None, folder: true, photos: vec![], cover: None, smart: None, quick: false, order: None },
     })
     .unwrap();
     let al = c.alloc_album_id();
     c.apply(Op::AddAlbum {
-        album: Album { id: al, name: "Alps".into(), parent: Some(f), folder: false, photos: vec![a], cover: None, smart: None, quick: false },
+        album: Album {
+            id: al,
+            name: "Alps".into(),
+            parent: Some(f),
+            folder: false,
+            photos: vec![a],
+            cover: None,
+            smart: None,
+            quick: false,
+            order: None,
+        },
     })
     .unwrap();
     assert_eq!(c.albums_of(a), vec![al]);
@@ -445,4 +455,49 @@ fn random_sort_has_no_date_headers() {
     let mut c = Catalog::new();
     let ids = many(&mut c, 5);
     assert!(c.date_runs(&ids, SortKey::Random, GroupBy::Day).is_empty());
+}
+
+#[test]
+fn undated_photos_group_under_unknown_date_and_sort_together() {
+    let mut c = Catalog::new();
+    let add_photo = |c: &mut Catalog, name: &str, captured: Option<&str>, imported: &str| {
+        let id = c.alloc_photo_id();
+        let mut p = Photo::new(id, Source::Demo { scene: 0 }, name, "JPEG", 100, 100, imported);
+        p.captured = captured.map(str::to_string);
+        c.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        id
+    };
+    let p_dated1 = add_photo(&mut c, "dated1.jpg", Some("2026-05-10T12:00:00"), "2026-10-01T00:00:00");
+    let p_dated2 = add_photo(&mut c, "dated2.jpg", Some("2026-05-20T12:00:00"), "2026-10-01T00:00:00");
+    let p_undated1 = add_photo(&mut c, "undated1.jpg", None, "2026-10-05T00:00:00");
+    let p_undated2 = add_photo(&mut c, "undated2.jpg", None, "2026-10-02T00:00:00");
+
+    // Descending sort (default, newest first): dated photos first (newest to oldest), undated photos at the end
+    let desc = c.query(&Filter::default(), &Sort { key: SortKey::CaptureDate, ascending: false, ..Default::default() });
+    assert_eq!(desc, vec![p_dated2, p_dated1, p_undated1, p_undated2]);
+
+    // Ascending sort (oldest first): undated photos at the beginning, dated photos from oldest to newest
+    let asc = c.query(&Filter::default(), &Sort { key: SortKey::CaptureDate, ascending: true, ..Default::default() });
+    assert_eq!(asc, vec![p_undated2, p_undated1, p_dated1, p_dated2]);
+
+    // date_runs groups undated photos under Unknown Date
+    let runs = c.date_runs(&desc, SortKey::CaptureDate, GroupBy::Day);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].key, "2026-05-20");
+    assert_eq!(runs[1].key, "2026-05-10");
+    assert_eq!(runs[2].key, "");
+    assert_eq!(runs[2].label, "Unknown Date");
+    assert_eq!(runs[2].count, 2);
+
+    // date_groups sidebar tree only counts photos with capture dates
+    let groups = c.date_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].year, "2026");
+    assert_eq!(groups[0].count, 2);
+
+    // Filter by capture date prefix does not match undated photos
+    let filter_day = Filter { date: Some("2026-10-05".into()), ..Default::default() };
+    assert_eq!(c.query(&filter_day, &Sort::default()), vec![]);
+    let filter_year = Filter { date: Some("2026".into()), ..Default::default() };
+    assert_eq!(c.query(&filter_year, &Sort { key: SortKey::CaptureDate, ascending: false, ..Default::default() }), vec![p_dated2, p_dated1]);
 }

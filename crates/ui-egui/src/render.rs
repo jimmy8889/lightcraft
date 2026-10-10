@@ -30,6 +30,11 @@ pub enum Slot {
     /// A thumbnail's stand-in (embedded preview of an unedited raw).
     ThumbQuick(PhotoId),
     Main,
+    /// The loupe zoomed past what `Main` can hold: the window of the frame that is on screen,
+    /// rendered at the zoom scale and drawn over `Main` (see [`crate::region`]).
+    Region,
+    /// The Before side of a Before/After view zoomed the same way (see [`Slot::Region`]).
+    RegionBefore,
     /// The loupe's stand-in until `Main` has the photo.
     Preview,
     Before,
@@ -79,8 +84,79 @@ struct Queued {
     job: RenderJob,
 }
 
-/// Variant thumbnails kept as textures (LRU).
+/// The texture of a render: its pixels as egui wants them. Renders are opaque, so the common case
+/// is a plain copy; only a pixel with alpha pays for premultiplying. (The generic conversion, on
+/// the UI thread, was most of the time a 5 MP zoom window took to show.)
+pub(crate) fn color_image(img: &lightcraft_raster::Rgba8) -> egui::ColorImage {
+    let pixels = img
+        .data
+        .iter()
+        .map(|p| if p[3] == 255 { egui::Color32::from_rgb(p[0], p[1], p[2]) } else { egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]) })
+        .collect();
+    egui::ColorImage { size: [img.width, img.height], source_size: egui::vec2(img.width as f32, img.height as f32), pixels }
+}
+
+/// How far over the budget the open photo's window and before caches may run before they are cut.
+const HARD_FACTOR: usize = 4;
+
+/// Which stage caches to clear, in order, so that the rest fit `budget` bytes.
+///
+/// What nothing is looking at goes first, the cheapest to rebuild and least reused first (hover,
+/// compare, second window, background work). The open photo's own views are what a slider drag
+/// reuses on every tick, and a cache cleared every frame is rebuilt every frame (a drag on a
+/// 2800 px canvas got 3.6x slower), so they stay — counted and reported — up to
+/// [`HARD_FACTOR`] times the budget; past that (a runaway: 8:1 on a huge canvas, both sides of
+/// Before/After) the before side's and the zoom window's go, the before side first. The
+/// whole-frame view's cache is never named. Empty caches are never named.
+pub(crate) fn stage_trim_order(sizes: &[(Slot, usize)], budget: usize) -> Vec<Slot> {
+    let idle_rank = |s: Slot| match s {
+        Slot::Hover => 0,
+        Slot::Compare(_) => 2,
+        Slot::Second => 3,
+        _ => 5,
+    };
+    let view_rank = |s: Slot| match s {
+        Slot::RegionBefore => Some(0),
+        Slot::Before => Some(1),
+        Slot::Region => Some(2),
+        _ => None,
+    };
+    let is_view = |s: Slot| matches!(s, Slot::Main) || view_rank(s).is_some();
+    let mut held: usize = sizes.iter().map(|(_, b)| *b).fold(0, usize::saturating_add);
+    let mut out = Vec::new();
+    let mut idle: Vec<(Slot, usize)> = sizes.iter().copied().filter(|(s, b)| *b > 0 && !is_view(*s)).collect();
+    idle.sort_by_key(|(s, _)| idle_rank(*s));
+    for (slot, bytes) in idle {
+        if held <= budget {
+            break;
+        }
+        held = held.saturating_sub(bytes);
+        out.push(slot);
+    }
+    let hard = budget.saturating_mul(HARD_FACTOR);
+    let mut views: Vec<(Slot, usize, u8)> = sizes.iter().filter_map(|(s, b)| view_rank(*s).filter(|_| *b > 0).map(|r| (*s, *b, r))).collect();
+    views.sort_by_key(|(_, _, r)| *r);
+    for (slot, bytes, _) in views {
+        if held <= hard {
+            break;
+        }
+        held = held.saturating_sub(bytes);
+        out.push(slot);
+    }
+    out
+}
+
+/// The share of the memory budget the per-view stage caches (the loupe's, the zoom window's, the
+/// before / hover renders') may hold together before the idle ones are cleared (see
+/// [`stage_trim_order`] for the open photo's own): they are the decoded-image sized buffers that the
+/// engine's own caches do not count.
+const STAGE_BUDGET_SHARE: usize = 4;
+
+/// Variant thumbnails kept as textures (LRU), when nothing asks for more.
 pub const VARIANT_TEXTURES: usize = 96;
+/// The most a view can raise that to ([`Renderer::want_variants`]): a screenful of small faces is a few hundred pictures of
+/// a few tens of kilobytes each.
+pub const MAX_VARIANT_TEXTURES: usize = 800;
 /// Priority of variant thumbnail jobs: below on-screen grid thumbnails and the loupe.
 const VARIANT_PRIORITY: u32 = 6;
 
@@ -126,8 +202,15 @@ pub struct Renderer {
     prefetched: HashMap<Slot, u64>,
     /// Variant key → frame it was last asked for (LRU of [`Slot::Variant`] textures).
     variant_used: HashMap<u64, u64>,
+    /// How many variants the last frame's views showed at once (see [`Self::want_variants`]).
+    variant_want: usize,
     /// Frames polled so far.
     frame: u64,
+    /// Stage caches cleared to stay in budget (see [`stage_trim_order`]).
+    stages_trimmed: u64,
+    /// A budget other than the memory budget's share (tests).
+    #[cfg(test)]
+    pub(crate) stage_budget_override: Option<usize>,
     /// Since when nothing has been pending, and whether the GPU pool was trimmed since.
     #[cfg(not(target_arch = "wasm32"))]
     idle: Option<(std::time::Instant, bool)>,
@@ -136,6 +219,14 @@ pub struct Renderer {
 /// After this long without renders the GPU renderer's pool of recycled buffers is freed.
 #[cfg(not(target_arch = "wasm32"))]
 const IDLE_TRIM: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl Slot {
+    /// An interactive view of the open photo: slider drags redo only the stages they feed, and a
+    /// draft that finishes late still replaces older pixels.
+    pub fn is_view(self) -> bool {
+        matches!(self, Slot::Main | Slot::Region | Slot::RegionBefore | Slot::Before | Slot::Hover)
+    }
+}
 
 impl Default for Renderer {
     fn default() -> Self {
@@ -172,7 +263,11 @@ impl Renderer {
             catalog_rev: 0,
             prefetched: HashMap::new(),
             variant_used: HashMap::new(),
+            variant_want: 0,
             frame: 0,
+            stages_trimmed: 0,
+            #[cfg(test)]
+            stage_budget_override: None,
             #[cfg(not(target_arch = "wasm32"))]
             idle: None,
         }
@@ -228,6 +323,12 @@ impl Renderer {
         }
         true
     }
+    /// Free a view slot's texture and stage cache (the view is no longer shown).
+    pub fn release(&mut self, slot: Slot) {
+        self.textures.remove(&slot);
+        self.stages.remove(&slot);
+    }
+
     /// Run jobs through `offload` from now on (instead of the job pool / inline).
     pub fn set_offload(&mut self, offload: Box<dyn RenderOffload>) {
         self.offload = Some(offload);
@@ -256,8 +357,7 @@ impl Renderer {
         job.request_id = lightcraft_preview::next_tick();
         self.request_ids.insert(slot, job.request_id);
         // (an offload keeps its own per-view stage caches; the flag tells it to)
-        let job =
-            if matches!(slot, Slot::Main | Slot::Before | Slot::Hover) { job.with_stages(self.stages.entry(slot).or_default().clone()) } else { job };
+        let job = if slot.is_view() { job.with_stages(self.stages.entry(slot).or_default().clone()) } else { job };
         if self.offload.is_some() {
             self.seq += 1;
             self.queue.retain(|q| q.slot != slot);
@@ -285,7 +385,13 @@ impl Renderer {
         job.request_id = lightcraft_preview::next_tick();
         self.request_ids.insert(slot, job.request_id);
         let key = job.key;
-        self.pool.submit(slot, key, priority, Box::new(move || job.run()));
+        let background = matches!(slot, Slot::Thumb(_) | Slot::ThumbQuick(_) | Slot::Prefetch(_));
+        self.pool.submit(
+            slot,
+            key,
+            priority,
+            Box::new(move || if background { lightcraft_engine::memory::in_background(|| job.run()) } else { job.run() }),
+        );
     }
 
     /// Prepare a photo in the background (a [`Slot::Prefetch`] job runs once per key; a newer one
@@ -375,6 +481,19 @@ impl Renderer {
         self.textures.get(&slot)
     }
 
+    /// A view that shows `n` variants at once (the People view's faces) says so each frame, so the cache holds them all:
+    /// with a fixed budget a screen of more than [`VARIANT_TEXTURES`] pictures evicts, and re-requests, the same few every
+    /// frame, and those tiles stay blank. The budget is the most asked for in the last frame, a quarter more, up to
+    /// [`MAX_VARIANT_TEXTURES`].
+    pub fn want_variants(&mut self, n: usize) {
+        self.variant_want = self.variant_want.max(n);
+    }
+
+    /// How many variant textures are kept now.
+    fn variant_budget(&self) -> usize {
+        VARIANT_TEXTURES.max(self.variant_want + self.variant_want / 4).min(MAX_VARIANT_TEXTURES)
+    }
+
     /// Variant thumbnail textures currently loaded.
     pub fn variant_textures(&self) -> usize {
         self.textures.keys().filter(|s| matches!(s, Slot::Variant(_))).count()
@@ -404,20 +523,22 @@ impl Renderer {
             }
             _ => true,
         });
+        let budget = self.variant_budget();
+        self.variant_want = 0;
         let n = self.variant_textures();
-        if n > VARIANT_TEXTURES {
+        if n > budget {
             let mut have: Vec<(u64, u64)> = self
                 .textures
                 .keys()
                 .filter_map(|s| if let Slot::Variant(k) = s { Some((self.variant_used.get(k).copied().unwrap_or(0), *k)) } else { None })
                 .collect();
             have.sort_unstable();
-            for (_, k) in have.into_iter().take(n - VARIANT_TEXTURES) {
+            for (_, k) in have.into_iter().take(n - budget) {
                 self.textures.remove(&Slot::Variant(k));
                 self.variant_used.remove(&k);
             }
         }
-        if self.variant_used.len() > 4 * VARIANT_TEXTURES {
+        if self.variant_used.len() > 4 * budget {
             let textures = &self.textures;
             let pending = &self.pending;
             self.variant_used.retain(|k, _| textures.contains_key(&Slot::Variant(*k)) || pending.contains_key(&Slot::Variant(*k)));
@@ -438,6 +559,7 @@ impl Renderer {
         self.preview_generation = Some((Arc::downgrade(cache), generation));
         self.catalog_rev = session.catalog.revision;
         self.frame += 1;
+        self.trim_stages();
         // wasm: run one job per frame on this thread, timed with the host clock
         #[cfg(target_arch = "wasm32")]
         let inline_ms = {
@@ -459,9 +581,11 @@ impl Renderer {
         for (mut slot, r, ms) in finished {
             self.completed += 1;
             // Ignore obsolete pixels, failures and decoded sources, even for the same render key;
-            // an interactive view still takes a superseded draft that is newer than what it shows.
+            // an interactive view still takes a superseded draft that is newer than what it
+            // shows, and the source it decoded: a drag supersedes every request before it
+            // finishes, and a source thrown away with them is decoded again for every tick.
             if self.request_ids.get(&slot) != Some(&r.request_id) {
-                let newer_draft = matches!(slot, Slot::Main | Slot::Before | Slot::Hover)
+                let newer_draft = slot.is_view()
                     && self.request_ids.contains_key(&slot)
                     && r.request_id >= self.epoch
                     && self.shown_ids.get(&slot).is_none_or(|shown| r.request_id > *shown)
@@ -469,11 +593,12 @@ impl Renderer {
                 if !newer_draft {
                     continue;
                 }
+                session.accept(&r);
             } else {
                 self.request_ids.remove(&slot);
                 session.accept(&r);
             }
-            if matches!(slot, Slot::Main | Slot::Before | Slot::Hover) {
+            if slot.is_view() {
                 self.shown_ids.insert(slot, r.request_id);
             }
             if self.pending.get(&slot).is_some_and(|p| p.0 == r.key) {
@@ -508,7 +633,7 @@ impl Renderer {
                 self.textures.remove(&Slot::ThumbQuick(id));
             }
             let img = &rendered.image;
-            let color = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &img.as_bytes()));
+            let color = std::sync::Arc::new(color_image(img));
             let pixels = self.keep_pixels.then(|| color.clone());
             let name = format!("{slot:?}");
             match self.textures.get_mut(&slot) {
@@ -576,6 +701,26 @@ impl Renderer {
         }
     }
 
+    /// Bytes the per-view stage caches (CPU images and GPU buffers) may hold together.
+    pub fn stage_budget(&self) -> usize {
+        #[cfg(test)]
+        if let Some(b) = self.stage_budget_override {
+            return b;
+        }
+        lightcraft_engine::memory::budget() / STAGE_BUDGET_SHARE
+    }
+
+    /// Clear stage caches, least useful first, until what they hold fits [`Self::stage_budget`].
+    fn trim_stages(&mut self) {
+        let sizes: Vec<(Slot, usize)> = self.stages.iter().map(|(slot, c)| (*slot, c.bytes() + lightcraft_engine::gpu::stage_bytes(c))).collect();
+        for slot in stage_trim_order(&sizes, self.stage_budget()) {
+            if let Some(c) = self.stages.get(&slot) {
+                c.clear();
+                self.stages_trimmed += 1;
+            }
+        }
+    }
+
     /// What the renderer holds: per-view stage caches (CPU images and GPU buffers) and textures.
     pub fn memory(&self) -> serde_json::Value {
         let cpu: usize = self.stages.values().map(|s| s.bytes()).sum();
@@ -583,7 +728,7 @@ impl Renderer {
         let tex: usize = self.textures.values().map(|t| t.size[0] * t.size[1] * 4).sum();
         let copies: usize = self.textures.values().filter_map(|t| t.pixels.as_ref()).map(|p| p.pixels.len() * 4).sum();
         serde_json::json!({
-            "stageCaches": {"count": self.stages.len(), "cpuBytes": cpu, "gpuBytes": gpu},
+            "stageCaches": {"count": self.stages.len(), "cpuBytes": cpu, "gpuBytes": gpu, "budgetBytes": self.stage_budget(), "trimmed": self.stages_trimmed, "sharedSourceBytes": lightcraft_engine::gpu::shared_source_bytes()},
             "textures": {"count": self.textures.len(), "bytes": tex, "cpuCopyBytes": copies},
         })
     }
@@ -1032,5 +1177,122 @@ mod thumbnail_tests {
             app.renderer.thumb(PhotoId(1)).unwrap().pixels.as_ref().unwrap().pixels.iter().flat_map(|c| c.to_array()).collect::<Vec<_>>(),
             expected.as_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod stage_budget_tests {
+    use super::*;
+
+    const MB: usize = 1 << 20;
+
+    // Given stage caches within the budget, nothing is cleared
+    #[test]
+    fn nothing_is_trimmed_within_the_budget() {
+        let sizes = [(Slot::Main, 300 * MB), (Slot::Region, 100 * MB)];
+        assert_eq!(stage_trim_order(&sizes, 512 * MB), vec![]);
+    }
+
+    // Given too much held, the caches nothing is looking at go first (a hover render's, a compare
+    // tile's: rebuilt cheaply), the least useful first, and only as many as needed
+    #[test]
+    fn the_idle_caches_go_first_and_only_as_many_as_needed() {
+        let sizes =
+            [(Slot::Main, 300 * MB), (Slot::Hover, 100 * MB), (Slot::Second, 80 * MB), (Slot::Compare(0), 60 * MB), (Slot::Compare(1), 60 * MB)];
+        // 600 held, 500 allowed: the hover render's 100 is enough
+        assert_eq!(stage_trim_order(&sizes, 500 * MB), vec![Slot::Hover]);
+        // 400 allowed: the compare tiles' too (380 left), then, at 350, the second window's
+        assert_eq!(stage_trim_order(&sizes, 400 * MB), vec![Slot::Hover, Slot::Compare(0), Slot::Compare(1)]);
+        assert_eq!(stage_trim_order(&sizes, 350 * MB), vec![Slot::Hover, Slot::Compare(0), Slot::Compare(1), Slot::Second]);
+    }
+
+    // Given the open photo's views over the budget, they are not trimmed: they are what a slider
+    // drag reuses on every tick, and clearing them every frame costs far more than the memory
+    // (issue #323 review: 3.6x slower drags on a 2800 px canvas). They are counted and reported,
+    // and only a runaway (more than HARD_FACTOR times the budget) cuts the window and before
+    // caches, never the whole-frame view's.
+    #[test]
+    fn the_open_photos_views_are_trimmed_only_in_a_runaway_and_never_the_whole_frame() {
+        let views = [(Slot::Main, 400 * MB), (Slot::Region, 500 * MB), (Slot::RegionBefore, 500 * MB), (Slot::Before, 100 * MB)];
+        assert_eq!(stage_trim_order(&views, 400 * MB), vec![], "1.5 GB against a 400 MB budget is a busy Before/After, not a runaway");
+        // against a 100 MB budget (HARD_FACTOR 4 = 400 MB) it is: the before side goes first, then the window
+        assert_eq!(stage_trim_order(&views, 100 * MB), vec![Slot::RegionBefore, Slot::Before, Slot::Region]);
+        let mut with_idle = views.to_vec();
+        with_idle.push((Slot::Hover, 50 * MB));
+        assert_eq!(stage_trim_order(&with_idle, 400 * MB), vec![Slot::Hover]);
+        // a whole-frame view of any size stays
+        assert_eq!(stage_trim_order(&[(Slot::Main, 9000 * MB)], MB), vec![]);
+    }
+
+    // Given caches of slots that hold nothing, they are never "trimmed"
+    #[test]
+    fn empty_caches_are_left_alone() {
+        assert_eq!(stage_trim_order(&[(Slot::Hover, 0), (Slot::Second, 900 * MB)], 100 * MB), vec![Slot::Second]);
+    }
+
+    // Given real stage caches over the budget, the renderer clears them (the open photo's last)
+    #[test]
+    fn the_renderer_trims_real_stage_caches() {
+        use lightcraft_engine::pipeline::{RenderRequest, SourceInfo, render_cached};
+        let src = std::sync::Arc::new(lightcraft_raster::Rgb32f::from_fn(320, 240, |x, y| [x as f32 / 320.0, y as f32 / 240.0, 0.3]));
+        let mut r = Renderer::default();
+        for slot in [Slot::Main, Slot::Hover] {
+            let cache: Arc<StageCache> = Default::default();
+            let mut s = lightcraft_engine::develop::DevelopSettings::default();
+            s.effects.clarity = 50.0;
+            render_cached(&src, &SourceInfo::default(), &s, &RenderRequest::fit(320, 240), &cache);
+            assert!(cache.bytes() > 0);
+            r.stages.insert(slot, cache);
+        }
+        let total: usize = r.stages.values().map(|c| c.bytes()).sum();
+        r.stage_budget_override = Some(total * 3 / 4);
+        r.trim_stages();
+        assert_eq!(r.stages[&Slot::Hover].bytes(), 0, "the hover render's cache went");
+        assert!(r.stages[&Slot::Main].bytes() > 0, "the open photo's stayed");
+        assert_eq!(r.stages_trimmed, 1);
+        r.stage_budget_override = Some(0);
+        r.trim_stages();
+        assert!(r.stages[&Slot::Main].bytes() > 0, "the open photo's view is never trimmed");
+        r.trim_stages();
+        assert_eq!(r.stages_trimmed, 1, "and nothing is trimmed again");
+    }
+
+    // The renderer counts and trims what it holds, and says so
+    #[test]
+    fn the_renderer_reports_its_stage_budget() {
+        let r = Renderer::default();
+        let m = r.memory();
+        assert!(m["stageCaches"]["budgetBytes"].as_u64().unwrap() > 0, "{m}");
+        assert_eq!(m["stageCaches"]["trimmed"], 0);
+        assert!(m["stageCaches"]["sharedSourceBytes"].is_u64(), "the one device copy of a big original is reported: {m}");
+    }
+}
+
+#[cfg(test)]
+mod color_image_tests {
+    use super::*;
+
+    // The texture a render becomes is what egui would make of its bytes, whatever the alpha
+    #[test]
+    fn the_fast_conversion_equals_eguis() {
+        let img = lightcraft_raster::Rgba8::from_fn(37, 29, |x, y| {
+            let a = match (x + y) % 5 {
+                0 => 0,
+                1 => 17,
+                2 => 128,
+                _ => 255,
+            };
+            [(x * 7) as u8, (y * 9) as u8, (x * y) as u8, a]
+        });
+        let want = egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &img.as_bytes());
+        let got = color_image(&img);
+        assert_eq!(got.size, want.size);
+        assert_eq!(got.pixels, want.pixels);
+    }
+
+    #[test]
+    fn an_empty_image_is_an_empty_texture() {
+        let img = lightcraft_raster::Rgba8::new(0, 0);
+        assert!(color_image(&img).pixels.is_empty());
     }
 }

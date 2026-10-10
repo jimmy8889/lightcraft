@@ -5,7 +5,7 @@ use lightcraft_develop::{CONTROLS, controls};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, cmd, has_active};
-use crate::Session;
+use crate::{LibrarySource, Session};
 
 pub fn photo_summary(p: &Photo) -> Value {
     json!({
@@ -48,8 +48,13 @@ fn album_json(a: &Album, all: &[Album], cat: &lightcraft_catalog::Catalog) -> Va
     v
 }
 
+/// The photo a query is about: `id` when given (which must be in the library), else the active one.
 fn photo_arg(s: &Session, p: &Value, c: &str) -> crate::Result<PhotoId> {
-    p.get("id").and_then(Value::as_u64).map(PhotoId).or(s.active()).ok_or_else(|| bad(c, "no photo"))
+    match p.get("id").and_then(Value::as_u64).map(PhotoId) {
+        Some(id) if s.catalog.photo(id).is_some() => Ok(id),
+        Some(id) => Err(bad(c, format!("no such photo {}", id.0))),
+        None => s.active().ok_or_else(|| bad(c, "no photo")),
+    }
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -81,10 +86,14 @@ pub fn specs() -> Vec<CommandSpec> {
             }))
         }),
         cmd!(query "library.state", "Library State", [], None, "{}", always, |s, _| {
-            let label = s.source.label(&s.catalog);
+            let label = match (s.source, s.library_folder.as_deref()) {
+                (LibrarySource::LibraryFolder, Some(path)) => lightcraft_catalog::folders::folder_label(path),
+                _ => s.source.label(&s.catalog),
+            };
             let n = s.visible().len();
             Ok(json!({
                 "source": s.source,
+                "libraryFolder": s.library_folder.as_ref().filter(|_| s.source == LibrarySource::LibraryFolder),
                 "sourceLabel": label,
                 "filter": s.filter,
                 "sort": s.sort,

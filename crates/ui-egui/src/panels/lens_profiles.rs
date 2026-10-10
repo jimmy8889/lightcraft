@@ -234,7 +234,7 @@ mod tests {
         let info = lightcraft_engine::media::source_info(&photo);
         session.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
         session.selection = Selection::single(PhotoId(1));
-        session.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(90, 60, [0.2; 3]), info))));
+        session.media.file_loader = Some(Arc::new(move |_, _| Ok((Rgb32f::filled(90, 60, [0.2; 3]), info.clone()))));
         let services = Services {
             png: Some(Box::new(|img| lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(img), &Default::default()).unwrap())),
             write: Some(Box::new(|p, b| std::fs::write(p, b).map_err(|e| e.to_string()))),

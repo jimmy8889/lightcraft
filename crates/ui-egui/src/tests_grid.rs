@@ -131,3 +131,27 @@ fn grid_headers_selection_scrolling_stacks_and_shape_changes() {
     assert!(after.height() > after.width(), "{after:?}");
     assert_cheap_frames(&mut h);
 }
+
+/// Selected photos whose thumbnails have not loaded (or can't) are still marked selected in the
+/// justified grid (issue #298): the active one white, the others grey.
+#[test]
+fn unloaded_thumbnails_show_their_selection() {
+    let mut h = grid(ViewMode::PhotoGrid);
+    h.request("engine.execute", json!({"command": "library.selectAll"}), T);
+    let img = h.snapshot(SETTLE);
+    assert_eq!(h.view.ctx.pixels_per_point(), 1.0);
+    let active = h.app.session.selection.active.expect("active");
+    let canvas = h.app.canvas_rect.expect("grid drawn");
+    let mut checked = 0;
+    for (w, r) in h.app.widgets.iter().filter(|(w, _)| w.starts_with("thumb:")) {
+        if !canvas.shrink(4.0).contains_rect(*r) || r.min.x < 6.0 {
+            continue;
+        }
+        let id = w.trim_start_matches("thumb:").parse::<u64>().unwrap();
+        let want = if id == active.0 { egui::Color32::WHITE } else { egui::Color32::from_gray(170) };
+        let px = img[((r.min.x - 1.0) as usize, r.center().y as usize)];
+        assert_eq!(px, want, "photo {id}");
+        checked += 1;
+    }
+    assert!(checked >= 3, "checked {checked}");
+}

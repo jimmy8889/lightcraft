@@ -19,6 +19,19 @@ fn gradient_png(path: &std::path::Path) {
     std::fs::write(path, png).unwrap();
 }
 
+#[test]
+fn calibrate_reads_raf_inputs_and_reports_bad_files() {
+    let input = tmp("invalid.RAF");
+    std::fs::write(&input, b"FUJIFILMCCD-RAW").unwrap();
+    let out = tmp("raf-profiles");
+    let result = Command::new(BIN).args(["calibrate", "--out"]).arg(&out).arg(&input).output().unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("1 of 1 raw files"), "RAF was silently ignored: {stderr}");
+    assert!(stderr.contains("invalid.RAF") && stderr.contains("no profile written"), "{stderr}");
+    assert!(!out.join("X-T4.json").exists(), "bad input must not produce a profile");
+}
+
 fn mean(path: &std::path::Path) -> f64 {
     let d = lightcraft_codecs::decode(&std::fs::read(path).unwrap(), Default::default()).unwrap();
     let img = d.to_srgb8();
@@ -154,10 +167,14 @@ fn snapshot_subcommand_renders_the_ui_headlessly() {
     std::fs::write(
         &script,
         format!(
-            "# comment\n{}\n{}\n{}\n{}\n",
+            "# comment\n{}\n{}\n{}\n{}\n{}\n{}\n",
             json!({"method": "ui.set", "params": {"view": "photoGrid"}}),
+            // (settled: under load a grid shot taken before its thumbnails is darker than the
+            // dimmed export dialog over them, and the comparison below fails)
+            json!({"method": "ui.settle", "params": {"timeoutMs": 20000}}),
             json!({"method": "ui.screenshot"}),
             json!({"method": "engine.execute", "params": {"command": "dialog.export"}}),
+            json!({"method": "ui.settle", "params": {"timeoutMs": 20000}}),
             json!({"method": "ui.screenshot", "params": {"path": b.to_str().unwrap()}}),
         ),
     )
@@ -168,7 +185,7 @@ fn snapshot_subcommand_renders_the_ui_headlessly() {
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let replies: Vec<Value> = String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(replies.len(), 4);
+    assert_eq!(replies.len(), 6);
     assert!(replies.iter().all(|r| r["ok"] == true), "{replies:?}");
     for (p, dimmed) in [(&a, false), (&b, true)] {
         let d = lightcraft_codecs::decode(&std::fs::read(p).unwrap(), Default::default()).unwrap();
@@ -181,6 +198,91 @@ fn snapshot_subcommand_renders_the_ui_headlessly() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let d = lightcraft_codecs::decode(&std::fs::read(&a).unwrap(), Default::default()).unwrap();
     assert_eq!((d.width, d.height), (640, 480));
+}
+
+/// Issue #166: a scripted request that fails makes `snapshot` exit non-zero. The failed reply is
+/// still printed, the later lines still run, and the final `-o` screenshot is still written.
+#[test]
+fn snapshot_script_failure_exits_non_zero() {
+    let script = tmp("snap-fail.jsonl");
+    let out = tmp("snap-fail.png");
+    std::fs::write(
+        &script,
+        format!(
+            "{}\n{}\n",
+            json!({"method": "ui.set", "params": {"view": "grid"}}), // not a view: `photoGrid`, `detail`, …
+            json!({"method": "ui.set", "params": {"view": "photoGrid"}}),
+        ),
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&out);
+    let o = Command::new(BIN)
+        .args(["snapshot", "--demo", "--script", script.to_str().unwrap(), "-o", out.to_str().unwrap(), "--size", "320x200"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "a failed scripted request must fail the run\n{stderr}");
+    assert!(stderr.contains("1 scripted request(s) failed"), "{stderr}");
+    let replies: Vec<Value> = String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(replies[0]["ok"], false, "{replies:?}");
+    assert!(replies[0]["error"].as_str().unwrap_or("").contains("grid"), "{replies:?}");
+    assert_eq!(replies[1]["ok"], true, "{replies:?}");
+    // continue-and-report: the final screenshot is still written
+    let d = lightcraft_codecs::decode(&std::fs::read(&out).unwrap(), Default::default()).unwrap();
+    assert_eq!((d.width, d.height), (320, 200));
+}
+
+#[test]
+fn snapshot_ui_zoom_keeps_requested_pixel_dimensions() {
+    let script = tmp("snap-ui-zoom.jsonl");
+    std::fs::write(
+        &script,
+        format!("{}\n{}\n", json!({"method": "ui.key", "params": {"key": "Plus", "cmd": true}}), json!({"method": "ui.inspect"})),
+    )
+    .unwrap();
+    for (size, scale, expected) in [("400x240", "1", (400, 240)), ("345x200", "0.9", (311, 180))] {
+        let out = tmp(&format!("snap-ui-zoom-{scale}.png"));
+        let o = Command::new(BIN)
+            .args(["snapshot", "--script", script.to_str().unwrap(), "-o", out.to_str().unwrap(), "--size", size, "--scale", scale])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let replies: Vec<Value> = String::from_utf8_lossy(&o.stdout).lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(replies.iter().all(|reply| reply["ok"] == true), "{replies:?}");
+        assert!(replies[1]["result"]["pixelsPerPoint"].as_f64().unwrap() > scale.parse::<f64>().unwrap());
+        let decoded = lightcraft_codecs::decode(&std::fs::read(out).unwrap(), Default::default()).unwrap();
+        assert_eq!((decoded.width, decoded.height), expected);
+    }
+}
+
+/// Headless snapshots default to CPU photo rendering as well as CPU UI rasterization.
+#[test]
+fn snapshot_defaults_to_cpu_without_gpu_environment_overrides() {
+    let script = tmp("default-cpu.jsonl");
+    std::fs::write(
+        &script,
+        format!("{}\n{}\n", json!({"method": "engine.execute", "params": {"command": "app.gpu"}}), json!({"method": "ui.screenshot"})),
+    )
+    .unwrap();
+    let image = tmp("default-cpu.png");
+    let output = Command::new(BIN)
+        .env_remove("LIGHTCRAFT_GPU")
+        .env_remove("LIGHTCRAFT_GPU_BACKEND")
+        .env_remove("WGPU_BACKEND")
+        .args(["snapshot", "--demo", "--script", script.to_str().unwrap(), "-o", image.to_str().unwrap(), "--size", "480x320"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "status {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    let replies: Vec<Value> = String::from_utf8_lossy(&output.stdout).lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert!(replies.iter().all(|reply| reply["ok"] == true), "{replies:?}");
+    let gpu = &replies[0]["result"];
+    assert_eq!(gpu["enabled"], false, "{gpu}");
+    assert_eq!(gpu["available"], false, "{gpu}");
+    assert_eq!(gpu["adapter"], Value::Null, "no device is created: {gpu}");
+    assert!(gpu["reason"].as_str().is_some_and(|reason| reason.contains("preference")), "{gpu}");
+    let decoded = lightcraft_codecs::decode(&std::fs::read(image).unwrap(), Default::default()).unwrap();
+    assert_eq!((decoded.width, decoded.height), (480, 320));
 }
 
 /// Issue #136: with the GPU switched off from the environment the UI starts and renders on the CPU,
@@ -353,4 +455,106 @@ fn connect_failure_hint_names_the_attempted_port() {
     assert!(!ok);
     assert!(err.contains("--control 18437"), "the hint must name the port it tried: {err}");
     assert!(!err.contains("--control 7980"), "{err}");
+}
+
+/// The CLI logs warnings on stderr (#168): with `RUST_LOG=warn` an unknown GPU backend name is
+/// reported, and `RUST_LOG=off` silences it. Before, no logger was installed and nothing appeared.
+#[test]
+fn warnings_are_logged_on_stderr() {
+    let input = tmp("log-in.png");
+    gradient_png(&input);
+    let out = tmp("log-out.jpg");
+    let run = |level: &str| {
+        let o = Command::new(BIN)
+            .args(["render", input.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("LIGHTCRAFT_GPU_BACKEND", "bogus")
+            .env("RUST_LOG", level)
+            .env_remove("LIGHTCRAFT_LOG")
+            .env_remove("LIGHTCRAFT_GPU")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "{stderr}");
+        stderr
+    };
+    let warn = run("warn");
+    assert!(warn.contains("LIGHTCRAFT_GPU_BACKEND=bogus names no known backend"), "{warn}");
+    let off = run("off");
+    assert!(!off.contains("names no known backend"), "{off}");
+}
+
+#[test]
+fn snapshot_rejects_invalid_dimensions_before_creating_an_image() {
+    for (index, (size, scale)) in
+        [("NaNx100", "1"), ("100x100", "inf"), ("9000x9000", "1"), ("9000x100", "2"), ("100x100", "0.001")].into_iter().enumerate()
+    {
+        let image = tmp(&format!("invalid-viewport-{index}.png"));
+        let output = Command::new(BIN).args(["snapshot", "--size", size, "--scale", scale, "-o"]).arg(&image).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("snapshot: bad --size/--scale"), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!image.exists());
+    }
+}
+
+#[test]
+fn snapshot_preserves_fractional_scale_rounding() {
+    let image = tmp("fractional-scale-rounding.png");
+    let output =
+        Command::new(BIN).env("LIGHTCRAFT_GPU", "0").args(["snapshot", "--size", "345x200", "--scale", "0.9", "-o"]).arg(&image).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let decoded = lightcraft_codecs::decode(&std::fs::read(image).unwrap(), Default::default()).unwrap();
+    assert_eq!((decoded.width, decoded.height), (311, 180));
+}
+
+/// Snapshot's CPU setting must never replace the desktop preference, including with --library.
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_leaves_desktop_gpu_preferences_untouched() {
+    let dir = tmp("snapshot-desktop-preferences");
+    let library = dir.join("library");
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(&library, true).unwrap();
+    drop(session);
+    let config = dir.join("config");
+    let app_config = config.join("lightcraft");
+    std::fs::create_dir_all(&app_config).unwrap();
+    let ui_path = app_config.join("ui.json");
+    let mut ui = lightcraft_ui_egui::UiState::default();
+    ui.settings.gpu = true;
+    let saved = serde_json::to_vec_pretty(&ui).unwrap();
+    std::fs::write(&ui_path, &saved).unwrap();
+    let script = dir.join("preferences.jsonl");
+    std::fs::write(
+        &script,
+        format!("{}\n{}\n", json!({"method": "engine.execute", "params": {"command": "app.gpu"}}), json!({"method": "ui.inspect"})),
+    )
+    .unwrap();
+    for gpu_environment in [None, Some("1")] {
+        let image = dir.join(format!("{}.png", gpu_environment.unwrap_or("default")));
+        let mut cmd = Command::new(BIN);
+        cmd.env("XDG_CONFIG_HOME", &config).env_remove("LIGHTCRAFT_GPU").env_remove("LIGHTCRAFT_GPU_BACKEND").env_remove("WGPU_BACKEND");
+        if let Some(value) = gpu_environment {
+            cmd.env("LIGHTCRAFT_GPU", value);
+        }
+        let output = cmd
+            .args(["snapshot", "--library"])
+            .arg(&library)
+            .args(["--script"])
+            .arg(&script)
+            .args(["-o"])
+            .arg(&image)
+            .args(["--size", "480x320"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let replies: Vec<Value> = String::from_utf8_lossy(&output.stdout).lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(replies.iter().all(|reply| reply["ok"] == true), "{replies:?}");
+        assert_eq!(replies[0]["result"]["enabled"], false);
+        assert_eq!(replies[0]["result"]["available"], false);
+        assert_eq!(replies[0]["result"]["adapter"], Value::Null);
+        assert_eq!(replies[1]["result"]["ui"]["settings"]["gpu"], false);
+        assert_eq!(std::fs::read(&ui_path).unwrap(), saved, "snapshot changed the desktop preferences");
+        assert!(!app_config.join("ui.json.tmp").exists());
+        assert!(image.exists());
+    }
 }

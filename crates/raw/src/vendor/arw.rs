@@ -338,7 +338,7 @@ fn read_ycbcr_tiles(bytes: &[u8], info: &ImageInfo, raw: &Ifd, mode: Mode) -> Re
         .map(|c| {
             let src = chunk_bytes(bytes, c).ok_or_else(|| RawError::Corrupt("YCbCr tile outside file".into()))?;
             let limit = (c.width as usize).checked_mul(c.height as usize).and_then(|n| n.checked_mul(3)).ok_or(RawError::Limit("tile too large"))?;
-            let f = ljpeg::decode_subsampled(src, limit)?;
+            let f = ljpeg::decode_subsampled(src, limit, ljpeg::Prediction::Geometric)?;
             if f.width != c.width as usize || f.height != c.height as usize {
                 return Err(RawError::Corrupt("Sony YCbCr tile dimensions".into()));
             }
@@ -454,13 +454,17 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     let linear_rgb = info.compression == 7 && info.photometric == photometric::YCBCR;
     let chunks = info.chunks(bytes.len() as u64);
     let strip_len: u64 = chunks.iter().map(|c| c.len).sum();
+    // The row-per-w-bytes (ARW2) layout stores exactly one byte per pixel in a single strip; all 108 such files in the test
+    // archive measure exactly width x height. A200/A230/A350 files carry a strip 4-23 % larger than that (and A290/A390 one
+    // smaller), which is a different packing, so they are refused rather than read with the wrong layout.
+    let one_byte_per_sample = chunks.len() == 1 && strip_len == (w * h) as u64;
     let (data, out_bits) = match info.compression {
         7 if linear_rgb => (RawData::U16(read_ycbcr_tiles(bytes, &info, raw, mode)?), 14),
-        32767 if chunks.len() == 1 && strip_len >= (w * h) as u64 && strip_len < (w * h) as u64 * 5 / 4 && mode == Mode::Header => {
+        32767 if one_byte_per_sample && mode == Mode::Header => {
             chunk_bytes(bytes, &chunks[0]).ok_or_else(|| RawError::Corrupt("raw strip outside file".into()))?;
             (RawData::U16(Vec::new()), 14)
         }
-        32767 if chunks.len() == 1 && strip_len >= (w * h) as u64 && strip_len < (w * h) as u64 * 5 / 4 => {
+        32767 if one_byte_per_sample => {
             let src = chunk_bytes(bytes, &chunks[0]).ok_or_else(|| RawError::Corrupt("raw strip outside file".into()))?;
             let curve = code_curve(&raw.u64s(TONE_CURVE).unwrap_or_else(|| vec![8000, 10400, 12900, 14100]));
             let mut data = vec![0u16; w * h];
@@ -473,7 +477,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
             });
             (RawData::U16(data), 14)
         }
-        32767 => return Err(RawError::Unsupported("Sony ARW version 1 / packed compressed variant".into())),
+        32767 => return Err(RawError::Unsupported("Sony ARW version 1 / packed compressed variant (raw strip is not one byte per pixel)".into())),
         7 if is_quad_tiled(bytes, &info) => match mode {
             Mode::Full => (RawData::U16(read_quad_tiles(bytes, &info)?), bits),
             Mode::Header => {
@@ -593,6 +597,37 @@ mod tests {
         assert_eq!(&pixels[..3], &[1140, 929, 1000]);
         let developed = full.develop(crate::Method::Bilinear).unwrap();
         assert_eq!((developed.width, developed.height), (4, 4));
+    }
+
+    /// A 32767-compressed ARW whose single strip is `strip` bytes for a 32 x 4 image.
+    fn arw_with_strip(strip: usize) -> Vec<u8> {
+        use lightcraft_tiff::{IfdBuilder, ImageData, TiffWriter, Value};
+        let mut raw = IfdBuilder::new();
+        raw.set(t::MAKE, Value::Ascii("SONY".into()));
+        raw.set(t::MODEL, Value::Ascii("DSLR-A200".into()));
+        raw.set(t::IMAGE_WIDTH, Value::Long(vec![32]));
+        raw.set(t::IMAGE_LENGTH, Value::Long(vec![4]));
+        raw.set(t::BITS_PER_SAMPLE, Value::Short(vec![12]));
+        raw.set(t::SAMPLES_PER_PIXEL, Value::Short(vec![1]));
+        raw.set(t::PHOTOMETRIC, Value::Short(vec![photometric::CFA]));
+        raw.set(t::COMPRESSION, Value::Short(vec![32767]));
+        raw.set(TONE_CURVE, Value::Short(vec![8000, 10400, 12900, 14100]));
+        raw.set_image(ImageData::Strips { rows_per_strip: 4, strips: vec![vec![0u8; strip]] });
+        TiffWriter::default().write(&[raw]).unwrap()
+    }
+
+    #[test]
+    fn strip_larger_or_smaller_than_one_byte_per_pixel_is_the_packed_variant() {
+        for strip in [32 * 4 + 8, 32 * 4 * 5 / 4 - 1, 32 * 4 - 1] {
+            for mode in [Mode::Header, Mode::Full] {
+                let err = decode(&arw_with_strip(strip), mode).unwrap_err();
+                assert!(matches!(err, RawError::Unsupported(ref m) if m.contains("packed compressed variant")), "{strip} {mode:?}: {err:?}");
+            }
+        }
+        for mode in [Mode::Header, Mode::Full] {
+            let r = decode(&arw_with_strip(32 * 4), mode);
+            assert!(!matches!(r, Err(RawError::Unsupported(ref m)) if m.contains("packed compressed variant")), "{r:?}");
+        }
     }
 
     /// Encode one 16-value set as an ARW2 block (the paper's scheme, used here to test the decoder).

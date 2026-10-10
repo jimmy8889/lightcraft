@@ -146,7 +146,19 @@ pub fn write_matrix_trc(space: &RgbSpace, trc: &Trc) -> Vec<u8> {
     };
     p.description = Some(ProfileText::Localizable(vec![LocalizableString::new("en".into(), "US".into(), desc)]));
     p.copyright = Some(ProfileText::Localizable(vec![LocalizableString::new("en".into(), "US".into(), "No copyright, use freely".into())]));
-    align_tags(&p.encode().unwrap_or_default())
+    align_tags(&fixed_date(p.encode().unwrap_or_default()))
+}
+
+/// Zero the header's creation date/time (ICC.1 §7.2.8, bytes 24..36) so a profile's bytes depend
+/// only on its colour space and curve. `moxcms` stamps the wall clock there on every `encode`
+/// (ignoring `ColorProfile::creation_date_time`), which made two exports of one photo differ in
+/// the embedded profile and nowhere else, so output hashes could not be compared (#180). Readers
+/// do not interpret the field; all zeros is the conventional "unspecified" value.
+fn fixed_date(mut b: Vec<u8>) -> Vec<u8> {
+    if let Some(date) = b.get_mut(24..36) {
+        date.fill(0);
+    }
+    b
 }
 
 /// Re-lay a profile's tag data on 4-byte boundaries (ICC.1 §7.3.1). The encoder packs tags back to
@@ -298,6 +310,23 @@ mod tests {
             assert!((out[i] - want[i]).abs() < 2e-3, "{out:?} vs {want:?}");
         }
         let _ = SRGB;
+    }
+
+    /// Two profiles for one space are byte-identical, and the header date is fixed: exports of the
+    /// same photo with the same settings hash the same (#180).
+    #[test]
+    fn written_profiles_are_deterministic() {
+        for n in NamedSpace::ALL {
+            let a = write_named(n);
+            let b = write_named(n);
+            assert_eq!(a, b, "{n:?}");
+            assert_eq!(&a[24..36], &[0u8; 12], "{n:?} header date/time");
+            // the profile ID is "not computed", not a hash of a timestamp
+            assert_eq!(&a[84..100], &[0u8; 16], "{n:?} profile ID");
+        }
+        let lin = write_matrix_trc(&PROPHOTO, &Trc::Linear);
+        assert_eq!(lin, write_matrix_trc(&PROPHOTO, &Trc::Linear));
+        assert_eq!(&lin[24..36], &[0u8; 12]);
     }
 
     #[test]

@@ -33,9 +33,8 @@ pub fn preview_only_variant(reason: &str) -> &str {
 
 /// What a preview-only raw means for the user (see `Photo::preview_only`).
 pub fn preview_only_explanation(reason: &str) -> String {
-    format!(
-        "LightCraft can't decode this raw variant yet ({}). You're editing the camera's embedded JPEG preview, \
-         which already includes the camera's picture style (e.g. Monochrome) and white balance.",
+    crate::i18n::tr_format!(
+        "LightCraft can't decode this raw variant yet ({}). You're editing the camera's embedded JPEG preview, which already includes the camera's picture style (e.g. Monochrome) and white balance.",
         preview_only_variant(reason)
     )
 }
@@ -61,7 +60,7 @@ pub fn preview_only_notice(ui: &mut Ui, key: &str, reason: &str) {
         })
         .response;
     let r = r.on_hover_text(crate::i18n::tr_format!("Decoder: {reason}", reason = reason));
-    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "Preview only: editing the camera's embedded JPEG"));
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, crate::i18n::tr("Preview only: editing the camera's embedded JPEG")));
     register(ui.ctx(), format!("notice:previewOnly:{key}"), r.rect);
 }
 
@@ -142,8 +141,26 @@ pub struct SliderOut {
     pub reset: bool,
 }
 
+/// What a value typed into a slider asks for (issue #322): a number such as `0.5`, `+12`, `-1,5`
+/// (comma or point) or `5600 K`, on the control's steps and clamped to its range. `None` when it
+/// isn't a finite number, so the slider keeps its value.
+pub fn typed_value(spec: &ControlSpec, text: &str) -> Option<f64> {
+    let t = text.trim().replace(',', ".");
+    let t = t.trim_end_matches(|c: char| c == '%' || c == 'K' || c == 'k' || c.is_whitespace());
+    let v: f64 = t.parse().ok().filter(|v: &f64| v.is_finite())?;
+    let step = spec.step.max(1e-9);
+    Some(((v / step).round() * step).clamp(spec.min, spec.max))
+}
+
+/// A slider's value as shown next to its label.
+fn shown_value(spec: &ControlSpec, v: f64) -> String {
+    let shown = if spec.id == "wb.temp" { format!("{v:.0}") } else { spec.format(v).replace("+0.00", "0").replace("-0.00", "0") };
+    if shown == "+0" || shown == "-0" { "0".to_string() } else { shown }
+}
+
 /// A Lightroom slider row (label + value above a track with a hollow ring thumb).
-/// Double-click the label or thumb to reset. Shift-drag = fine adjustment.
+/// Double-click the label or thumb to reset. Shift-drag = fine adjustment. Click the value to
+/// type one: Return or clicking away applies it, Esc keeps the old one.
 pub fn slider(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, label_override: Option<&str>) -> SliderOut {
     let t = Tokens::get(ui.ctx());
     let w = ui.available_width();
@@ -159,12 +176,58 @@ pub fn slider(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, label_
     resp.widget_info(|| egui::WidgetInfo::slider(enabled, value, label_text.clone()));
     let label_resp = ui.interact(label_rect, id.with("label"), Sense::click());
     register(ui.ctx(), format!("slider:{}", spec.id), track_rect);
+    // the value: click it to type an exact one (over the label, so it takes the click)
+    let value_rect = Rect::from_min_max(pos2(label_rect.right() - 64.0, label_rect.top()), label_rect.max);
+    let value_resp = ui.interact(value_rect, id.with("value"), if enabled { Sense::click() } else { Sense::hover() });
+    register(ui.ctx(), format!("sliderValue:{}", spec.id), value_rect);
+    let typing_id = id.with("typing");
+    let field_id = id.with("typingField");
+    // the text being typed and how many frames the field has been up: it takes the keyboard on its
+    // first frames (not on the click's own, whose release would take the focus straight back)
+    let mut typing: Option<(String, u8)> = ui.data(|m| m.get_temp(typing_id));
+    if enabled && typing.is_none() && value_resp.clicked() {
+        typing = Some((shown_value(spec, value).trim_start_matches('+').to_string(), 0));
+    }
     let mut out = SliderOut::default();
     let span = (spec.max - spec.min).max(1e-9);
     let to_x = |v: f64| track_rect.left() + ((v - spec.min) / span).clamp(0.0, 1.0) as f32 * track_rect.width();
     let from_x = |x: f32| spec.min + ((x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0) as f64 * span;
     let mut v = value;
-    if resp.double_clicked() || label_resp.double_clicked() {
+    if let Some((mut text, frames)) = typing.take() {
+        let field = egui::TextEdit::singleline(&mut text)
+            .id(field_id)
+            .font(t.font(12.5))
+            .horizontal_align(egui::Align::RIGHT)
+            .desired_width(value_rect.width())
+            .margin(egui::Margin::ZERO);
+        // a child over the value, so the field never moves the rows around it
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(value_rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        let te = child.add(field);
+        if frames < 2 {
+            te.request_focus();
+            // the old value is selected, so typing replaces it (set again once the field has the
+            // focus, which places the cursor)
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), field_id).unwrap_or_default();
+            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()));
+            state.cursor.set_char_range(Some(all));
+            state.store(ui.ctx(), field_id);
+            typing = Some((text.clone(), frames + 1));
+            ui.data_mut(|m| m.insert_temp(typing_id, (text, frames + 1)));
+        } else if !te.has_focus() || !enabled {
+            // Esc (or the slider turning off) keeps the old value; Return or clicking away applies
+            let cancelled = !enabled || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if let Some(nv) = typed_value(spec, &text).filter(|nv| !cancelled && (nv - value).abs() > 1e-12) {
+                out.value = Some(nv);
+                out.drag_started = true;
+                out.drag_stopped = true;
+                v = nv;
+            }
+            ui.data_mut(|m| m.remove::<(String, u8)>(typing_id));
+        } else {
+            typing = Some((text.clone(), frames));
+            ui.data_mut(|m| m.insert_temp(typing_id, (text, frames)));
+        }
+    } else if resp.double_clicked() || label_resp.double_clicked() {
         out.reset = true;
         out.value = Some(spec.default);
         v = spec.default;
@@ -202,7 +265,7 @@ pub fn slider(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, label_
             out.drag_stopped = true;
         }
         // ↑ / ↓ while the pointer rests on the row nudge the value (⇧: five times as much)
-        if enabled && out.value.is_none() && ui.rect_contains_pointer(row) {
+        if enabled && out.value.is_none() && typing.is_none() && ui.rect_contains_pointer(row) {
             let (up, down, shift) = ui.input_mut(|i| {
                 let shift = i.modifiers.shift;
                 let m = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
@@ -224,9 +287,12 @@ pub fn slider(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, label_
     let text_c = if enabled { t.text_label } else { t.text_disabled };
     let p = ui.painter();
     p.text(label_rect.left_center(), Align2::LEFT_CENTER, crate::i18n::tr(label_override.unwrap_or(spec.label)), t.font(12.5), text_c);
-    let shown = if spec.id == "wb.temp" { format!("{v:.0}") } else { spec.format(v).replace("+0.00", "0").replace("-0.00", "0") };
-    let shown = if shown == "+0" || shown == "-0" { "0".to_string() } else { shown };
-    p.text(label_rect.right_center(), Align2::RIGHT_CENTER, shown, t.font(12.5), text_c);
+    if typing.is_none() {
+        p.text(label_rect.right_center(), Align2::RIGHT_CENTER, shown_value(spec, v), t.font(12.5), text_c);
+        if enabled && value_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
+    }
     let ring = 7.0;
     let tx = to_x(v);
     paint_track(ui, track_rect, &spec.track, &t, tx, ring);
@@ -263,15 +329,18 @@ pub fn section_header(ui: &mut Ui, id: &str, title: &str, open: bool, enabled: O
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, true, open, title));
     register(ui.ctx(), format!("section:{id}"), r);
     let p = ui.painter();
-    if resp.hovered() {
+    if ui.rect_contains_pointer(r) {
         p.rect_filled(r, 0.0, t.chrome.gamma_multiply(1.06));
     }
     let chev = Rect::from_center_size(pos2(r.left() + 30.0, r.center().y), vec2(14.0, 14.0));
     paint(p, chev, if open { Icon::ChevronDown } else { Icon::ChevronRight }, t.text_label);
     p.text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, title, t.semibold(14.0), t.text);
     let mut toggled = None;
+    // shown while the pointer is anywhere on the header: `resp.hovered()` turns false as soon as the
+    // pointer is over the eye itself (the eye is on top), which hid the eye before it could be
+    // clicked (issue #316)
     if let Some(on) = enabled
-        && (resp.hovered() || !on)
+        && (ui.rect_contains_pointer(r) || !on)
     {
         let eye = Rect::from_center_size(pos2(r.right() - 34.0, r.center().y), vec2(18.0, 18.0));
         let er = ui.interact(eye, ui.id().with(("eye", id)), Sense::click());
@@ -468,6 +537,23 @@ mod tests {
         assert_eq!(nudged(&spec("wb.temp", 2000.0, 50000.0, 1.0), 6500.0, 1.0), 6550.0);
         assert_eq!(nudged(&spec("light.contrast", -100.0, 100.0, 1.0), 99.0, 5.0), 100.0, "clamped");
     }
+
+    /// Typed values (issue #322): signs, a decimal comma, units; on the control's steps, in range.
+    #[test]
+    fn typed_values_are_stepped_and_clamped() {
+        let exposure = lightcraft_develop::controls::find("light.exposure").unwrap();
+        let contrast = lightcraft_develop::controls::find("light.contrast").unwrap();
+        let temp = lightcraft_develop::controls::find("wb.temp").unwrap();
+        assert_eq!(typed_value(exposure, "1.5"), Some(1.5));
+        assert_eq!(typed_value(exposure, " +0,25 "), Some(0.25));
+        assert_eq!(typed_value(exposure, "-12"), Some(exposure.min), "clamped");
+        assert_eq!(typed_value(contrast, "33.4"), Some(33.0), "on the control's steps");
+        assert_eq!(typed_value(contrast, "-20 %"), Some(-20.0));
+        assert_eq!(typed_value(temp, "5600 K"), Some(5600.0));
+        for bad in ["", "abc", "1.2.3", "NaN", "inf", "--1"] {
+            assert_eq!(typed_value(contrast, bad), None, "{bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,4 +591,39 @@ mod access_tests {
         assert!(has("Button", "Auto"), "{found:?}");
         assert!(has("Button", "Delete mask"), "{found:?}");
     }
+}
+
+/// `text` laid out on one line, cut short with … when it is wider than `max` (the galley's
+/// `elided` says whether it was): for text painted into a fixed box (a tile, a row before its
+/// buttons), which a plain `Painter::text` would draw past.
+pub(crate) fn one_line(painter: &egui::Painter, text: &str, font: egui::FontId, color: Color32, max: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max.max(1.0));
+    painter.layout_job(job)
+}
+
+/// `text` shortened to fit `max` (as `width` measures it): leading folders drop first
+/// (`Users/me/Pictures/Lightroom` → `…/Pictures/Lightroom`) so the end of a path, which says the
+/// most, stays; a single name still too long loses its end (`2024-06-12 Tri…`: folders tend to
+/// differ at the start). Cuts fall on characters. The result is never empty.
+pub(crate) fn elide_head(text: &str, max: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(text) <= max {
+        return text.to_string();
+    }
+    let mut rest = text;
+    while let Some(i) = rest.find('/') {
+        rest = rest.get(i + 1..).unwrap_or("");
+        let cand = format!("…/{rest}");
+        if width(&cand) <= max {
+            return cand;
+        }
+    }
+    let n = rest.chars().count();
+    for keep in (1..n).rev() {
+        let cand: String = rest.chars().take(keep).chain(std::iter::once('…')).collect();
+        if width(&cand) <= max {
+            return cand;
+        }
+    }
+    "…".to_string()
 }

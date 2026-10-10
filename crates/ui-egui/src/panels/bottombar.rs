@@ -49,18 +49,21 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 
 /// Width of the centre group: the rating/flag pill, then Copy/Paste Edit Settings and its gear.
 const PILL_W: f32 = 196.0;
-const CENTRE_W: f32 = PILL_W + 10.0 + 136.0 + 4.0 + 30.0;
 
 /// The rating/flag pill and copy/paste settings, between `from` and `to` (the side groups): the
 /// copy buttons go first when there is no room (they are in the Edit menu too), then the pill.
 fn centre(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect, from: f32, to: f32) {
     let t = Tokens::get(ui.ctx());
+    let has_clip = app.session.clipboard.is_some();
+    let label = crate::i18n::tr(if has_clip { "Paste Edit Settings" } else { "Copy Edit Settings" });
+    let copy_width = (ui.painter().layout_no_wrap(label.to_string(), t.font(13.0), t.text_label).size().x + 24.0).max(136.0);
+    let centre_width = PILL_W + 10.0 + copy_width + 4.0 + 30.0;
     let room = to - from;
     if room < PILL_W {
         return;
     }
-    let with_copy = room >= CENTRE_W;
-    let w = if with_copy { CENTRE_W } else { PILL_W };
+    let with_copy = room >= centre_width;
+    let w = if with_copy { centre_width } else { PILL_W };
     // where it sits with room to spare (slightly left of centre), kept between the side groups
     let left = (full.center().x - 60.0 - PILL_W / 2.0).clamp(from, to - w);
     let active = app.session.active().and_then(|id| app.session.catalog.photo(id).cloned());
@@ -99,23 +102,15 @@ fn centre(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect, from: f32, to:
     if !with_copy {
         return;
     }
-    let copy_r = Rect::from_min_size(pos2(pill.right() + 10.0, pill.top()), vec2(136.0, 30.0));
-    let has_clip = app.session.clipboard.is_some();
-    let label = if has_clip { "Paste Edit Settings" } else { "Copy Edit Settings" };
+    let copy_r = Rect::from_min_size(pos2(pill.right() + 10.0, pill.top()), vec2(copy_width, 30.0));
     let cresp = ui.interact(copy_r, egui::Id::new("copy-settings"), Sense::click());
     register(ui.ctx(), "button:copySettings", copy_r);
     ui.painter().rect_filled(copy_r, 15.0, if cresp.hovered() { t.hover } else { t.canvas });
-    ui.painter().text(
-        copy_r.center(),
-        Align2::CENTER_CENTER,
-        crate::i18n::tr(label),
-        t.font(13.0),
-        if active.is_some() { t.text_label } else { t.text_disabled },
-    );
+    ui.painter().text(copy_r.center(), Align2::CENTER_CENTER, label, t.font(13.0), if active.is_some() { t.text_label } else { t.text_disabled });
     if cresp.clicked() && active.is_some() {
         let _ = if has_clip { app.run("develop.paste", json!({})) } else { app.run("develop.copy", json!({})) };
         let msg = if has_clip { "Settings pasted" } else { "Edit settings copied" };
-        app.toast(ui.ctx(), msg);
+        app.toast(ui.ctx(), crate::i18n::tr(msg));
     }
     let gear_r = Rect::from_min_size(pos2(copy_r.right() + 4.0, pill.top()), vec2(30.0, 30.0));
     let gresp = ui.interact(gear_r, egui::Id::new("copy-gear"), Sense::click());
@@ -178,17 +173,17 @@ fn right_side(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect) -> f32 {
         let zoom_label = match app.ui.zoom {
             Zoom::Fit => "Fit".to_string(),
             Zoom::Fill => "Fill".to_string(),
-            Zoom::Percent(p) => format!("{p}%"),
+            Zoom::Percent(p) => format!("{p:.0}%"),
         };
         let zr = crate::widgets::dropdown(&mut child, "zoom", crate::i18n::tr(&zoom_label), t.font(13.0), t.text_label);
         egui::Popup::menu(&zr).show(|ui| {
             for (label, z) in [
                 ("Fit", Zoom::Fit),
                 ("Fill", Zoom::Fill),
-                ("50%", Zoom::Percent(50)),
-                ("100%", Zoom::Percent(100)),
-                ("200%", Zoom::Percent(200)),
-                ("400%", Zoom::Percent(400)),
+                ("50%", Zoom::Percent(50.0)),
+                ("100%", Zoom::Percent(100.0)),
+                ("200%", Zoom::Percent(200.0)),
+                ("400%", Zoom::Percent(400.0)),
             ] {
                 if ui.selectable_label(app.ui.zoom == z, label).clicked() {
                     app.ui.zoom = z;

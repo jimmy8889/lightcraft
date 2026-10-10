@@ -95,3 +95,28 @@ fn unreadable_settings_are_not_overwritten() {
     assert_eq!(files.files.get("presets.json").unwrap(), presets);
     assert_eq!(files.files.get("prefs.json").unwrap(), prefs);
 }
+
+/// Issue #171: a library whose `catalog.lock` can't be locked (stood in for here by a directory
+/// of that name, which takes the same path as a file system without locks) still opens, and the
+/// user is told it is unprotected — in `library.info` and once through the library warnings the
+/// app's notices and the CLI show. A normally locked library says nothing.
+#[test]
+fn an_unlockable_library_opens_with_a_warning() {
+    let lib = temp_dir("unlocked");
+    std::fs::create_dir_all(lib.join("catalog.lock")).unwrap();
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    let info = s.execute("library.info", &json!({})).unwrap();
+    let listed = info["settingsWarnings"].as_array().cloned().unwrap_or_default();
+    assert!(listed.iter().any(|w| w.as_str().is_some_and(|w| w.contains("without protection against a second program"))), "{info}");
+    let warnings = s.take_library_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    drop(s);
+    // the same library with a lockable lock file: no warning
+    std::fs::remove_dir_all(lib.join("catalog.lock")).unwrap();
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    assert!(s.take_library_warnings().is_empty());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&lib);
+}

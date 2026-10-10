@@ -93,7 +93,9 @@ fn main() {
         for path in &args {
             let bytes = std::fs::read(path).expect("read");
             println!("{path}");
-            let raw = lightcraft_raw::decode(&bytes).expect("decode");
+            let mut raw = lightcraft_raw::decode(&bytes).expect("decode");
+            // as the loader does: lens corrections are applied by the pipeline, not in the raw develop
+            raw.opcodes.list3.retain(|op| !op.is_lens_correction());
             println!("  {}×{} cpp {} cfa {:?}", raw.width, raw.height, raw.cpp, raw.cfa.as_ref().map(|c| c.name()));
             println!("  {:<36} {}", "raw decode:", best(n, || drop(lightcraft_raw::decode(&bytes).expect("decode"))));
             println!("  {:<36} {}", "normalize:", best(n, || drop(raw.normalized().expect("norm"))));

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "upstream_repository": "storytold/lightcraft",
-  "upstream_base": "2472021091a28eb93a05947cfc9b941d3911543a",
-  "upstream_version": "v0.4.0",
+  "upstream_base": "1cc0dde747917f96a0a368a6d6cf8b3b8b36b62c",
+  "upstream_version": "v0.5.0",
   "integration_branch": "custom/folder-raw-workflow",
   "features": [
     {
@@ -211,6 +211,26 @@
         {
           "file": "crates/ui-egui/src/processed_raw.rs",
           "contains": "prepare_processed_dng_with_processor"
+        }
+      ]
+    },
+    {
+      "id": "CUSTOM-011",
+      "name": "Bounded exact camera-preview reuse and culling neighbour prefetch",
+      "status": "implemented",
+      "files": [
+        "crates/engine/src/media.rs",
+        "crates/ui-egui/src/render.rs",
+        "crates/ui-egui/src/panels/detail.rs"
+      ],
+      "checks": [
+        {
+          "file": "crates/engine/src/media.rs",
+          "contains": "camera_previews_reuse_exact_pixels_by_content_and_size_without_becoming_developed_thumbnails"
+        },
+        {
+          "file": "crates/engine/src/media.rs",
+          "contains": "cleared_camera_preview_jobs_cannot_repopulate_the_cache"
         }
       ]
     }

@@ -19,6 +19,9 @@ pub enum LibrarySource {
     Folder,
     /// Photos whose original file can't be found (`library.missing`).
     Missing,
+    /// A folder the library's photos were imported from ([`crate::Session::library_folder`]),
+    /// and the folders inside it (`library.folders`).
+    LibraryFolder,
 }
 
 /// The folder a [`LibrarySource::Folder`] view shows.
@@ -49,7 +52,7 @@ impl LibrarySource {
             LibrarySource::RecentlyDeleted => f.deleted = true,
             LibrarySource::Picks => f.flag = Some(lightcraft_catalog::Flag::Pick),
             // the folder itself is filled in by the session (it holds the path)
-            LibrarySource::Folder | LibrarySource::Missing => {}
+            LibrarySource::Folder | LibrarySource::Missing | LibrarySource::LibraryFolder => {}
         }
         f
     }
@@ -62,6 +65,7 @@ impl LibrarySource {
             LibrarySource::RecentlyDeleted => "Recently Deleted".into(),
             LibrarySource::Picks => "Picks".into(),
             LibrarySource::Folder => "Folder".into(),
+            LibrarySource::LibraryFolder => "Folder".into(),
             LibrarySource::Missing => "Missing Photos".into(),
         }
     }
@@ -74,7 +78,27 @@ pub struct Selection {
     pub active: Option<PhotoId>,
 }
 
+/// How a photo relates to the selection: what every view draws (grid cell, filmstrip cell…).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionState {
+    NotSelected,
+    /// Selected, but not the photo the loupe and panels act on.
+    Selected,
+    /// The most-selected photo.
+    Active,
+}
+
 impl Selection {
+    /// What views draw for `id`: active, selected or neither (one answer for grid, filmstrip, …).
+    pub fn state_of(&self, id: PhotoId) -> SelectionState {
+        if self.active == Some(id) {
+            SelectionState::Active
+        } else if self.contains(id) {
+            SelectionState::Selected
+        } else {
+            SelectionState::NotSelected
+        }
+    }
     pub fn single(id: PhotoId) -> Selection {
         Selection { ids: vec![id], active: Some(id) }
     }
@@ -173,6 +197,11 @@ pub fn filter_chips(f: &Filter, cat: &Catalog) -> Vec<FilterChip> {
     if let Some(d) = &f.date {
         add(format!("Date: {}", date_label(d)), json!({"date": Null}));
     }
+    if let Some(d) = f.library_folder.as_deref().filter(|d| !d.trim().is_empty()) {
+        // the last two names, so two folders called "Pictures" are told apart
+        let name = lightcraft_catalog::folders::folder_label(d);
+        add(format!("Folder: {name}"), json!({"libraryFolder": Null}));
+    }
     if let Some(d) = &f.imported {
         add(format!("Imported: {}", date_label(d)), json!({"imported": Null}));
     }
@@ -201,5 +230,20 @@ fn date_label(d: &str) -> String {
         ([y, _, day], Some(m)) => format!("{m} {}, {y}", day.trim_start_matches('0')),
         ([y, _], Some(m)) => format!("{m} {y}"),
         _ => d.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod selection_state_tests {
+    use super::*;
+    use lightcraft_catalog::PhotoId;
+
+    #[test]
+    fn select_all_marks_the_others_selected_and_one_active() {
+        let ids: Vec<PhotoId> = (1..=3).map(PhotoId).collect();
+        let s = Selection { ids: ids.clone(), active: Some(ids[0]) };
+        assert_eq!(s.state_of(ids[0]), SelectionState::Active);
+        assert_eq!(s.state_of(ids[1]), SelectionState::Selected);
+        assert_eq!(s.state_of(PhotoId(9)), SelectionState::NotSelected);
     }
 }

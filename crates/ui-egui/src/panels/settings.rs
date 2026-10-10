@@ -1,4 +1,4 @@
-//! The Settings dialog (⌘,): General, Import, Performance, Interface.
+//! The Settings dialog (⌘,): General, Import, Performance, Interface, Faces, AI Denoise.
 //!
 //! Changes apply immediately (no OK/Cancel). Where they are stored:
 //! - **app settings** ([`crate::state::AppSettings`]: startup view, delete confirmation, GPU,
@@ -12,12 +12,19 @@ use egui::RichText;
 use serde_json::{Value, json};
 
 use crate::LightcraftApp;
-use crate::state::{GridBadges, PREVIEW_EDGES, StartupView};
+use crate::state::{GridBadges, PREVIEW_LIMITS, StartupView};
 use crate::theme::Tokens;
 use crate::widgets::register;
 
 /// (id, label) of the tabs, in order.
-pub const TABS: &[(&str, &str)] = &[("general", "General"), ("import", "Import"), ("performance", "Performance"), ("interface", "Interface")];
+pub const TABS: &[(&str, &str)] = &[
+    ("general", "General"),
+    ("import", "Import"),
+    ("performance", "Performance"),
+    ("interface", "Interface"),
+    ("faces", "Faces"),
+    ("denoise", "AI Denoise"),
+];
 
 /// Thumbnail cache sizes offered (MB).
 const CACHE_SIZES: [u32; 5] = [512, 1024, 2048, 4096, 8192];
@@ -43,11 +50,13 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, tab: &mut String) {
         "import" => import_tab(app, ui, &t),
         "performance" => performance_tab(app, ui, &t),
         "interface" => interface_tab(app, ui, &t),
+        "faces" => super::faces::settings_tab(app, ui, &t),
+        "denoise" => super::denoise::settings_tab(app, ui, &t),
         _ => general_tab(app, ui, &t),
     }
 }
 
-fn heading(ui: &mut egui::Ui, t: &Tokens, text: &str) {
+pub(super) fn heading(ui: &mut egui::Ui, t: &Tokens, text: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(crate::i18n::tr(text)).font(t.semibold(12.5)).color(t.text));
 }
@@ -63,19 +72,19 @@ fn row<R>(ui: &mut egui::Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut egui
     .inner
 }
 
-fn hint(ui: &mut egui::Ui, t: &Tokens, text: &str) {
+pub(super) fn hint(ui: &mut egui::Ui, t: &Tokens, text: &str) {
     ui.label(RichText::new(crate::i18n::tr(text)).size(11.0).color(t.text_dim));
 }
 
 /// A checkbox addressable as `check:{id}`; true when toggled.
-fn check(ui: &mut egui::Ui, id: &str, value: &mut bool, label: &str) -> bool {
+pub(super) fn check(ui: &mut egui::Ui, id: &str, value: &mut bool, label: &str) -> bool {
     let r = ui.checkbox(value, crate::i18n::tr(label));
     register(ui.ctx(), format!("check:{id}"), r.rect);
     r.changed()
 }
 
 /// Mutually exclusive buttons (`button:{id}-{index}`).
-fn choices<V: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, options: &[(V, &str)], value: &mut V) -> bool {
+pub(super) fn choices<V: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, options: &[(V, &str)], value: &mut V) -> bool {
     let mut changed = false;
     ui.spacing_mut().item_spacing.x = 4.0;
     for (i, (v, l)) in options.iter().enumerate() {
@@ -145,20 +154,27 @@ fn general_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
 
 /// A preset picker: `None` = `none_label`. Returns the new choice when it changed.
 fn preset_combo(app: &LightcraftApp, ui: &mut egui::Ui, id: &str, current: Option<&str>, none_label: &str) -> Option<Option<String>> {
-    let name = |pid: &str| app.session.presets.iter().find(|p| p.id == pid).map(|p| p.name.clone()).unwrap_or_else(|| format!("{pid} (missing)"));
-    let text = current.map(name).unwrap_or_else(|| none_label.to_string());
+    let name = |pid: &str| {
+        app.session
+            .presets
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|p| crate::i18n::builtin_label(&p.name, p.builtin).to_string())
+            .unwrap_or_else(|| crate::i18n::tr_format!("{pid} (missing)", pid = pid))
+    };
+    let text = current.map(name).unwrap_or_else(|| crate::i18n::tr(none_label).to_string());
     let mut out = None;
     let r = egui::ComboBox::from_id_salt(id).width(240.0).selected_text(text).show_ui(ui, |ui| {
-        if ui.selectable_label(current.is_none(), none_label).clicked() {
+        if ui.selectable_label(current.is_none(), crate::i18n::tr(none_label)).clicked() {
             out = Some(None);
         }
         let mut group = "";
         for p in &app.session.presets {
             if p.group != group {
                 group = &p.group;
-                ui.label(RichText::new(group).size(10.5).weak());
+                ui.label(RichText::new(crate::i18n::builtin_label(group, p.builtin)).size(10.5).weak());
             }
-            if ui.selectable_label(current == Some(p.id.as_str()), &p.name).clicked() {
+            if ui.selectable_label(current == Some(p.id.as_str()), crate::i18n::builtin_label(&p.name, p.builtin)).clicked() {
                 out = Some(Some(p.id.clone()));
             }
         }
@@ -214,9 +230,15 @@ fn import_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
                     };
                     let mut pick = None;
                     let label = match current {
-                        Some(RAW_DEFAULT) => "Same as raw default".to_string(),
-                        None => "LightCraft Default".to_string(),
-                        Some(pid) => app.session.presets.iter().find(|p| p.id == pid).map(|p| p.name.clone()).unwrap_or_else(|| pid.to_string()),
+                        Some(RAW_DEFAULT) => crate::i18n::tr("Same as raw default").to_string(),
+                        None => crate::i18n::tr("LightCraft Default").to_string(),
+                        Some(pid) => app
+                            .session
+                            .presets
+                            .iter()
+                            .find(|p| p.id == pid)
+                            .map(|p| crate::i18n::builtin_label(&p.name, p.builtin).to_string())
+                            .unwrap_or_else(|| pid.to_string()),
                     };
                     let id = format!("settingsCamera-{i}");
                     let r = egui::ComboBox::from_id_salt(&id).width(240.0).selected_text(label).show_ui(ui, |ui| {
@@ -227,7 +249,7 @@ fn import_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
                             pick = Some(json!({"camera": cam, "preset": null}));
                         }
                         for p in &app.session.presets {
-                            if ui.selectable_label(current == Some(p.id.as_str()), &p.name).clicked() {
+                            if ui.selectable_label(current == Some(p.id.as_str()), crate::i18n::builtin_label(&p.name, p.builtin)).clicked() {
                                 pick = Some(json!({"camera": cam, "preset": p.id}));
                             }
                         }
@@ -272,7 +294,7 @@ fn import_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
             let mut pick = None;
             let r = egui::ComboBox::from_id_salt("settingsMetaPreset")
                 .width(240.0)
-                .selected_text(cur.clone().unwrap_or_else(|| "None".into()))
+                .selected_text(cur.clone().unwrap_or_else(|| crate::i18n::tr("None").into()))
                 .show_ui(ui, |ui| {
                     if ui.selectable_label(cur.is_none(), crate::i18n::tr("None")).clicked() {
                         pick = Some(String::new());
@@ -306,7 +328,7 @@ fn import_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
         heading(ui, t, crate::i18n::tr("Auto Import"));
         hint(ui, t, crate::i18n::tr("Photos that arrive in this folder (tethering, a scanner, a sync app) are added as soon as they're complete."));
         row(ui, t, crate::i18n::tr("Watched folder"), |ui| {
-            ui.label(RichText::new(d.auto_folder.clone().unwrap_or_else(|| "Off".into())).color(t.text));
+            ui.label(RichText::new(d.auto_folder.clone().unwrap_or_else(|| crate::i18n::tr("Off").into())).color(t.text));
             let can = app.services.pick_folder.is_some();
             let r = ui.add_enabled(can, egui::Button::new(crate::i18n::tr("Choose…")));
             register(ui.ctx(), "button:settingsAutoFolder", r.rect);
@@ -359,11 +381,18 @@ fn performance_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
     };
     hint(ui, t, &status);
     row(ui, t, crate::i18n::tr("Preview size"), |ui| {
-        let opts: Vec<(u32, String)> = PREVIEW_EDGES.iter().map(|e| (*e, format!("{e} px"))).collect();
+        let opts: Vec<(u32, String)> =
+            PREVIEW_LIMITS.iter().map(|e| (*e, if *e == 0 { crate::i18n::tr("Automatic").to_string() } else { format!("{e} px") })).collect();
         let opts: Vec<(u32, &str)> = opts.iter().map(|(e, l)| (*e, l.as_str())).collect();
-        choices(ui, "settingsPreview", &opts, &mut app.ui.settings.preview_edge);
+        choices(ui, "settingsPreview", &opts, &mut app.ui.settings.preview_limit);
     });
-    hint(ui, t, crate::i18n::tr("Largest long edge the Detail view renders at; larger is sharper on big displays but slower."));
+    hint(
+        ui,
+        t,
+        crate::i18n::tr(
+            "Automatic renders the Detail view at the size it is shown, up to the photo's own pixels. Choose a size to cap it: smaller is faster.",
+        ),
+    );
     row(ui, t, crate::i18n::tr("Memory for caches"), |ui| {
         let auto = crate::i18n::tr_format!("Automatic ({} MB)", lightcraft_engine::memory::default_budget() >> 20);
         let opts = [(0u32, auto.as_str()), (512, "512 MB"), (1024, "1 GB"), (2048, "2 GB"), (4096, "4 GB")];
@@ -530,18 +559,26 @@ fn interface_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
 /// `app.openLibrary {path?}`: close the current library and open (or create) the one at `path`,
 /// or a folder chosen in a dialog. Remembered as the library to open at launch.
 pub fn open_library(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
+    if crate::lightroom_import::is_running(app) {
+        return Err("wait for Lightroom catalog import to finish before switching libraries".into());
+    }
     let path = match p.get("path").and_then(Value::as_str) {
         Some(x) => x.to_string(),
-        None => match app.services.pick_folder.as_mut() {
-            Some(pick) => match pick() {
-                Some(x) => x,
-                None => return Ok(Value::Null),
-            },
-            None => return Err("no folder dialog on this platform".into()),
-        },
+        None => {
+            let req = crate::pick::PickRequest::folder(crate::i18n::tr("Open Library"));
+            match crate::pick::ask(app, "app.openLibrary", p, "path", req, |s| s.pick_folder.as_mut().and_then(|f| f()).map(|x| vec![x])) {
+                crate::pick::Picked::Now(v) => match v.into_iter().next() {
+                    Some(x) => x,
+                    None => return Ok(Value::Null),
+                },
+                crate::pick::Picked::Later => return Ok(Value::Null),
+                crate::pick::Picked::Unavailable => return Err("no folder dialog on this platform".into()),
+            }
+        }
     };
     app.session.close_library().map_err(|e| e.to_string())?;
     app.session.open_library(&path, false).map_err(|e| e.to_string())?;
+    app.lightroom_last = None;
     app.renderer.forget_all();
     app.ui.compare = None;
     app.ui.settings.library_path = path.clone();

@@ -159,9 +159,17 @@ fn photo_tile(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, slot: Slo
         photo.embedded_lens.as_ref(),
     );
     let aspect = frame.aspect() as f32;
-    let native = [photo.width.max(1) as usize, photo.height.max(1) as usize];
-    let img = super::detail::fit_rect(img_area, aspect, zoom, native, ppp, app.ui.pan);
-    let want = (img.width().max(img.height()).min(img_area.width().max(img_area.height()) * 4.0) * ppp).min(2560.0) as usize;
+    let native = super::detail::output_px(&frame);
+    let mut img = super::detail::fit_rect(img_area, aspect, zoom, native, ppp, app.ui.pan);
+    if matches!(app.ui.view, ViewMode::Compare | ViewMode::Reference) {
+        if super::detail::navigate_gesture(app, ui, &resp, img_area, img, native) {
+            img = super::detail::fit_rect(img_area, aspect, app.ui.zoom, native, ppp, app.ui.pan);
+        } else if resp.dragged() {
+            super::detail::pan_image(app, img_area, img, resp.drag_delta());
+        }
+    }
+    let want = (img.width().max(img.height()).min(img_area.width().max(img_area.height()) * 4.0) * ppp)
+        .min(2560.0_f32.min(super::detail::texture_side(ui.ctx()) as f32)) as usize;
     let (rw, rh) = if aspect >= 1.0 { (want, (want as f32 / aspect) as usize) } else { ((want as f32 * aspect) as usize, want) };
     if let Some(job) = app.session.render_job(id, rw.max(8), rh.max(8), false, true) {
         app.renderer.request(slot, job, 60);
@@ -171,23 +179,28 @@ fn photo_tile(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, slot: Slo
     }
     let p = ui.painter_at(img_area);
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    let mut display = img;
     if let Some(tex) = app.renderer.textures.get(&slot).filter(|x| x.photo == id) {
-        p.image(tex.tex.id(), img, uv, Color32::WHITE);
+        let texture_aspect = tex.size[0].max(1) as f32 / tex.size[1].max(1) as f32;
+        display = super::detail::fit_rect(img_area, texture_aspect, zoom, native, ppp, app.ui.pan);
+        p.image(tex.tex.id(), display, uv, Color32::WHITE);
     } else if let Some(tex) = app.renderer.textures.get(&Slot::Thumb(id)) {
-        p.image(tex.tex.id(), img, uv, Color32::WHITE);
+        let texture_aspect = tex.size[0].max(1) as f32 / tex.size[1].max(1) as f32;
+        display = super::detail::fit_rect(img_area, texture_aspect, zoom, native, ppp, app.ui.pan);
+        p.image(tex.tex.id(), display, uv, Color32::WHITE);
     } else {
         p.rect_filled(img.intersect(img_area), 0.0, Color32::from_gray(38));
     }
     if photo.flag == Flag::Reject {
-        p.rect_filled(img, 0.0, Color32::from_black_alpha(110));
+        p.rect_filled(display, 0.0, Color32::from_black_alpha(110));
     }
     let active = app.session.selection.active == Some(id);
     if active {
-        p.rect_stroke(img.intersect(img_area.shrink(1.0)), 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+        p.rect_stroke(display.intersect(img_area.shrink(1.0)), 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
     }
     // caption: label · file name · stars · flag
     // caption right under the image (at the bottom when zoomed in)
-    let cap_top = (img.bottom() + 2.0).min(img_area.bottom());
+    let cap_top = (display.bottom() + 2.0).min(img_area.bottom());
     let cap = Rect::from_min_max(pos2(img.left().max(area.left()), cap_top), pos2(area.right(), cap_top + caption_h));
     let pt = ui.painter();
     let mut x = cap.left() + 4.0;
@@ -217,23 +230,14 @@ fn photo_tile(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, slot: Slo
         Flag::Reject if fr.right() < cap.right() => paint(pt, fr, Icon::FlagReject, t.reject),
         _ => {}
     }
-    register(ui.ctx(), format!("cull:{}", id.0), img);
-    (img, resp)
+    register(ui.ctx(), format!("cull:{}", id.0), display);
+    (display, resp)
 }
 
 fn slot_index(s: Slot) -> u8 {
     match s {
         Slot::Compare(i) => i,
         _ => 255,
-    }
-}
-
-/// Drag-to-pan when zoomed in (shared by both compare panes: zoom and pan are synced).
-fn pan(app: &mut LightcraftApp, resp: &egui::Response, img: Rect) {
-    if app.ui.zoom != Zoom::Fit && resp.dragged() {
-        let d = resp.drag_delta();
-        let (px, py) = app.ui.pan;
-        app.ui.pan = ((px - d.x / img.width().max(1.0)).clamp(0.0, 1.0), (py - d.y / img.height().max(1.0)).clamp(0.0, 1.0));
     }
 }
 
@@ -255,12 +259,11 @@ pub fn show_compare(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         if i == 1 {
             app.image_rect = Some(img);
         }
-        pan(app, &resp, img);
         if resp.clicked() {
             select_pair(app, sel, cand, id);
         }
         if resp.double_clicked() {
-            app.ui.zoom = if app.ui.zoom == Zoom::Fit { Zoom::Percent(100) } else { Zoom::Fit };
+            app.ui.zoom = if app.ui.zoom == Zoom::Fit { Zoom::Percent(100.0) } else { Zoom::Fit };
         }
         resp.context_menu(|ui| {
             if ui.button(crate::i18n::tr("Swap")).clicked() {
@@ -356,9 +359,8 @@ pub fn show_reference(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let left = Rect::from_min_size(area.min, vec2(half, area.height()));
     let right = Rect::from_min_size(pos2(area.right() - half, area.top()), vec2(half, area.height()));
     let (_, lresp) = photo_tile(app, ui, r, Slot::Compare(0), left, "Reference", zoom);
-    let (img, resp) = photo_tile(app, ui, active, Slot::Compare(1), right, "Active", zoom);
+    let (img, _) = photo_tile(app, ui, active, Slot::Compare(1), right, "Active", zoom);
     app.image_rect = Some(img);
-    pan(app, &resp, img);
     lresp.context_menu(|ui| {
         if ui.button(crate::i18n::tr("Clear Reference")).clicked() {
             app.ui.reference = None;

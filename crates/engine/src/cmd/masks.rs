@@ -432,6 +432,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     "available": crate::segment::Segmenter::AVAILABLE,
                     "installed": g.installed(),
                     "dir": g.dir.as_ref().map(|d| d.display().to_string()),
+                    "remote": g.remote_endpoint(),
                     "loaded": g.loaded(),
                     "busy": g.busy(),
                     "analyzing": g.analyzing(),

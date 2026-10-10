@@ -130,10 +130,24 @@ struct Prepared<'a> {
 }
 
 const BAND: usize = 32;
+/// Limits for CPU screenshots, shared with headless input validation.
+pub const MAX_IMAGE_EDGE: usize = 16_384;
+pub const MAX_IMAGE_PIXELS: usize = 64_000_000;
+
+fn image_len(size: [usize; 2]) -> Option<usize> {
+    let [w, h] = size;
+    if w == 0 || h == 0 || w > MAX_IMAGE_EDGE || h > MAX_IMAGE_EDGE {
+        return None;
+    }
+    w.checked_mul(h).filter(|n| *n <= MAX_IMAGE_PIXELS)
+}
 
 /// Rasterize `primitives` into a `size` (pixels) image cleared to `clear`. The result is opaque if
 /// `clear` is.
 pub fn paint(primitives: &[ClippedPrimitive], textures: &dyn TextureSource, size: [usize; 2], pixels_per_point: f32, clear: Color32) -> ColorImage {
+    let Some(len) = image_len(size).filter(|_| pixels_per_point.is_finite() && pixels_per_point > 0.0) else {
+        return ColorImage::new([0, 0], Vec::new());
+    };
     let [w, h] = size;
     let ppp = pixels_per_point as f64;
     let prepared: Vec<Prepared<'_>> = primitives
@@ -167,7 +181,7 @@ pub fn paint(primitives: &[ClippedPrimitive], textures: &dyn TextureSource, size
         })
         .collect();
 
-    let mut pixels = vec![clear; w * h];
+    let mut pixels = vec![clear; len];
     let bands: Vec<(usize, &mut [Color32])> = pixels.chunks_mut((BAND * w).max(1)).enumerate().map(|(i, c)| (i * BAND, c)).collect();
     let threads = thread_count().min(bands.len()).max(1);
     if threads <= 1 {
@@ -467,5 +481,22 @@ mod tests {
         assert_eq!(t.image.pixels[2 * 4 + 1], Color32::WHITE);
         assert_eq!(t.image.pixels[2 * 4 + 2], Color32::WHITE);
         assert_eq!(t.image.pixels[2 * 4 + 3], Color32::BLACK);
+    }
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_dimensions_allocate_no_pixels() {
+        for size in [[usize::MAX, 2], [9000, 9000], [MAX_IMAGE_EDGE + 1, 1], [0, 1]] {
+            let image = paint(&[], &TextureStore::default(), size, 1.0, Color32::BLACK);
+            assert_eq!(image.size, [0, 0]);
+            assert!(image.pixels.is_empty());
+        }
+        let image = paint(&[], &TextureStore::default(), [2, 3], 1.0, Color32::BLACK);
+        assert_eq!(image.size, [2, 3]);
+        assert_eq!(image.pixels.len(), 6);
     }
 }

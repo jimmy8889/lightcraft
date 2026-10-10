@@ -88,6 +88,17 @@ impl PreviewCache {
         self.mem.lock().unwrap_or_else(|e| e.into_inner()).insert(key, img, c);
     }
 
+    /// Keep exact camera-preview pixels in the bounded memory LRU without writing a lossy disk copy.
+    /// An in-flight job captured before clear/retire cannot repopulate the cache.
+    pub fn put_memory_at(&self, generation: u64, key: Hash128, img: Arc<Rgba8>) {
+        let current = self.generation.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != Some(generation) {
+            return;
+        }
+        let c = cost(&img);
+        self.mem.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, img, c);
+    }
+
     /// Like [`Self::put`], but the disk write (a JPEG encode) happens on a background thread, so
     /// the caller (a render about to hand its result to the screen) isn't held up.
     pub fn put_deferred(self: &Arc<Self>, key: Hash128, img: Arc<Rgba8>) {

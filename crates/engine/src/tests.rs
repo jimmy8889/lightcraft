@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::{Session, command_specs};
+use crate::{Selection, Session, command_specs};
 
 fn demo() -> Session {
     Session::with_demo()
@@ -14,24 +14,27 @@ fn active_dev(s: &Session) -> lightcraft_develop::DevelopSettings {
 fn changing_one_wb_control_resolves_as_shot_without_stale_tint() {
     use lightcraft_catalog::{Photo, PhotoId, Source};
     use lightcraft_develop::{DevelopSettings, WbMode};
-    let mut s = demo();
-    let id = PhotoId(100);
-    let mut p = Photo::new(id, Source::File { path: "synthetic.arw".into() }, "synthetic.arw", "ARW", 16, 16, "");
-    // A catalog made by the old generic-matrix Kelvin inference.
-    p.as_shot_wb = Some((6829.0, -127.0));
-    p.develop = std::sync::Arc::new(DevelopSettings::for_raw(6829.0, -127.0));
-    s.catalog.apply(lightcraft_catalog::Op::AddPhoto { photo: Box::new(p) }).unwrap();
-    s.execute("library.select", &json!({"ids": [100], "active": 100})).unwrap();
-    s.execute("develop.set", &json!({"control": "wb.temp", "value": 8000})).unwrap();
-    let d = active_dev(&s);
-    assert_eq!(d.wb.mode, WbMode::Custom);
-    assert_eq!(d.wb.temp, 8000.0);
-    assert_eq!(d.wb.tint, 0.0, "untouched tint comes from the current as-shot reference");
-    s.execute("develop.wb", &json!({"mode": "asShot"})).unwrap();
-    s.execute("develop.set", &json!({"control": "wb.tint", "value": 10})).unwrap();
-    assert_eq!(active_dev(&s).wb.temp, 6500.0);
-    s.execute("develop.reset", &json!({})).unwrap();
-    assert_eq!((active_dev(&s).wb.temp, active_dev(&s).wb.tint), (6500.0, 0.0));
+    for format in ["ARW", "NEF", "NRW", "RAF", "CR2", "PEF"] {
+        let mut s = demo();
+        let id = PhotoId(100);
+        let name = format!("synthetic.{format}");
+        let mut p = Photo::new(id, Source::File { path: name.clone() }, &name, format, 16, 16, "");
+        // A catalog made by the old generic-matrix Kelvin inference.
+        p.as_shot_wb = Some((6829.0, -127.0));
+        p.develop = std::sync::Arc::new(DevelopSettings::for_raw(6829.0, -127.0));
+        s.catalog.apply(lightcraft_catalog::Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        s.execute("library.select", &json!({"ids": [100], "active": 100})).unwrap();
+        s.execute("develop.set", &json!({"control": "wb.temp", "value": 8000})).unwrap();
+        let d = active_dev(&s);
+        assert_eq!(d.wb.mode, WbMode::Custom);
+        assert_eq!(d.wb.temp, 8000.0);
+        assert_eq!(d.wb.tint, 0.0, "{format}: untouched tint comes from the current as-shot reference");
+        s.execute("develop.wb", &json!({"mode": "asShot"})).unwrap();
+        s.execute("develop.set", &json!({"control": "wb.tint", "value": 10})).unwrap();
+        assert_eq!(active_dev(&s).wb.temp, 6500.0, "{format}");
+        s.execute("develop.reset", &json!({})).unwrap();
+        assert_eq!((active_dev(&s).wb.temp, active_dev(&s).wb.tint), (6500.0, 0.0), "{format}");
+    }
 }
 
 #[test]
@@ -115,6 +118,29 @@ fn albums_crud() {
     s.execute("album.delete", &json!({"id": f})).unwrap();
 }
 
+/// Given an album and a folder, when something is created inside each, then only the folder
+/// accepts it: the sidebar only lists children of folders, so a child of a plain album would
+/// be invisible.
+#[test]
+fn albums_and_smart_albums_are_created_only_inside_folders() {
+    let mut s = demo();
+    let folder = s.execute("album.create", &json!({"name": "Trips", "folder": true})).unwrap()["id"].as_u64().unwrap();
+    let album = s.execute("album.create", &json!({"name": "Best", "parent": folder})).unwrap()["id"].as_u64().unwrap();
+    for (cmd, params) in [
+        ("album.create", json!({"name": "Nested", "parent": album})),
+        ("album.create", json!({"name": "Nested", "folder": true, "parent": album})),
+        ("album.createSmart", json!({"name": "Nested", "parent": album})),
+        ("album.create", json!({"name": "Nested", "parent": 987_654})),
+    ] {
+        assert!(s.execute(cmd, &params).is_err(), "{cmd} {params} must be refused");
+    }
+    let n = s.catalog.albums().count();
+    let sub = s.execute("album.create", &json!({"name": "Sub", "folder": true, "parent": folder})).unwrap()["id"].as_u64().unwrap();
+    let smart = s.execute("album.createSmart", &json!({"name": "Rated", "parent": sub})).unwrap()["id"].as_u64().unwrap();
+    assert_eq!(s.catalog.albums().count(), n + 2);
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(smart)).unwrap().parent, Some(lightcraft_catalog::AlbumId(sub)));
+}
+
 #[test]
 fn filters_and_delete_restore() {
     let mut s = demo();
@@ -129,6 +155,47 @@ fn filters_and_delete_restore() {
     s.execute("photo.restore", &json!({})).unwrap();
     s.execute("library.source", &json!({"kind": "all"})).unwrap();
     assert_eq!(s.visible().len(), 24);
+}
+
+#[test]
+fn deleting_photos_selects_a_neighbour_in_the_current_view() {
+    for params in [json!({}), json!({"key": "fileName", "ascending": false}), json!({"key": "random", "seed": 123})] {
+        for at_end in [false, true] {
+            let mut s = demo();
+            s.execute("library.sort", &params).unwrap();
+            s.execute("library.filter", &json!({"rating": 2})).unwrap();
+            let visible = s.visible_cloned();
+            assert!(visible.len() > 5);
+            let at = if at_end { visible.len() - 2 } else { visible.len() / 2 };
+            let deleted = &visible[at..at + 2];
+            s.execute("library.select", &json!({"ids": deleted, "active": deleted[0]})).unwrap();
+            s.execute("photo.delete", &json!({})).unwrap();
+            let expected = if at_end { visible[at - 1] } else { visible[at + 2] };
+            assert_eq!(s.selection, Selection::single(expected), "sort {params}, end {at_end}");
+            assert!(deleted.iter().all(|id| s.catalog.photo(*id).unwrap().deleted));
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert!(deleted.iter().all(|id| !s.catalog.photo(*id).unwrap().deleted));
+            s.execute("edit.redo", &json!({})).unwrap();
+            assert!(deleted.iter().all(|id| s.catalog.photo(*id).unwrap().deleted));
+        }
+    }
+    let mut s = demo();
+    s.execute("library.selectAll", &json!({})).unwrap();
+    s.execute("photo.delete", &json!({})).unwrap();
+    assert!(s.visible().is_empty());
+    assert_eq!(s.selection, Selection::default());
+}
+
+#[test]
+fn deleting_explicit_targets_keeps_the_surviving_selection() {
+    let mut s = demo();
+    let visible = s.visible_cloned();
+    s.execute("library.select", &json!({"ids": [visible[8], visible[9]], "active": visible[9]})).unwrap();
+    let before = s.selection.clone();
+    s.execute("photo.delete", &json!({"ids": [visible[3]]})).unwrap();
+    assert_eq!(s.selection, before, "deleting an unselected photo doesn't change selection");
+    s.execute("photo.delete", &json!({"ids": [visible[9]]})).unwrap();
+    assert_eq!(s.selection, Selection::single(visible[8]), "partial deletion retains a selected survivor");
 }
 
 #[test]
@@ -380,6 +447,61 @@ fn crop_aspect_lock_current_and_toggle() {
     assert!((aw as f64 / ah as f64 - want).abs() < 0.01, "{aw}:{ah} vs {want}");
     s.execute("crop.aspect", &json!({"aspect": "toggle"})).unwrap();
     assert!(active_dev(&s).crop.aspect.is_none(), "toggle unlocks");
+}
+
+// Feature: dragging crop handles (issue 295)
+#[test]
+fn crop_drag_stops_at_the_image_edge_and_keeps_the_anchor() {
+    let mut s = demo();
+    s.execute("crop.set", &json!({"rect": [0.2, 0.2, 0.8, 0.8]})).unwrap();
+    s.execute("crop.drag", &json!({"handle": "bottomRight", "from": [0.8, 0.8], "to": [1.4, 0.7]})).unwrap();
+    let r = active_dev(&s).crop.geometry.rect;
+    assert!((r.x0 - 0.2).abs() < 1e-6 && (r.y0 - 0.2).abs() < 1e-6, "anchor moved: {r:?}");
+    assert!((r.x1 - 1.0).abs() < 1e-6 && (r.y1 - 0.7).abs() < 1e-6, "{r:?}");
+}
+
+#[test]
+fn crop_drag_keeps_a_locked_ratio_on_every_handle() {
+    let mut s = demo();
+    s.execute("crop.aspect", &json!({"aspect": "16x9"})).unwrap();
+    let d = active_dev(&s);
+    assert!(d.crop.aspect.is_some());
+    let want = d.crop.geometry.rect.aspect();
+    let r = d.crop.geometry.rect;
+    for (handle, to) in [("left", [r.x0 + 0.1, 0.5]), ("top", [0.5, r.y0 + 0.05]), ("bottomRight", [1.3, 1.3]), ("right", [0.9, 0.5])] {
+        s.execute("crop.drag", &json!({"handle": handle, "from": [0.5, 0.5], "to": to, "start": [r.x0, r.y0, r.x1, r.y1]})).unwrap();
+        let g = active_dev(&s).crop.geometry.rect;
+        assert!((g.aspect() - want).abs() < 1e-6, "{handle}: {} vs {want}", g.aspect());
+    }
+}
+
+#[test]
+fn crop_drag_rejects_unknown_handles_and_bad_points() {
+    let mut s = demo();
+    assert!(s.execute("crop.drag", &json!({"handle": "sideways", "from": [0.5, 0.5], "to": [0.6, 0.6]})).is_err());
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "from": [0.5], "to": [0.6, 0.6]})).is_err());
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "to": [0.6, 0.6]})).is_err());
+}
+
+#[test]
+fn crop_aspect_rejects_degenerate_custom_ratios() {
+    let mut s = demo();
+    let before = active_dev(&s).crop;
+    for bad in [json!([0.004, 3]), json!([3, 0]), json!([-1, 2]), json!([1000, 0.01]), json!(["a", 2]), json!([1, 2, 3])] {
+        assert!(s.execute("crop.aspect", &json!({"aspect": bad.clone()})).is_err(), "{bad}");
+    }
+    assert!(s.execute("crop.aspect", &json!({"aspect": "0x5"})).is_err());
+    let after = active_dev(&s).crop;
+    assert_eq!(before.geometry, after.geometry, "a rejected ratio leaves the crop alone");
+    s.execute("crop.aspect", &json!({"aspect": [2.5, 1]})).unwrap();
+    assert!(!active_dev(&s).crop.geometry.rect.is_empty());
+}
+
+#[test]
+fn crop_drag_rejects_non_numeric_points() {
+    let mut s = demo();
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "from": ["a", 0.5, 0.5], "to": [0.6, 0.6]})).is_err());
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "from": [0.5, 0.5], "to": [0.6, 0.6], "start": [0.1, "x", 0.5, 0.5]})).is_err());
 }
 
 #[test]
@@ -816,4 +938,80 @@ fn face_job_follows_rotate_right() {
     // the rotated photo is h × w pixels
     let (pw, ph) = ((r.x1 - r.x0) * h, (r.y1 - r.y0) * w);
     assert!((pw - ph).abs() < 1e-6 * w.max(h), "square in rotated pixels: {pw} × {ph}");
+}
+
+/// Selecting an id that is not in the library is an error, and the selection stays as it was
+/// (#182: `select_photos {"ids": [9999]}` answered `selected: 1` and the session lost its photo).
+#[test]
+fn selecting_an_unknown_photo_is_an_error_and_keeps_the_selection() {
+    let mut s = demo();
+    let vis = s.visible_cloned();
+    s.execute("library.select", &json!({"ids": [vis[0].0]})).unwrap();
+    let before = s.selection.clone();
+    for p in [
+        json!({"ids": [9999]}),
+        json!({"ids": [9999], "active": 9999}),
+        json!({"ids": [vis[1].0], "active": 9999}),
+        json!({"ids": [vis[1].0, 9999]}),
+        json!({"ids": [9999], "mode": "add"}),
+        json!({"ids": [9999], "mode": "toggle"}),
+        json!({"ids": [9999], "mode": "range"}),
+    ] {
+        let e = s.execute("library.select", &p).unwrap_err().to_string();
+        assert!(e.contains("no such photo 9999"), "{p}: {e}");
+        assert_eq!(s.selection, before, "{p}");
+    }
+    assert_eq!(s.active(), Some(vis[0]));
+    assert!(s.execute("develop.get", &json!({})).is_ok());
+    // queries about an explicit id check it too
+    for c in ["develop.get", "photo.inspect", "photo.allMetadata", "history.list"] {
+        let e = s.execute(c, &json!({"id": 9999})).unwrap_err().to_string();
+        assert!(e.contains("no such photo 9999"), "{c}: {e}");
+        assert!(s.execute(c, &json!({"id": vis[1].0})).is_ok(), "{c}");
+    }
+    // an empty selection is still allowed
+    assert_eq!(s.execute("library.select", &json!({"ids": []})).unwrap()["selected"], 0);
+}
+
+/// A preset saved by another version may hold keys this one doesn't know: exporting with it keeps
+/// working (the stale keys are dropped), while a typo the caller makes is still refused (#181).
+#[test]
+fn saved_presets_with_unknown_keys_still_export() {
+    use crate::export::{ExportOptions, ExportPreset};
+    let mut s = demo();
+    s.export_presets.push(ExportPreset {
+        name: "Old".into(),
+        params: json!({"format": "png", "retiredOption": 3, "watermark": {"text": "©", "retiredKey": true}}),
+    });
+    let p = s.export_params(&json!({"preset": "old", "quality": 80})).unwrap();
+    let o = ExportOptions::from_params(&p).unwrap();
+    assert_eq!(o.format, crate::export::ExportFormat::Png);
+    assert_eq!(o.watermark.map(|w| w.text), Some("©".to_string()));
+    assert!(ExportOptions::from_params(&s.export_params(&json!({"preset": "old", "qualty": 80})).unwrap()).is_err());
+}
+
+/// Undo and redo bring the photo they change on screen (issue #293): after editing one photo and
+/// moving on, Undo makes it the active photo again; a step that changes several photos leaves the
+/// selection alone.
+#[test]
+fn undo_and_redo_show_the_photo_they_change() {
+    let mut s = demo();
+    let vis = s.visible_cloned();
+    let (a, b) = (vis[0], vis[1]);
+    s.execute("library.select", &json!({"ids": [a.0]})).unwrap();
+    s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.0})).unwrap();
+    s.execute("library.select", &json!({"ids": [b.0]})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.active(), Some(a), "undo shows the photo it changed");
+    assert_eq!(s.selection.ids, vec![a]);
+    s.execute("library.select", &json!({"ids": [b.0]})).unwrap();
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(s.active(), Some(a), "so does redo");
+    // rating both selected photos is one step over two photos: undoing it leaves the selection
+    s.execute("library.select", &json!({"ids": [a.0, b.0], "active": b.0})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 3})).unwrap();
+    s.execute("library.select", &json!({"ids": [a.0, b.0], "active": a.0})).unwrap();
+    let before = s.selection.clone();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.selection, before, "a step over several photos keeps the selection");
 }

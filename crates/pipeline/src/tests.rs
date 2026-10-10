@@ -237,6 +237,35 @@ fn exposure_after_spatial_filters_equals_exposing_the_source() {
     assert!(d <= 2, "max difference {d}");
 }
 
+/// A section whose eye is off renders as if it were at its defaults (issue #316): Light, Color
+/// and Detail, which the pipeline doesn't switch off where it applies them.
+#[test]
+fn sections_switched_off_render_as_defaults() {
+    let src = Rgb32f::from_fn(32, 24, |x, y| [0.05 + x as f32 / 40.0, 0.1 + y as f32 / 30.0, 0.3]);
+    let info = SourceInfo::default();
+    let req = RenderRequest::fit(32, 24);
+    let plain = render(&src, &info, &DevelopSettings::default(), &req).image;
+    let mut s = DevelopSettings::default();
+    s.light.exposure = 1.5;
+    s.light.contrast = 40.0;
+    s.color.saturation = -60.0;
+    s.color.vibrance = 30.0;
+    s.detail.sharpen_amount = 120.0;
+    let edited = render(&src, &info, &s, &req).image;
+    assert_ne!(edited.data, plain.data);
+    for section in ["light", "color", "detail"] {
+        s.set_section_enabled(section, false);
+    }
+    assert_eq!(render(&src, &info, &s, &req).image.data, plain.data, "every edited section off = the unedited photo");
+    // one section back on brings back only its own adjustments
+    s.set_section_enabled("light", true);
+    let mut light_only = DevelopSettings::default();
+    light_only.light.exposure = 1.5;
+    light_only.light.contrast = 40.0;
+    assert_eq!(render(&src, &info, &s, &req).image.data, render(&src, &info, &light_only, &req).image.data);
+    assert!(matches!(DevelopSettings::default().effective(), std::borrow::Cow::Borrowed(_)), "nothing is copied when every section is on");
+}
+
 #[test]
 fn calibration_shifts_colours_but_keeps_greys() {
     let info = SourceInfo { raw: true, ..Default::default() };
@@ -329,4 +358,80 @@ fn soft_proof_maps_into_the_proof_gamut_and_flags_what_does_not_fit() {
             .image;
     assert!(blue(&pro) > 0);
     assert!(red(&pro) < n, "ProPhoto holds more than sRGB");
+}
+
+#[test]
+fn tint_negative_is_green_and_positive_is_magenta() {
+    use lightcraft_develop::WbMode;
+    let src = Rgb32f::filled(16, 16, [0.18; 3]);
+    // Rendered images, uncalibrated RAW and calibrated RAW with a nonzero As Shot tint.
+    for info in [
+        SourceInfo::default(),
+        SourceInfo { raw: true, relative_wb: true, ..Default::default() },
+        SourceInfo { raw: true, as_shot_temp: 4200.0, as_shot_tint: 15.0, ..Default::default() },
+        // camera-space white balance: the same sign through the camera's own colour model
+        SourceInfo { raw: true, as_shot_temp: 4200.0, as_shot_tint: 15.0, camera_color: Some(camera_color(4200.0, 15.0)), ..Default::default() },
+    ] {
+        let mut s = DevelopSettings::default();
+        let neutral = render(&src, &info, &s, &RenderRequest::fit(16, 16)).image.get(8, 8);
+        assert!((neutral[0] as i16 - neutral[1] as i16).abs() <= 1);
+        assert!((neutral[2] as i16 - neutral[1] as i16).abs() <= 1);
+        s.wb.mode = WbMode::Custom;
+        s.wb.temp = info.as_shot_temp;
+        for delta in [-50.0, 50.0] {
+            s.wb.tint = info.as_shot_tint + delta;
+            let p = render(&src, &info, &s, &RenderRequest::fit(16, 16)).image.get(8, 8);
+            let magenta = (p[0] as f64 + p[2] as f64) / 2.0 - p[1] as f64;
+            assert!(magenta * delta > 100.0, "delta {delta} must follow the green/magenta track, got {p:?}");
+        }
+    }
+}
+
+/// A dual-illuminant (A / D65) camera colour model, its pixels developed for `temp` / `tint`.
+fn camera_color(temp: f64, tint: f64) -> std::sync::Arc<crate::CameraColor> {
+    use lightcraft_color::Mat3;
+    let tags = lightcraft_raw::ColorData {
+        illuminant: [17, 21],
+        color_matrix: [
+            Some(Mat3([[0.9, 0.2, -0.15], [-0.3, 1.25, 0.08], [0.02, -0.12, 0.85]])),
+            Some(Mat3([[0.7, 0.3, -0.1], [-0.35, 1.3, 0.1], [0.05, -0.2, 1.0]])),
+        ],
+        ..Default::default()
+    };
+    std::sync::Arc::new(crate::CameraColor { tags, developed_for: lightcraft_color::cct::temp_tint_to_xy(temp, tint) })
+}
+
+/// Camera-space white balance: a raw source with its colour model is re-developed for the chosen
+/// white, so a grey card lit by that white renders neutral. Without the model, or with a relative
+/// white balance, the developed pixels are adapted (Bradford, neutral luminance kept).
+#[test]
+fn custom_white_balance_redevelops_in_camera_space() {
+    use crate::local::wb_matrix_for;
+    use lightcraft_color::cct::temp_tint_to_xy;
+    use lightcraft_develop::WbMode;
+    let cc = camera_color(5500.0, 0.0);
+    let info = SourceInfo { raw: true, as_shot_temp: 5500.0, as_shot_tint: 0.0, camera_color: Some(cc.clone()), ..Default::default() };
+    let mut s = DevelopSettings::default();
+    (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 3200.0, 10.0);
+    // a grey card lit by 3200 K / +10, as the camera records it, developed for the as-shot white
+    let a = lightcraft_raw::color::camera_transform_of(&cc.tags, cc.developed_for);
+    let n = lightcraft_raw::color::camera_neutral(&cc.tags, temp_tint_to_xy(3200.0, 10.0));
+    let card = a.matrix.apply(std::array::from_fn(|i| n[i] * a.wb[i] as f64)).map(|v| v as f32);
+    let apply = |m: [[f32; 3]; 3], c: [f32; 3]| -> [f32; 3] { std::array::from_fn(|r| m[r][0] * c[0] + m[r][1] * c[1] + m[r][2] * c[2]) };
+    let m = wb_matrix_for(&info, &s).unwrap();
+    let out = apply(m, card);
+    assert!(out.iter().all(|v| (v / out[1] - 1.0).abs() < 1e-4), "{card:?} -> {out:?}");
+    // the adaptation path for sources without a colour model, and for relative white balance
+    let luma = |c: [f32; 3]| lightcraft_color::luminance_2020(c);
+    for other in [SourceInfo { camera_color: None, ..info.clone() }, SourceInfo { relative_wb: true, ..info.clone() }] {
+        let b = wb_matrix_for(&other, &s).unwrap();
+        assert_ne!(b, m);
+        assert!((luma(apply(b, [1.0; 3])) - 1.0).abs() < 1e-4);
+    }
+    // the white-balance picker / auto white balance invert the same model: the card names its white
+    let picked = crate::auto::auto_wb(&Rgb32f::filled(4, 4, card), &info);
+    assert_eq!(picked, (3200.0, 10.0));
+    // the as-shot white needs nothing
+    s.wb.mode = WbMode::AsShot;
+    assert!(wb_matrix_for(&info, &s).is_none());
 }

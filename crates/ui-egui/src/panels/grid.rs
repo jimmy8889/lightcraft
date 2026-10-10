@@ -1,5 +1,9 @@
 //! Photo Grid (justified rows) and Square Grid. Virtualized: only visible cells request thumbnails.
 
+#[cfg(test)]
+#[path = "grid_header_tests.rs"]
+mod header_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -137,8 +141,6 @@ fn show_inner(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let (generation, ids) = app.session.visible_shared();
     // header: source title + count
-    let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-    ui.painter().rect_filled(hr, 0.0, t.canvas);
     let sel_n = app.session.selection.ids.len();
     let chips = lightcraft_engine::filter_chips(&app.session.filter, &app.session.catalog);
     let total = app.session.source_total();
@@ -147,12 +149,24 @@ fn show_inner(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     match app.session.browse.clone().filter(|_| app.session.source == lightcraft_engine::LibrarySource::Folder) {
         Some(b) => {
             let local = app.caches.grid.local(&app.session.catalog, &ids, generation);
-            folder_header(app, ui, hr, &b, &ids, local, &cnt)
+            folder_header(app, ui, &b, &ids, local, &cnt);
         }
         None => {
-            let title = crate::i18n::source_label(app.session.source, &app.session.catalog);
-            ui.painter().text(pos2(hr.left() + 20.0, hr.center().y), Align2::LEFT_CENTER, &title, t.semibold(17.0), t.text);
-            ui.painter().text(pos2(hr.right() - 20.0, hr.center().y), Align2::RIGHT_CENTER, cnt, t.font(12.5), t.text_dim);
+            let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+            ui.painter().rect_filled(hr, 0.0, t.canvas);
+            let full = crate::i18n::source_title(&app.session);
+            let count_w = ui.painter().layout_no_wrap(cnt.clone(), t.font(12.5), t.text_dim).size().x;
+            // the title gives way to the count: a long album or folder name is trimmed, in full on hover
+            let room = (hr.width() - 20.0 - count_w - 36.0).max(0.0);
+            let font = t.semibold(17.0);
+            let title = crate::widgets::elide_head(&full, room, |s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), t.text).size().x);
+            let title_rect = ui.painter().text(pos2(hr.left() + 20.0, hr.center().y), Align2::LEFT_CENTER, &title, font, t.text);
+            let count_rect = ui.painter().text(pos2(hr.right() - 20.0, hr.center().y), Align2::RIGHT_CENTER, cnt, t.font(12.5), t.text_dim);
+            crate::widgets::register(ui.ctx(), "grid:title", title_rect);
+            crate::widgets::register(ui.ctx(), "grid:count", count_rect);
+            if title != full {
+                ui.interact(title_rect, ui.id().with("grid-title"), Sense::hover()).on_hover_text(full);
+            }
         }
     }
     super::chips::show(app, ui, &chips);
@@ -164,11 +178,7 @@ fn show_inner(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         if !chips.is_empty() {
             let body = match total {
                 Some(n) if n > 0 => {
-                    crate::i18n::tr_format!(
-                        "{n} photos in {} are hidden by the filters above",
-                        crate::i18n::source_label(app.session.source, &app.session.catalog),
-                        n = n
-                    )
+                    crate::i18n::tr_format!("{n} photos in {} are hidden by the filters above", crate::i18n::source_title(&app.session), n = n)
                 }
                 _ => "Remove a filter above, or choose Clear all".to_string(),
             };
@@ -477,25 +487,27 @@ fn cell(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, r: Rect, square
     let Some(photo) = app.session.catalog.photo(id).cloned() else { return };
     let resp = ui.interact(r, egui::Id::new(("cell", id.0)), Sense::click_and_drag());
     register(ui.ctx(), format!("thumb:{}", id.0), r);
-    let selected = app.session.selection.contains(id);
+    let state = app.session.selection.state_of(id);
+    let selected = state != lightcraft_engine::SelectionState::NotSelected;
     // screen readers: the file, then rating / flag / label
     let mut spoken = photo.file_name.clone();
     if photo.rating > 0 {
-        spoken.push_str(&format!(", {} star{}", photo.rating, if photo.rating == 1 { "" } else { "s" }));
+        spoken.push_str(&crate::i18n::tr_format!(", {} star{}", photo.rating, if photo.rating == 1 { "" } else { "s" }));
     }
     match photo.flag {
-        lightcraft_catalog::Flag::Pick => spoken.push_str(", picked"),
-        lightcraft_catalog::Flag::Reject => spoken.push_str(", rejected"),
+        lightcraft_catalog::Flag::Pick => spoken.push_str(crate::i18n::tr(", picked")),
+        lightcraft_catalog::Flag::Reject => spoken.push_str(crate::i18n::tr(", rejected")),
         lightcraft_catalog::Flag::None => {}
     }
     if let Some(l) = photo.label {
-        spoken.push_str(&format!(", {} label", app.session.catalog.label_name(l)));
+        spoken.push_str(&crate::i18n::tr_format!(", {} label", crate::i18n::color_label(&app.session.catalog, l)));
     }
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &spoken));
-    let active = app.session.selection.active == Some(id);
+    let active = state == lightcraft_engine::SelectionState::Active;
     let p = ui.painter();
     let img_rect = if square {
-        p.rect_filled(r, 0.0, if selected { t.cell_selected } else { t.cell });
+        let base = if selected { t.cell_selected } else { t.cell };
+        p.rect_filled(r, 0.0, crate::theme::label_background(base, photo.label, selected));
         Rect::from_min_max(r.min + vec2(10.0, 24.0), r.max - vec2(10.0, 10.0))
     } else {
         r
@@ -505,12 +517,8 @@ fn cell(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, r: Rect, square
     request_thumb(app, id, size, if onscreen { 10 } else { 5 });
     if let Some(tex) = app.renderer.thumb(id) {
         let [tw, th] = tex.size;
-        let fit = if square {
-            let s = (img_rect.width() / tw as f32).min(img_rect.height() / th as f32);
-            Rect::from_center_size(img_rect.center(), vec2(tw as f32 * s, th as f32 * s))
-        } else {
-            img_rect
-        };
+        // Preserve the decoded preview's ratio when it differs from the catalog dimensions.
+        let fit = super::detail::fit_texture_rect(img_rect, [tw, th]);
         p.image(tex.tex.id(), fit, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         if active {
             p.rect_stroke(fit.expand(if square { 2.0 } else { 0.0 }), 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
@@ -520,6 +528,12 @@ fn cell(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, r: Rect, square
     } else {
         let ph = img_rect.shrink(if square { 20.0 } else { 0.0 });
         p.rect_filled(ph, 0.0, Color32::from_gray(38));
+        // not drawn yet (or unreadable): the selection is still visible
+        if active {
+            p.rect_stroke(ph, 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+        } else if selected {
+            p.rect_stroke(ph, 0.0, Stroke::new(2.0, Color32::from_gray(170)), StrokeKind::Outside);
+        }
         if app.renderer.failure(Slot::Thumb(id)).is_some() {
             // unreadable / missing file
             p.text(ph.center(), Align2::CENTER_CENTER, "!", t.semibold(18.0), t.text_dim);
@@ -558,9 +572,15 @@ fn cell(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, r: Rect, square
         crate::state::GridBadges::Always => true,
         crate::state::GridBadges::Never => false,
     };
+    let badge_bar = Rect::from_min_max(pos2(img_rect.left(), img_rect.bottom() - 24.0), img_rect.right_bottom());
+    if !square && photo.label.is_some() {
+        // Justified photos fill the whole cell, so the label shows as a translucent tinted footer
+        // over the photo's bottom edge (opaque, it would hide 24 px of every labelled photo).
+        p.rect_filled(badge_bar, 0.0, crate::theme::label_background(t.cell, photo.label, selected).gamma_multiply(0.7));
+    }
     if show_badges {
-        let bar = Rect::from_min_max(pos2(img_rect.left(), img_rect.bottom() - 24.0), img_rect.right_bottom());
-        if resp.hovered() || selected {
+        let bar = badge_bar;
+        if (resp.hovered() || selected) && (square || photo.label.is_none()) {
             p.rect_filled(bar, 0.0, Color32::from_black_alpha(120));
         }
         let mut x = bar.left() + 6.0;
@@ -655,55 +675,86 @@ fn cell(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, r: Rect, square
 
 /// The header of a Local folder view: the path as a breadcrumb (each part opens that folder),
 /// Include subfolders, Add to My Photos.
-fn folder_header(app: &mut LightcraftApp, ui: &mut egui::Ui, hr: Rect, b: &lightcraft_engine::Browse, ids: &[PhotoId], local_n: usize, cnt: &str) {
+fn folder_header(app: &mut LightcraftApp, ui: &mut egui::Ui, b: &lightcraft_engine::Browse, ids: &[PhotoId], local_n: usize, cnt: &str) -> Rect {
     let t = Tokens::get(ui.ctx());
-    let mut child =
-        ui.new_child(egui::UiBuilder::new().max_rect(hr.shrink2(vec2(16.0, 6.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-    child.spacing_mut().item_spacing.x = 4.0;
-    let parts: Vec<&str> = b.path.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
-    // the last few parts (the root side is elided)
-    let skip = parts.len().saturating_sub(4);
-    if skip > 0 {
-        child.label(egui::RichText::new("…  ›").color(t.text_dim));
-    }
-    for (i, part) in parts.iter().enumerate().skip(skip) {
-        let last = i + 1 == parts.len();
-        let text = egui::RichText::new(*part).size(13.0).color(if last { t.text } else { t.text_label });
-        let r = child.add(egui::Label::new(if last { text.strong() } else { text }).sense(Sense::click()));
-        register(child.ctx(), format!("crumb:{i}"), r.rect);
-        if !last {
-            if r.hovered() {
-                child.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    // The path/count and actions need independent rows. The frame reserves the actual height,
+    // including any wrapped actions, so the grid below never paints under the header.
+    let header = egui::Frame::NONE.fill(t.canvas).inner_margin(egui::Margin::symmetric(16, 6)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let count_w =
+                ui.painter().layout_no_wrap(cnt.to_owned(), t.font(12.5), t.text_dim).size().x.ceil().min((ui.available_width() * 0.45).floor());
+            let path_w = (ui.available_width() - count_w - 8.0).max(0.0).floor();
+            ui.allocate_ui_with_layout(vec2(path_w, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                folder_breadcrumbs(app, ui, &b.path);
+            });
+            let count = ui.add_sized(vec2(count_w, 24.0), egui::Label::new(egui::RichText::new(cnt).size(12.5).color(t.text_dim)).truncate());
+            register(ui.ctx(), "grid:count", count.rect);
+            count.on_hover_text(cnt);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let mut sub = b.subfolders;
+            let c = ui.checkbox(&mut sub, crate::i18n::tr("Include subfolders"));
+            register(ui.ctx(), "check:includeSubfolders", c.rect);
+            if c.changed() {
+                let _ = app.run("library.browse", json!({"path": b.path, "subfolders": sub}));
             }
-            if r.clicked() {
-                let prefix = if b.path.starts_with('/') { format!("/{}", parts[..=i].join("/")) } else { parts[..=i].join("/") };
-                let _ = app.run("library.browse", json!({"path": prefix}));
-            }
-            child.label(egui::RichText::new("›").color(t.text_dim));
-        }
-    }
-    child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(egui::RichText::new(cnt).size(12.5).color(t.text_dim));
-        ui.add_space(10.0);
-        // counted once per view (cached); the ids are only gathered on a click
-        if local_n > 0 {
-            let label = crate::i18n::tr_format!("Add {local_n} to My Photos", local_n = local_n);
-            if crate::widgets::text_button(ui, "addToLibrary", &label, false).clicked() {
-                let local: Vec<u64> = ids.iter().filter(|id| app.session.catalog.photo(**id).is_some_and(|p| p.local)).map(|id| id.0).collect();
-                let n = local.len();
-                match app.run("photo.addToLibrary", json!({"ids": local})) {
-                    Ok(_) => app.toast(ui.ctx(), crate::i18n::tr_format!("Added {n} photo{} to My Photos", if n == 1 { "" } else { "s" }, n = n)),
-                    Err(e) => app.toast(ui.ctx(), e),
+            // Counted once per view (cached); the ids are only gathered on a click.
+            if local_n > 0 {
+                let label = crate::i18n::tr_format!("Add {local_n} to My Photos", local_n = local_n);
+                let button =
+                    ui.add(egui::Button::new(egui::RichText::new(label).font(t.semibold(11.5)).color(t.text)).wrap().min_size(vec2(37.0, 24.0)));
+                register(ui.ctx(), "button:addToLibrary", button.rect);
+                if button.clicked() {
+                    let local: Vec<u64> = ids.iter().filter(|id| app.session.catalog.photo(**id).is_some_and(|p| p.local)).map(|id| id.0).collect();
+                    let n = local.len();
+                    match app.run("photo.addToLibrary", json!({"ids": local})) {
+                        Ok(_) => app.toast(ui.ctx(), crate::i18n::tr_format!("Added {n} photo{} to My Photos", if n == 1 { "" } else { "s" }, n = n)),
+                        Err(e) => app.toast(ui.ctx(), e),
+                    }
                 }
             }
-        }
-        let mut sub = b.subfolders;
-        let c = ui.checkbox(&mut sub, crate::i18n::tr("Include subfolders"));
-        register(ui.ctx(), "check:includeSubfolders", c.rect);
-        if c.changed() {
-            let _ = app.run("library.browse", json!({"path": b.path, "subfolders": sub}));
-        }
+        });
     });
+    register(ui.ctx(), "grid:folderHeader", header.response.rect);
+    header.response.rect
+}
+
+fn folder_breadcrumbs(app: &mut LightcraftApp, ui: &mut egui::Ui, path: &str) {
+    let t = Tokens::get(ui.ctx());
+    ui.spacing_mut().item_spacing.x = 4.0;
+    let parts: Vec<&str> = path.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    // With all sidebars open even four ellipses and their separators can exceed the row.
+    // Prefer the current folder, showing more ancestors as space permits.
+    let visible = ((ui.available_width() / 80.0) as usize).clamp(1, 4);
+    let skip = parts.len().saturating_sub(visible);
+    if skip > 0 {
+        ui.label(egui::RichText::new("…  ›").color(t.text_dim)).on_hover_text(path);
+    }
+    let separator_w = ui.painter().layout_no_wrap("›".into(), t.font(13.0), t.text_dim).size().x + 8.0;
+    for (i, part) in parts.iter().enumerate().skip(skip) {
+        let remaining = parts.len() - i;
+        let last = remaining == 1;
+        // Share the bounded row among the remaining crumbs, leaving room for every separator.
+        let width = ((ui.available_width() - separator_w * (remaining - 1) as f32) / remaining as f32).max(0.0).floor();
+        let text = egui::RichText::new(*part).size(13.0).color(if last { t.text } else { t.text_label });
+        let r = ui.add_sized(vec2(width, 24.0), egui::Label::new(if last { text.strong() } else { text }).truncate().sense(Sense::click()));
+        register(ui.ctx(), format!("crumb:{i}"), r.rect);
+        if !last {
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                let prefix = if path.starts_with('/') { format!("/{}", parts[..=i].join("/")) } else { parts[..=i].join("/") };
+                let _ = app.run("library.browse", json!({"path": prefix}));
+            }
+            ui.label(egui::RichText::new("›").size(13.0).color(t.text_dim));
+        }
+        r.on_hover_text(path);
+    }
 }
 
 /// While photos are dragged: a badge at the pointer; the drag ends when the button is up
@@ -736,7 +787,7 @@ pub use super::filterbar::label_color;
 pub fn label_menu(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let current = app.session.active().and_then(|id| app.session.catalog.photo(id)).and_then(|p| p.label);
     for l in ColorLabel::ALL {
-        let name = app.session.catalog.label_name(l);
+        let name = crate::i18n::color_label(&app.session.catalog, l);
         let resp = ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 5.0, label_color(l));
@@ -798,7 +849,10 @@ pub fn context_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             Ok(r) => {
                 let n = r["photos"].as_array().map_or(0, Vec::len);
                 app.ui.view = crate::state::ViewMode::PhotoGrid;
-                app.toast(ui.ctx(), format!("{n} similar photo{} · View ▸ Clear Filters to see all", if n == 1 { "" } else { "s" }));
+                app.toast(
+                    ui.ctx(),
+                    crate::i18n::tr_format!("{n} similar photo{} · View ▸ Clear Filters to see all", if n == 1 { "" } else { "s" }, n = n),
+                );
             }
             Err(e) => app.toast(ui.ctx(), e),
         }
@@ -910,7 +964,7 @@ pub fn context_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     if missing && ui.button(crate::i18n::tr("Locate Missing File…")).clicked() {
         let _ = app.run("photo.locate", json!({}));
     }
-    if ui.add_enabled(crate::menus::ui_enabled(app, "app.showInFinder"), egui::Button::new(crate::i18n::tr("Show in Finder"))).clicked() {
+    if ui.add_enabled(crate::menus::ui_enabled(app, "app.showInFinder"), egui::Button::new(crate::i18n::tr(crate::menus::reveal_label()))).clicked() {
         let _ = app.run("app.showInFinder", json!({}));
     }
     if ui.button(crate::i18n::tr("Export…")).clicked() {

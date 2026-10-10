@@ -120,10 +120,17 @@ pub fn auto_wb(src: &Rgb32f, info: &SourceInfo) -> (f64, f64) {
         return (info.as_shot_temp, info.as_shot_tint);
     }
     let avg = acc.map(|v| v / wsum);
-    let xyz = REC2020.to_xyz().apply(avg);
-    let shot = lightcraft_color::cct::temp_tint_to_xy(info.as_shot_temp, info.as_shot_tint);
-    let seen = bradford(REC2020.white, shot).apply(xyz);
-    let (t, tint) = xy_to_temp_tint(Xy::from_xyz(seen));
+    // the white that makes `avg` neutral, through the same model the white balance renders with
+    // (`local::wb_matrix_for`): the camera's own colour model, else a Bradford adaptation
+    let camera = info.camera_color.as_deref().filter(|_| info.raw && !info.relative_wb);
+    let seen = match camera.and_then(|cc| lightcraft_raw::color::neutral_white(&cc.tags, cc.developed_for, avg)) {
+        Some(white) => white,
+        None => {
+            let shot = lightcraft_color::cct::temp_tint_to_xy(info.as_shot_temp, info.as_shot_tint);
+            Xy::from_xyz(bradford(REC2020.white, shot).apply(REC2020.to_xyz().apply(avg)))
+        }
+    };
+    let (t, tint) = xy_to_temp_tint(seen);
     (t.clamp(2000.0, 50000.0).round(), tint.clamp(-150.0, 150.0).round())
 }
 
@@ -189,5 +196,30 @@ mod bw_tests {
         // an image without colour leaves the mix alone
         let grey = Rgb32f::from_fn(16, 16, |x, _| [x as f32 / 16.0; 3]);
         assert_eq!(auto_bw_mix(&grey, &SourceInfo::default(), &DevelopSettings::default()), [0.0; 8]);
+    }
+}
+
+#[cfg(test)]
+mod tint_tests {
+    use super::*;
+
+    #[test]
+    fn auto_wb_and_picker_correct_green_with_positive_tint() {
+        // The picker delegates a sampled patch to this same auto_wb implementation.
+        for (rgb, sign) in [([0.18, 0.24, 0.18], 1.0), ([0.24, 0.18, 0.24], -1.0)] {
+            let img = Rgb32f::filled(16, 16, rgb);
+            let info = SourceInfo { raw: true, relative_wb: true, ..Default::default() };
+            let (temp, tint) = auto_wb(&img, &info);
+            assert!(tint * sign > 0.0, "{rgb:?}: temp {temp}, tint {tint}");
+            let mut s = DevelopSettings::default();
+            s.wb.mode = lightcraft_develop::WbMode::Custom;
+            s.wb.temp = temp;
+            s.wb.tint = tint;
+            let mut corrected = img;
+            crate::local::white_balance(&mut corrected, &info, &s);
+            let p = corrected.get(0, 0);
+            let spread = p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+            assert!(spread < 0.003, "{rgb:?} -> {p:?}");
+        }
     }
 }

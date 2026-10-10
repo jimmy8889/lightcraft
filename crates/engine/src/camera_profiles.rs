@@ -1,6 +1,6 @@
 //! Camera colour profiles of our own, pooled from many photos of one camera model.
 //!
-//! A raw file without colour matrices (Sony ARW, Nikon NEF) gets its look fitted to its own embedded camera
+//! A raw file without colour matrices (Sony ARW, Nikon NEF, Fujifilm RAF) gets its look fitted to its own embedded camera
 //! JPEG (`camera_preview`), but one photo shows too little of some colours: a lime shirt covering a
 //! few dozen proxy pixels next to a hillside of foliage at the same hue. `lightcraft-cli calibrate`
 //! pools the colour pairs of many photos per model and fits one matrix and hue/saturation/value
@@ -24,7 +24,11 @@ const MAX_FILE: u64 = 4 << 20;
 
 /// Profiles built into LightCraft (`assets/camera-profiles/`, see `assets/ATTRIBUTION.md`):
 /// `(model, JSON)`.
-pub const BUNDLED: &[(&str, &str)] = &[("ILCE-7M4", include_str!("../../../assets/camera-profiles/ILCE-7M4.json"))];
+pub const BUNDLED: &[(&str, &str)] = &[
+    ("ILCE-7M4", include_str!("../../../assets/camera-profiles/ILCE-7M4.json")),
+    ("X-H2S", include_str!("../../../assets/camera-profiles/X-H2S.json")),
+    ("X-T4", include_str!("../../../assets/camera-profiles/X-T4.json")),
+];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraProfile {
@@ -61,19 +65,8 @@ impl CameraProfile {
     }
 }
 
-/// LightCraft's configuration folder (settings, GPU marker, camera profiles).
-pub fn config_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/LightCraft"))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("LightCraft"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|c| c.join("lightcraft"))
-    }
-}
+/// LightCraft's configuration folder (settings, GPU marker, camera profiles); one helper for the app.
+pub use crate::config::config_dir;
 
 /// Where camera profiles are read from and written to.
 pub fn dir() -> Option<PathBuf> {
@@ -196,10 +189,12 @@ pub struct Pool {
 const PAIRS_PER_FILE: usize = 4000;
 
 impl Pool {
-    /// Add one raw file's colour pairs. `Ok(None)` when the file can't contribute (not an ARW or
-    /// NEF without colour matrices, no usable camera JPEG, too little colour).
+    /// Add one raw file's colour pairs. `Ok(None)` when the file can't contribute (not an ARW,
+    /// NEF or RAF without colour matrices, no usable camera JPEG, too little colour).
     pub fn add(&mut self, bytes: &[u8]) -> Result<Option<String>, String> {
-        let raw = lightcraft_raw::decode(bytes).map_err(|e| e.to_string())?;
+        let mut raw = lightcraft_raw::decode(bytes).map_err(|e| e.to_string())?;
+        // colour only: geometric lens corrections would stop the sensor proxy from binning
+        raw.opcodes.list3.retain(|op| !op.is_lens_correction());
         let Some(model) = raw.metadata.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) else { return Ok(None) };
         let Some(pairs) = crate::camera_preview::profile_pairs(&raw, bytes) else { return Ok(None) };
         let step = pairs.len().div_ceil(PAIRS_PER_FILE).max(1);

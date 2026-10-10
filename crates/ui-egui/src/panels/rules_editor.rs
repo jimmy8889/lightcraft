@@ -34,9 +34,9 @@ fn match_combo(ui: &mut egui::Ui, salt: &str, m: &mut Match) {
         Match::Any => "any",
         Match::None => "none",
     };
-    egui::ComboBox::from_id_salt(format!("{salt}-match")).width(64.0).selected_text(label(*m)).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(format!("{salt}-match")).width(64.0).selected_text(crate::i18n::tr(label(*m))).show_ui(ui, |ui| {
         for x in [Match::All, Match::Any, Match::None] {
-            ui.selectable_value(m, x, label(x));
+            ui.selectable_value(m, x, crate::i18n::tr(label(x)));
         }
     });
 }
@@ -47,7 +47,7 @@ fn text_value(ui: &mut egui::Ui, v: &mut Value, width: f32, hint: &str, salt: &s
         Value::Null => String::new(),
         other => other.to_string(),
     };
-    let r = ui.add(egui::TextEdit::singleline(&mut s).hint_text(hint).desired_width(width));
+    let r = ui.add(egui::TextEdit::singleline(&mut s).hint_text(crate::i18n::tr(hint)).desired_width(width));
     register(ui.ctx(), format!("field:{salt}"), r.rect);
     if r.changed() {
         *v = json!(s);
@@ -83,9 +83,9 @@ fn value_editor(ui: &mut egui::Ui, field: &str, op: &str, v: &mut Value, salt: &
                 v["n"] = json!(n.round());
             }
             let unit = v["unit"].as_str().unwrap_or("days").to_string();
-            egui::ComboBox::from_id_salt(format!("{salt}-unit")).width(70.0).selected_text(&unit).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(format!("{salt}-unit")).width(70.0).selected_text(crate::i18n::tr(&unit)).show_ui(ui, |ui| {
                 for u in ["hours", "days", "weeks", "months", "years"] {
-                    if ui.selectable_label(unit == u, u).clicked() {
+                    if ui.selectable_label(unit == u, crate::i18n::tr(u)).clicked() {
                         v["unit"] = json!(u);
                     }
                 }
@@ -109,9 +109,9 @@ fn value_editor(ui: &mut egui::Ui, field: &str, op: &str, v: &mut Value, salt: &
         (Some(Kind::Number), _) => number_value(ui, v, field),
         (Some(Kind::Choice(c)), _) => {
             let cur = v.as_str().unwrap_or("").to_string();
-            egui::ComboBox::from_id_salt(format!("{salt}-choice")).width(90.0).selected_text(&cur).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(format!("{salt}-choice")).width(90.0).selected_text(crate::i18n::tr(&cur)).show_ui(ui, |ui| {
                 for x in c.iter() {
-                    if ui.selectable_label(cur == *x, *x).clicked() {
+                    if ui.selectable_label(cur == *x, crate::i18n::tr(x)).clicked() {
                         *v = json!(x);
                     }
                 }
@@ -119,10 +119,13 @@ fn value_editor(ui: &mut egui::Ui, field: &str, op: &str, v: &mut Value, salt: &
         }
         (Some(Kind::Bool), _) => {
             let mut b = v.as_bool().unwrap_or(true);
-            egui::ComboBox::from_id_salt(format!("{salt}-bool")).width(60.0).selected_text(if b { "true" } else { "false" }).show_ui(ui, |ui| {
-                ui.selectable_value(&mut b, true, "true");
-                ui.selectable_value(&mut b, false, "false");
-            });
+            egui::ComboBox::from_id_salt(format!("{salt}-bool"))
+                .width(60.0)
+                .selected_text(crate::i18n::tr(if b { "true" } else { "false" }))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut b, true, crate::i18n::tr("true"));
+                    ui.selectable_value(&mut b, false, crate::i18n::tr("false"));
+                });
             *v = json!(b);
         }
         (Some(Kind::Date), _) => text_value(ui, v, 120.0, "2026-04 or 2026-04-12", salt),
@@ -156,22 +159,25 @@ pub fn edit(ui: &mut egui::Ui, rs: &mut RuleSet, salt: &str, depth: usize) {
             Rule::Field { field, op, value } => {
                 ui.horizontal(|ui| {
                     let label = FIELDS.iter().find(|f| f.0 == field.as_str()).map_or(field.as_str(), |f| f.1).to_string();
-                    egui::ComboBox::from_id_salt(format!("{rsalt}-field")).width(150.0).height(400.0).selected_text(label).show_ui(ui, |ui| {
-                        for (id, l, k) in FIELDS {
-                            if ui.selectable_label(field == id, *l).clicked() && field != id {
-                                *field = id.to_string();
-                                if !ops_for(*k).iter().any(|o| o.0 == op.as_str()) {
-                                    *op = ops_for(*k)[0].0.to_string();
+                    egui::ComboBox::from_id_salt(format!("{rsalt}-field")).width(150.0).height(400.0).selected_text(crate::i18n::tr(&label)).show_ui(
+                        ui,
+                        |ui| {
+                            for (id, l, k) in FIELDS {
+                                if ui.selectable_label(field == id, crate::i18n::tr(l)).clicked() && field != id {
+                                    *field = id.to_string();
+                                    if !ops_for(*k).iter().any(|o| o.0 == op.as_str()) {
+                                        *op = ops_for(*k)[0].0.to_string();
+                                    }
+                                    *value = default_value(field, op);
                                 }
-                                *value = default_value(field, op);
                             }
-                        }
-                    });
+                        },
+                    );
                     let kind = field_kind(field).unwrap_or(Kind::Text);
                     let op_label = ops_for(kind).iter().find(|o| o.0 == op.as_str()).map_or(op.as_str(), |o| o.1).to_string();
-                    egui::ComboBox::from_id_salt(format!("{rsalt}-op")).width(110.0).selected_text(op_label).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(format!("{rsalt}-op")).width(110.0).selected_text(crate::i18n::tr(&op_label)).show_ui(ui, |ui| {
                         for (id, l) in ops_for(kind) {
-                            if ui.selectable_label(op == id, *l).clicked() && op != id {
+                            if ui.selectable_label(op == id, crate::i18n::tr(l)).clicked() && op != id {
                                 let was_special = matches!(op.as_str(), "between" | "inLast" | "notInLast" | "isEmpty" | "isNotEmpty");
                                 *op = id.to_string();
                                 if was_special || matches!(*id, "between" | "inLast" | "notInLast" | "isEmpty" | "isNotEmpty") {
@@ -209,12 +215,12 @@ pub fn edit(ui: &mut egui::Ui, rs: &mut RuleSet, salt: &str, depth: usize) {
     }
     if rs.rules.is_empty() || depth == 0 {
         ui.horizontal(|ui| {
-            let add = ui.small_button("+ Rule");
+            let add = ui.small_button(crate::i18n::tr("+ Rule"));
             register(ui.ctx(), format!("button:ruleAddEnd-{salt}"), add.rect);
             if add.clicked() {
                 rs.rules.push(new_rule());
             }
-            if depth < 3 && ui.small_button("+ Group").clicked() {
+            if depth < 3 && ui.small_button(crate::i18n::tr("+ Group")).clicked() {
                 rs.rules.push(Rule::Group { group: RuleSet { mode: Match::Any, rules: vec![new_rule()] } });
             }
         });

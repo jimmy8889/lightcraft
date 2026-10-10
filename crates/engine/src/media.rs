@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 13;
+pub const RENDER_CACHE_VERSION: u64 = 23;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -104,12 +104,63 @@ impl SourceLevel {
     }
 }
 
+/// Pixels along the source's long edge that an output `out_long` pixels long needs: a crop shows
+/// only part of the photo, so its pixels come from a source that many times larger (the source
+/// level is chosen from this, or a tight crop shown at its own pixels would be a stretched preview).
+fn source_edge_needed(p: &Photo, settings: &DevelopSettings, apply_crop: bool, out_long: usize) -> usize {
+    let (w, h) = (f64::from(p.width.max(1)), f64::from(p.height.max(1)));
+    let r = settings.crop.geometry.rect;
+    let shown = if apply_crop { (r.width() * w).max(r.height() * h) } else { w.max(h) };
+    if !shown.is_finite() || shown < 1.0 {
+        return out_long;
+    }
+    let needed = out_long as f64 * w.max(h) / shown;
+    if needed.is_finite() { needed.min(usize::MAX as f64 / 2.0) as usize } else { out_long }
+}
+
 /// Decodes a file into a linear Rec.2020 image no larger than `max_edge` (set by the app).
 pub type FileLoader = Arc<dyn Fn(&str, usize) -> Result<(Rgb32f, SourceInfo), String> + Send + Sync>;
 
 /// A raw file's embedded (camera-rendered) preview as display sRGB, oriented, no larger than
 /// `max_edge` (set by the app). `None`: no usable preview.
 pub type PreviewLoader = Arc<dyn Fn(&str, usize) -> Option<Rgba8> + Send + Sync>;
+
+/// Makes a photo's denoised picture when it is not cached yet (an export does not wait for the background queue):
+/// `Ok(true)` once it is there, `Ok(false)` when denoise does not apply to this photo (render it plain), `Err` when it
+/// should have worked and did not.
+pub type MakeProduct = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
+
+/// A raw photo's cached AI-denoised picture (see [`crate::denoise`]): where the file is and the key it must have been
+/// made with. A file that is missing, damaged or made for something else is a cache miss, never an error.
+#[derive(Clone)]
+pub struct DenoiseSpec {
+    pub product: std::path::PathBuf,
+    pub key: String,
+    /// Run before the picture is read, by a job that must not render without it (an export).
+    pub make: Option<MakeProduct>,
+}
+
+/// Decodes a raw file once and develops it twice: as usual, and from the denoised picture in `spec` when that can be
+/// read (`None` when it cannot). Both are at most `max_edge` long and the same size.
+pub type PairLoader = Arc<dyn Fn(&str, usize, &DenoiseSpec) -> Result<(Rgb32f, Option<Rgb32f>, SourceInfo), String> + Send + Sync>;
+
+/// A photo's denoised picture next to its plain one, and the last mix of the two that was asked for.
+pub struct Twin {
+    pub image: Arc<Rgb32f>,
+    /// The Amount (in thousandths) and the picture mixed for it, so dragging other sliders keeps one source picture.
+    mix: std::sync::Mutex<Option<(u32, Arc<Rgb32f>)>>,
+}
+
+impl Twin {
+    pub fn new(image: Arc<Rgb32f>) -> Twin {
+        Twin { image, mix: std::sync::Mutex::new(None) }
+    }
+
+    /// Bytes reserved for the twin and its lazy mix, before either cache cost can grow.
+    fn bytes(&self) -> usize {
+        self.image.data.len().saturating_mul(24)
+    }
+}
 
 /// Pixels and the source interpretation learned while decoding; they must be cached together.
 #[derive(Clone)]
@@ -121,17 +172,53 @@ pub struct DecodedSource {
     /// A smart preview's stored camera tone curve: the one decoder fact its pixels need that the
     /// catalog's header facts lack (used when `info` is `None`).
     pub camera_tone: Option<lightcraft_pipeline::tone::CameraTone>,
+    /// The same picture developed from the AI-denoised mosaic, when the photo has one cached.
+    pub denoised: Option<Arc<Twin>>,
 }
 
 impl DecodedSource {
     pub fn new(image: Arc<Rgb32f>, info: Option<SourceInfo>) -> Self {
-        DecodedSource { image, info, camera_tone: None, raw_processing_key: 0 }
+        DecodedSource { image, info, camera_tone: None, denoised: None, raw_processing_key: 0 }
+    }
+
+    /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
+    /// the denoised one, or a mix of the two. A mix is made once per amount and kept, so the stages after it are
+    /// reused until the amount changes.
+    pub fn image_for(&self, amount: f32) -> Arc<Rgb32f> {
+        let Some(twin) = &self.denoised else { return self.image.clone() };
+        if amount.is_nan() || amount <= 0.0 || twin.image.width != self.image.width || twin.image.height != self.image.height {
+            return self.image.clone();
+        }
+        if amount >= 1.0 {
+            return twin.image.clone();
+        }
+        let thousandths = (amount * 1000.0).round().clamp(1.0, 999.0) as u32;
+        let mut memo = twin.mix.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((t, img)) = memo.as_ref()
+            && *t == thousandths
+        {
+            return img.clone();
+        }
+        let mut mixed = (*self.image).clone();
+        if !lightcraft_denoise::product::blend(&mut mixed, &twin.image, thousandths as f32 / 1000.0) {
+            return self.image.clone();
+        }
+        let mixed = Arc::new(mixed);
+        *memo = Some((thousandths, mixed.clone()));
+        mixed
+    }
+
+    /// Cache cost: the picture, its segmentation mattes, its denoised twin and room for the lazy mix.
+    pub fn bytes(&self) -> usize {
+        let mattes = self.info.as_ref().and_then(|i| i.mattes.as_ref()).map_or(0, |m| m.bytes());
+        let mattes = mattes + self.info.as_ref().and_then(|i| i.local_tone.as_ref()).map_or(0, |t| t.map.gains.len() * 4);
+        self.image.data.len() * 12 + 64 + std::mem::size_of::<SourceInfo>() + mattes + self.denoised.as_ref().map_or(0, |t| t.bytes())
     }
 
     /// What to render these pixels against: the decoder's facts, else `header` (the catalog's)
     /// with any stored camera tone curve.
     pub fn info_or(&self, header: SourceInfo) -> SourceInfo {
-        match self.info {
+        match self.info.clone() {
             Some(mut actual) => {
                 // Never replace independently decoded facts with stale catalog metadata. A
                 // catalog edit invalidates the measured profile until both identities agree.
@@ -161,6 +248,8 @@ pub enum SourceRef {
         /// The photo's smart preview, used when the original can't be read (offline drive). The
         /// UI thread never checks whether the original is there; the render worker finds out.
         fallback: Option<std::path::PathBuf>,
+        /// The photo has a cached denoised picture: load it with the plain one (see [`PairLoader`]).
+        denoise: Option<(DenoiseSpec, PairLoader)>,
     },
     /// A smart preview standing in for a missing original.
     Smart {
@@ -176,20 +265,52 @@ impl SourceRef {
     pub fn load_source(&self) -> Result<DecodedSource, String> {
         let image = match self {
             SourceRef::Loaded(a) => return Ok((**a).clone()),
-            SourceRef::Demo { scene, max_edge } => Arc::new(scene.render_fit(*max_edge)),
-            SourceRef::File { path, max_edge, loader, fallback, raw_processing_key } => {
-                let r = match loader {
+            SourceRef::Demo { scene, max_edge } => crate::demo::scene_pixels(scene, *max_edge),
+            SourceRef::File { path, max_edge, loader, fallback, denoise, raw_processing_key } => {
+                let plain = || match loader {
                     Some(l) => l(path, *max_edge).map(|(image, info)| {
                         let mut source = DecodedSource::new(Arc::new(image), Some(info));
                         source.raw_processing_key = *raw_processing_key;
                         source
                     }),
+
                     None => Err(format!("no decoder available for {path}")),
+                };
+                // the denoised picture comes with the plain one from a single decode; when it cannot be read the
+                // pair loader gives the plain picture alone (the cached file is never a reason to fail a render)
+                let r = match denoise {
+                    Some((spec, pair)) => {
+                        // a job that needs the denoised picture has it made first; if that fails the job fails (no smart
+                        // preview stands in: an export must not quietly come out without the denoise it was asked for)
+                        let made = match &spec.make {
+                            Some(make) => make()?,
+                            None => true,
+                        };
+                        if made {
+                            pair(path, *max_edge, spec).and_then(|(image, twin, info)| {
+                                if spec.make.is_some() && twin.is_none() {
+                                    return Err("the cached AI Denoise picture could not be read; clear the denoise cache and retry".into());
+                                }
+                                Ok(DecodedSource {
+                                    image: Arc::new(image),
+                                    info: Some(info),
+                                    camera_tone: None,
+                                    raw_processing_key: *raw_processing_key,
+                                    denoised: twin.map(|t| Arc::new(Twin::new(Arc::new(t)))),
+                                })
+                            })
+                        } else {
+                            plain()
+                        }
+                    }
+                    None => plain(),
                 };
                 // An offline original renders from its smart preview (no decoder facts: header ones).
                 return match (r, fallback) {
                     #[cfg(not(target_arch = "wasm32"))]
-                    (Err(e), Some(sp)) if *raw_processing_key == 0 && crate::smart::is_valid(sp) => {
+                    (Err(e), Some(sp))
+                        if *raw_processing_key == 0 && denoise.as_ref().is_none_or(|(spec, _)| spec.make.is_none()) && crate::smart::is_valid(sp) =>
+                    {
                         crate::smart::load(sp).map_err(|e2| format!("{e}; smart preview: {e2}"))
                     }
                     (r, _) => r,
@@ -230,6 +351,54 @@ pub struct MediaCache {
     scenes: Vec<lightcraft_scenes::Scene>,
     /// Rendered thumbnails (memory, plus disk once a library is attached).
     pub rendered: Arc<PreviewCache>,
+    /// Which photos have a cached denoised picture, and how to read it.
+    pub denoise: DenoiseIndex,
+}
+
+/// The photos that have a cached denoised picture for the denoise model in use. Only memory: nothing here touches the
+/// file system, so it can be asked on the UI thread.
+#[derive(Default)]
+pub struct DenoiseIndex {
+    ready: std::collections::HashMap<PhotoId, DenoiseSpec>,
+    /// Reads the pictures (`None`: this build cannot, and nothing is ever ready).
+    pub loader: Option<PairLoader>,
+}
+
+impl DenoiseIndex {
+    /// What to load for `id` besides its plain picture, and how.
+    pub fn get(&self, id: PhotoId) -> Option<(&DenoiseSpec, &PairLoader)> {
+        self.ready.get(&id).zip(self.loader.as_ref())
+    }
+
+    pub fn spec(&self, id: PhotoId) -> Option<&DenoiseSpec> {
+        self.ready.get(&id)
+    }
+
+    pub fn set(&mut self, id: PhotoId, spec: DenoiseSpec) {
+        self.ready.insert(id, spec);
+    }
+
+    pub fn remove(&mut self, id: PhotoId) -> bool {
+        self.ready.remove(&id).is_some()
+    }
+
+    pub fn clear(&mut self) {
+        self.ready.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.ready.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ready.is_empty()
+    }
+
+    pub fn ids(&self) -> Vec<PhotoId> {
+        let mut v: Vec<PhotoId> = self.ready.keys().copied().collect();
+        v.sort();
+        v
+    }
 }
 
 impl Default for MediaCache {
@@ -250,6 +419,7 @@ impl Default for MediaCache {
             availability: Default::default(),
             scenes: Vec::new(),
             rendered: Arc::new(PreviewCache::memory(rendered_budget(budget))),
+            denoise: DenoiseIndex::default(),
         }
     }
 }
@@ -257,10 +427,6 @@ impl Default for MediaCache {
 /// Memory for rendered previews out of the cache share.
 fn rendered_budget(share: usize) -> usize {
     RENDERED_MEM_BYTES.min(share / 4)
-}
-
-fn source_bytes(img: &Rgb32f) -> usize {
-    img.data.len() * 12 + 64 + std::mem::size_of::<SourceInfo>()
 }
 
 impl MediaCache {
@@ -325,8 +491,8 @@ impl MediaCache {
             let Some((tick, which)) = candidates.into_iter().flatten().min() else { break };
             let freed = match which {
                 0 => self.thumbs.pop_oldest(),
-                1 => self.previews.iter().position(|e| e.2 == tick).map(|i| source_bytes(&self.previews.remove(i).1.image)),
-                2 => self.full.take().map(|e| source_bytes(&e.1.image)),
+                1 => self.previews.iter().position(|e| e.2 == tick).map(|i| self.previews.remove(i).1.bytes()),
+                2 => self.full.take().map(|e| e.1.bytes()),
                 _ => self.rendered.evict_oldest(),
             };
             match freed {
@@ -378,7 +544,7 @@ impl MediaCache {
         let tick = lightcraft_preview::next_tick();
         match level {
             SourceLevel::Thumb => {
-                let cost = source_bytes(&img.image);
+                let cost = img.bytes();
                 self.thumbs.insert(id, img, cost);
             }
             SourceLevel::Preview => {
@@ -409,22 +575,76 @@ impl MediaCache {
         (self.thumbs.len(), self.thumbs.cost())
     }
 
+    /// Whether the decoded source of `id` at `level` is held.
+    pub fn has_source(&self, id: PhotoId, level: SourceLevel) -> bool {
+        match level {
+            SourceLevel::Thumb => self.thumbs.contains(&id),
+            SourceLevel::Preview => self.previews.iter().any(|e| e.0 == id),
+            SourceLevel::Full => self.full.as_ref().is_some_and(|e| e.0 == id),
+        }
+    }
+
     /// Decoded sources held: (thumbnail level, preview level, full size).
     pub fn usage(&self) -> (crate::memory::Usage, crate::memory::Usage, crate::memory::Usage) {
         use crate::memory::Usage;
-        let previews = Usage::new(self.previews.len(), self.previews.iter().map(|e| source_bytes(&e.1.image)).sum());
-        let full = self.full.as_ref().map(|e| Usage::new(1, source_bytes(&e.1.image))).unwrap_or_default();
+        let previews = Usage::new(self.previews.len(), self.previews.iter().map(|e| e.1.bytes()).sum());
+        let full = self.full.as_ref().map(|e| Usage::new(1, e.1.bytes())).unwrap_or_default();
         (Usage::new(self.thumbs.len(), self.thumbs.cost()), previews, full)
     }
 
+    /// What a render of photo `id` with settings `s` adds to its identity for the denoised picture it will use: 0 unless
+    /// it uses one (the Denoise amount is above 0 and the photo has a cached denoised picture).
+    pub fn denoise_salt(&self, id: PhotoId, s: &DevelopSettings) -> u64 {
+        match self.denoise.spec(id) {
+            Some(spec) if s.denoise_amount() > 0.0 => Hasher128::new().str(&spec.key).finish().0 as u64 | 1,
+            _ => 0,
+        }
+    }
+
+    /// How to load photo `p` at `level`: from the cache when its source is there, else from its file (with its denoised
+    /// picture beside it when it has one), its smart preview or the demo scene.
     pub fn source_ref(&mut self, p: &Photo, level: SourceLevel) -> SourceRef {
-        self.source_ref_with_settings(p, level, &p.develop)
+        self.source_ref_with(p, level, true)
+    }
+
+    /// [`Self::source_ref`] that never takes a decoded source from memory: for a job that needs something the cached
+    /// one lacks (an export, whose denoised picture is made when it runs).
+    pub fn source_ref_uncached(&mut self, p: &Photo, level: SourceLevel) -> SourceRef {
+        self.source_ref_with(p, level, false)
+    }
+
+    fn source_ref_with(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
+        let mut r = self.source_ref_plain(p, level, cached);
+        if let (SourceRef::File { denoise, raw_processing_key, .. }, Some((spec, loader))) = (&mut r, self.denoise.get(p.id)) {
+            let loader = if *raw_processing_key == 0 {
+                loader.clone()
+            } else {
+                let options = crate::files::raw_denoise_options(&p.develop);
+                let read = self.file_bytes.clone();
+                Arc::new(move |path: &str, max_edge: usize, spec: &DenoiseSpec| {
+                    let weight = std::fs::metadata(path).map(|m| m.len().saturating_mul(8).min(usize::MAX as u64) as usize).unwrap_or(0);
+                    let gate = crate::memory::work_gate();
+                    let _permit = if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) };
+                    let bytes = crate::files::read_processing_source(path, read.as_ref())?;
+                    crate::files::load_vec_pair_with_raw_denoise(bytes, max_edge, spec, options)
+                }) as PairLoader
+            };
+            *denoise = Some((spec.clone(), loader));
+        }
+        r
     }
 
     fn source_ref_with_settings(&mut self, p: &Photo, level: SourceLevel, settings: &DevelopSettings) -> SourceRef {
-        let options = crate::files::raw_denoise_options(settings);
+        let mut photo = p.clone();
+        photo.develop = Arc::new(settings.clone());
+        self.source_ref_with(&photo, level, true)
+    }
+
+    fn source_ref_plain(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
+        let options = crate::files::raw_denoise_options(&p.develop);
         let processing_key = options.cache_key();
-        if let Some(a) = self.get_source(p.id, level)
+        if cached
+            && let Some(a) = self.get_source(p.id, level)
             && a.raw_processing_key == processing_key
         {
             return SourceRef::Loaded(Box::new(a));
@@ -444,6 +664,7 @@ impl MediaCache {
                     max_edge: level.max_edge(),
                     loader: Some(loader),
                     raw_processing_key: processing_key,
+                    denoise: None,
                     fallback: None,
                 },
                 _ => SourceRef::File {
@@ -451,6 +672,7 @@ impl MediaCache {
                     max_edge: level.max_edge(),
                     loader: None,
                     raw_processing_key: processing_key,
+                    denoise: None,
                     fallback: None,
                 },
             };
@@ -490,12 +712,24 @@ impl MediaCache {
                 }
                 match self.scenes.iter().find(|s| s.id == *scene) {
                     Some(s) => SourceRef::Demo { scene: Box::new(s.clone()), max_edge },
-                    None => SourceRef::File { path: format!("demo:{scene}"), max_edge, loader: None, fallback: None, raw_processing_key: 0 },
+                    None => SourceRef::File {
+                        path: format!("demo:{scene}"),
+                        max_edge,
+                        loader: None,
+                        fallback: None,
+                        denoise: None,
+                        raw_processing_key: 0,
+                    },
                 }
             }
-            Source::File { path } => {
-                SourceRef::File { path: path.clone(), max_edge, loader: self.file_loader.clone(), fallback: None, raw_processing_key: 0 }
-            }
+            Source::File { path } => SourceRef::File {
+                path: path.clone(),
+                max_edge,
+                loader: self.file_loader.clone(),
+                fallback: None,
+                denoise: None,
+                raw_processing_key: 0,
+            },
         }
     }
 }
@@ -606,7 +840,8 @@ impl RenderJob {
         let was_loaded = matches!(self.source, SourceRef::Loaded(_));
         match self.source.load_source() {
             Ok(source) => {
-                let src = &source.image;
+                // the plain picture, or (Denoise amount above 0 and a denoised picture cached) the mix the amount asks for
+                let src = &source.image_for(self.settings.denoise_amount());
                 let info = source.info_or(self.info);
                 // Thumbnails (many small jobs side by side) stay on the CPU; views and exports use
                 // the GPU when there is one.
@@ -687,6 +922,9 @@ pub struct QuickJob {
     pub cached: Vec<(Arc<PreviewCache>, Hash128)>,
     /// Embedded preview of an unedited raw: (path, loader, max edge).
     pub embedded: Option<(String, PreviewLoader, usize)>,
+    /// Camera previews have a separate, size-specific identity from developed renders.
+    /// The generation is captured at submission, so clear/retire also invalidates in-flight jobs.
+    pub embedded_cache: Option<(Arc<PreviewCache>, Hash128, u64)>,
     /// Last resort: run this thumbnail job.
     pub small: Option<Box<RenderJob>>,
 }
@@ -714,9 +952,17 @@ impl QuickJob {
                 return done(rendered(Arc::unwrap_or_clone(img)), Some(QuickSource::Cached));
             }
         }
+        if let Some((cache, key, generation)) = &self.embedded_cache
+            && let Some(image) = cache.get_at(*generation, *key)
+        {
+            return done(rendered(Arc::unwrap_or_clone(image)), Some(QuickSource::Embedded));
+        }
         if let Some((path, loader, edge)) = &self.embedded
             && let Some(image) = loader(path, *edge)
         {
+            if let Some((cache, key, generation)) = &self.embedded_cache {
+                cache.put_memory_at(*generation, *key, Arc::new(image.clone()));
+            }
             return done(rendered(image), Some(QuickSource::Embedded));
         }
         if let Some(job) = self.small {
@@ -798,8 +1044,12 @@ impl crate::Session {
         thumb_bucket: Option<usize>,
     ) -> Option<RenderJob> {
         let p = self.catalog.photo(id)?.clone();
-        let level = SourceLevel::for_size(max_w.max(max_h));
         let settings = if before { Arc::new(self.before_settings(&p)) } else { p.develop.clone() };
+        let level = SourceLevel::for_size(if thumb_bucket.is_some() {
+            max_w.max(max_h) // (grid thumbnails of tight crops stay cheap)
+        } else {
+            source_edge_needed(&p, &settings, apply_crop, max_w.max(max_h))
+        });
         let source = self.media.source_ref_with_settings(&p, level, &settings);
         let request = RenderRequest { apply_crop, ..RenderRequest::fit(max_w, max_h) };
         // the photo id is part of the key: two photos with the same settings and size must not
@@ -810,6 +1060,7 @@ impl crate::Session {
         let content = source_key.0 as u64;
         // Temporary "before" settings must not replace the photo's cached develop hash.
         let settings_hash = if before { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
+        let salt = self.media.denoise_salt(id, &settings);
         let key = settings_hash
             ^ ((max_w as u64) << 40)
             ^ ((max_h as u64) << 20)
@@ -817,17 +1068,21 @@ impl crate::Session {
             ^ (level as u64) << 60
             ^ id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
             ^ content.rotate_left(17)
+            ^ salt
             ^ source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default().rotate_left(31);
         let cache = thumb_bucket.map(|b| {
-            let k = Hasher128::new()
-                .str(&content_key)
+            let mut k = Hasher128::new();
+            k.str(&content_key)
                 .u64(source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default())
                 .u64(settings_hash)
                 .u64(b as u64)
                 .u64(RENDER_CACHE_VERSION)
-                .u64(crate::camera_profiles::cache_key())
-                .finish();
-            (self.media.rendered.clone(), k)
+                .u64(crate::camera_profiles::cache_key());
+            // (only a render that uses a denoised picture has it in its key, so every other thumbnail stays valid)
+            if salt != 0 {
+                k.u64(salt);
+            }
+            (self.media.rendered.clone(), k.finish())
         });
         Some(RenderJob {
             request_id: 0,
@@ -968,12 +1223,91 @@ impl crate::Session {
         Some(job)
     }
 
+    /// A render of one window of the loupe's frame, for a view zoomed past what one whole-frame
+    /// render can hold: the frame is `full_w × full_h` (the size the loupe would draw it at) and
+    /// the result is `window`'s pixels of it, at that scale, from the source level that size needs.
+    /// Nothing is cached here (a window is only worth keeping while it is on screen). `None`: no
+    /// such photo, or the window reads (spots, Auto Mask strokes) more than one render can hold.
+    pub fn region_job(
+        &mut self,
+        id: PhotoId,
+        full_w: usize,
+        full_h: usize,
+        window: lightcraft_pipeline::PixelWindow,
+        apply_crop: bool,
+    ) -> Option<RenderJob> {
+        self.region_job_of(id, full_w, full_h, window, apply_crop, false)
+    }
+
+    /// [`Self::region_job`] of the photo without its edits (its crop kept): the Before side.
+    pub fn region_job_before(
+        &mut self,
+        id: PhotoId,
+        full_w: usize,
+        full_h: usize,
+        window: lightcraft_pipeline::PixelWindow,
+        apply_crop: bool,
+    ) -> Option<RenderJob> {
+        self.region_job_of(id, full_w, full_h, window, apply_crop, true)
+    }
+
+    fn region_job_of(
+        &mut self,
+        id: PhotoId,
+        full_w: usize,
+        full_h: usize,
+        window: lightcraft_pipeline::PixelWindow,
+        apply_crop: bool,
+        before: bool,
+    ) -> Option<RenderJob> {
+        let mut job = self.render_job(id, full_w, full_h, before, apply_crop)?;
+        // what the window's spots and Auto Mask strokes read must fit in one render: else the
+        // caller keeps the whole-frame render (a window alone would come out wrong)
+        let p = self.catalog.photo(id)?;
+        let frame = lightcraft_pipeline::geometry::Frame::with_lens(
+            p.width.max(1) as usize,
+            p.height.max(1) as usize,
+            &job.settings,
+            apply_crop,
+            p.embedded_lens.as_ref(),
+        );
+        let ppl = frame.px_per_long(full_w);
+        lightcraft_pipeline::spots::window_for_reads_checked(&job.settings, &frame, full_w, full_h, ppl, window.clamped(full_w, full_h))?;
+        job.request.window = Some(window);
+        job.key = Hasher128::new()
+            .u64(job.key)
+            .str("window")
+            .u64(window.x as u64)
+            .u64(window.y as u64)
+            .u64(window.w as u64)
+            .u64(window.h as u64)
+            .finish()
+            .0 as u64;
+        Some(job)
+    }
+
     /// The embedded preview of an unedited raw (path, loader), when the app installed a loader.
     fn embedded_of(&self, p: &Photo) -> Option<(String, PreviewLoader)> {
         match (&p.source, &self.media.preview_loader) {
             (Source::File { path }, Some(l)) if p.kind == MediaKind::Raw && crate::import::has_import_look(p) => Some((path.clone(), l.clone())),
             _ => None,
         }
+    }
+
+    /// The camera's embedded preview of a raw file, for the face scan. Faces are read from the unedited picture, so the
+    /// photo's edits do not matter, and the camera's own JPEG (oriented, display-ready) costs a fraction of decoding the
+    /// raw. `None` for anything else, and where the host installed no loader.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn scan_preview_of(&self, p: &Photo) -> Option<(String, PreviewLoader)> {
+        match (&p.source, &self.media.preview_loader) {
+            (Source::File { path }, Some(l)) if p.kind == MediaKind::Raw => Some((path.clone(), l.clone())),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn embedded_cache_key(&self, p: &Photo, edge: usize) -> (Arc<PreviewCache>, Hash128, u64) {
+        let key = Hasher128::new().str("camera-preview").str(&content_key(p)).u64(edge as u64).u64(RENDER_CACHE_VERSION).finish();
+        (self.media.rendered.clone(), key, self.media.rendered.generation())
     }
 
     /// Something to show in the loupe right away for `id` (see [`QuickJob`]): its cached view
@@ -987,12 +1321,14 @@ impl crate::Session {
             .str(&content_key(&p))
             .u64(source_info(&p).calibration_key.map(|i| i.metadata).unwrap_or_default())
             .str("quick")
+            .u64(max_edge.clamp(1, SourceLevel::Preview.max_edge()) as u64)
             .u64(p.develop.hash64())
             .u64(apply_crop as u64)
             .finish();
         let key = h.0 as u64;
         let embedded = self.embedded_of(&p).map(|(path, l)| (path, l, max_edge.clamp(1, SourceLevel::Preview.max_edge())));
-        Some(QuickJob { request_id: 0, photo: id, key, cached, embedded, small: apply_crop.then(|| Box::new(small)) })
+        let embedded_cache = embedded.as_ref().map(|(_, _, edge)| self.embedded_cache_key(&p, *edge));
+        Some(QuickJob { request_id: 0, photo: id, key, cached, embedded, embedded_cache, small: apply_crop.then(|| Box::new(small)) })
     }
 
     /// A first grid thumbnail for an unedited raw: the cached render for `job` (the real
@@ -1009,6 +1345,7 @@ impl crate::Session {
             key: job.key,
             cached: job.cache.clone().into_iter().collect(),
             embedded: Some((path, l, edge)),
+            embedded_cache: Some(self.embedded_cache_key(&p, edge)),
             small: None,
         })
     }
@@ -1055,6 +1392,15 @@ impl crate::Session {
         depth: lightcraft_pipeline::OutputDepth,
     ) -> Result<RenderJob, String> {
         let mut job = self.render_job(id, max_w, max_h, false, true).ok_or("no such photo")?;
+        // An export is made from the denoised picture its Denoise amount asks for, made when the job runs if the
+        // background queue has not got to it. (A source kept in memory may lack the picture, so the job reads the file.)
+        if let Some(wanted) = self.denoise_for_export(id, &job.settings)? {
+            let p = self.catalog.photo(id).ok_or("no such photo")?.clone();
+            job.source = self.media.source_ref_uncached(&p, job.level);
+            if let SourceRef::File { denoise, .. } = &mut job.source {
+                *denoise = Some(wanted);
+            }
+        }
         job.request.space = space;
         job.request.depth = depth;
         job.key ^= (space as u64 + 1).wrapping_mul(0xa076_1d64_78bd_642f) ^ (depth as u64 + 1).wrapping_mul(0xe703_7ed1_a0b4_28db);
@@ -1206,7 +1552,72 @@ mod thumbnail_hash_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn camera_previews_reuse_exact_pixels_by_content_and_size_without_becoming_developed_thumbnails() {
+        use lightcraft_catalog::Op;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut s = crate::Session::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        s.media.preview_loader = Some(Arc::new(move |_, edge| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Some(Rgba8::from_fn(edge.min(64), 32, |x, y| [x as u8, y as u8, 17, 255]))
+        }));
+        let mut p = Photo::new(PhotoId(1), Source::File { path: "camera.ARW".into() }, "camera.ARW", "ARW", 8640, 5760, "2026-01-01");
+        p.kind = MediaKind::Raw;
+        p.content_hash = Some("original-content".into());
+        p.develop = Arc::new(p.import_defaults());
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        let first = s.quick_view_job(PhotoId(1), 2560, true).unwrap();
+        let key = first.key;
+        let a = first.run();
+        let b = s.quick_view_job(PhotoId(1), 2560, true).unwrap().run();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "revisits must not decode the camera JPEG again");
+        assert_eq!(a.rendered.unwrap().image.data, b.rendered.unwrap().image.data);
+        assert_eq!(b.quick, Some(QuickSource::Embedded), "camera pixels are never a developed render");
+        let resized = s.quick_view_job(PhotoId(1), 1024, true).unwrap();
+        assert_ne!(resized.key, key, "a larger view must not retain an undersized preview");
+        resized.run();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        s.execute("library.select", &serde_json::json!({"ids":[1]})).unwrap();
+        s.execute("develop.set", &serde_json::json!({"control":"light.exposure","value":1.0})).unwrap();
+        assert!(s.quick_view_job(PhotoId(1), 2560, true).unwrap().embedded.is_none(), "edits cannot use camera pixels");
+    }
+
+    #[test]
+    fn cleared_camera_preview_jobs_cannot_repopulate_the_cache() {
+        let cache = Arc::new(PreviewCache::memory(1 << 20));
+        let key = Hasher128::new().str("camera").finish();
+        let generation = cache.generation();
+        let job = QuickJob {
+            request_id: 0,
+            photo: PhotoId(1),
+            key: 1,
+            cached: Vec::new(),
+            embedded: Some(("fixture.ARW".into(), Arc::new(|_, _| Some(Rgba8::from_fn(8, 8, |_, _| [1, 2, 3, 255]))), 8)),
+            embedded_cache: Some((cache.clone(), key, generation)),
+            small: None,
+        };
+        cache.clear();
+        assert!(job.run().rendered.is_ok());
+        assert!(cache.get(key).is_none(), "a job from before cache clear cannot store old pixels");
+    }
+
     use super::*;
+
+    #[test]
+    fn denoise_mix_is_reserved_before_the_source_enters_the_cache() {
+        let mut plain = Rgb32f::new(8, 8);
+        plain.data.fill([1.0; 3]);
+        let mut source = DecodedSource::new(Arc::new(plain), None);
+        source.denoised = Some(Arc::new(Twin::new(Arc::new(Rgb32f::new(8, 8)))));
+        let reserved = source.bytes();
+        assert!(reserved >= 3 * 8 * 8 * 12);
+        assert_eq!(source.image_for(0.5).data[0], [0.5; 3]);
+        assert_eq!(source.bytes(), reserved, "creating a mix cannot evade the LRU's recorded cost");
+        let _ = source.image_for(0.25);
+        assert_eq!(source.bytes(), reserved, "changing Amount replaces the reserved mix");
+    }
 
     #[test]
     fn decoder_info_survives_render_jobs_cache_and_eviction() {
@@ -1219,6 +1630,7 @@ mod tests {
         let mut s = crate::Session::with_demo();
         let id = s.active().unwrap();
         let mut job = s.render_job(id, 64, 64, false, true).unwrap();
+        let loaded_info = info.clone();
         job.source = SourceRef::File {
             raw_processing_key: 0,
             path: "synthetic.arw".into(),
@@ -1226,14 +1638,15 @@ mod tests {
             loader: Some(Arc::new(move |_, _| {
                 let mut image = Rgb32f::new(64, 64);
                 image.data.fill([0.1; 3]);
-                Ok((image, info))
+                Ok((image, loaded_info.clone()))
             })),
             fallback: None,
+            denoise: None,
         };
         job.info = SourceInfo::default(); // Header facts cannot override decoder facts.
         job.settings = Arc::new(DevelopSettings::default());
         let r = job.clone().run();
-        assert_eq!(r.loaded.as_ref().unwrap().info, Some(info));
+        assert_eq!(r.loaded.as_ref().unwrap().info.as_ref(), Some(&info));
         let expected = lightcraft_pipeline::render(&r.loaded.as_ref().unwrap().image, &info, &job.settings, &job.request);
         assert_eq!(r.rendered.as_ref().unwrap().image.data, expected.image.data);
         s.accept(&r);
@@ -1316,6 +1729,110 @@ mod tests {
         let plain: Vec<_> = s.catalog.photos().filter(|p| !p.is_edited()).map(|p| p.id).take(2).collect();
         let (a, b) = (s.render_job(plain[0], 1600, 1600, false, true).unwrap(), s.render_job(plain[1], 1600, 1600, false, true).unwrap());
         assert_ne!(a.key, b.key);
+    }
+
+    // Issue #323: a window of a 1:1 view is its own job: the window's pixels, at the zoom scale,
+    // from the original, with a key of its own
+    #[test]
+    fn region_jobs_render_a_window_of_the_zoomed_frame() {
+        use lightcraft_pipeline::PixelWindow;
+        let mut s = crate::Session::with_demo();
+        let p = s.catalog.photos().next().unwrap().clone();
+        let (w, h) = (p.width as usize, p.height as usize);
+        assert!(w.max(h) > 2560, "demo photos are camera-sized");
+        let win = PixelWindow { x: w / 3, y: h / 3, w: 300, h: 200 };
+        let job = s.region_job(p.id, w, h, win, true).unwrap();
+        assert_eq!(job.level, SourceLevel::Full, "a 1:1 window reads the original");
+        let img = job.run().rendered.unwrap().image;
+        assert_eq!((img.width, img.height), (300, 200));
+        // other windows, and the whole-frame job, never share a key
+        let other = s.region_job(p.id, w, h, PixelWindow { x: win.x + 64, ..win }, true).unwrap();
+        let whole = s.render_job(p.id, w, h, false, true).unwrap();
+        let again = s.region_job(p.id, w, h, win, true).unwrap();
+        assert_ne!(other.key, again.key);
+        assert_ne!(whole.key, again.key);
+        assert_eq!(s.region_job(p.id, w, h, win, true).unwrap().key, again.key, "the same window keeps its key");
+        // a window never writes the photo's view preview or the thumbnail cache
+        assert!(again.view_cache.is_none() && again.cache.is_none());
+    }
+
+    // Issue #323: a tight crop shown at its own pixels needs the original, not the 2560 px preview
+    #[test]
+    fn a_tight_crop_reads_the_source_level_its_pixels_need() {
+        let mut s = crate::Session::with_demo();
+        let p = s.catalog.photos().next().unwrap().clone();
+        let long = p.width.max(p.height) as usize;
+        assert!(long > 2560);
+        let id = p.id;
+        let mut d = (*s.develop_of(id).unwrap()).clone();
+        // the uncropped photo at 1600 px: the preview is plenty
+        assert_eq!(s.render_job(id, 1600, 1600, false, true).unwrap().level, SourceLevel::Preview);
+        // a crop to 30 % of each side shown 1600 px long needs 1600 / 0.3 px of the source
+        d.crop.geometry.rect = lightcraft_geom::Rect { x0: 0.2, y0: 0.2, x1: 0.5, y1: 0.5 };
+        s.set_develop(id, d, "Crop").unwrap();
+        assert_eq!(s.render_job(id, 1600, 1600, false, true).unwrap().level, SourceLevel::Full);
+        // …but with the crop tool open (the whole photo shown) it does not
+        assert_eq!(s.render_job(id, 1600, 1600, false, false).unwrap().level, SourceLevel::Preview);
+        // and a crop shown small enough still reads the preview
+        assert_eq!(s.render_job(id, 600, 600, false, true).unwrap().level, SourceLevel::Preview);
+    }
+
+    // a window whose spot reads from further away than a render can hold is refused
+    #[test]
+    fn a_region_job_is_refused_when_a_spot_reads_beyond_what_fits() {
+        use lightcraft_pipeline::PixelWindow;
+        let mut s = crate::Session::with_demo();
+        let id = s.active().unwrap();
+        let p = s.catalog.photo(id).unwrap().clone();
+        let (w, h) = (p.width as usize * 8, p.height as usize * 8);
+        let mut d = (*s.develop_of(id).unwrap()).clone();
+        d.spots.push(lightcraft_develop::Spot {
+            points: vec![lightcraft_geom::Point::new(0.2, 0.5)],
+            size: 0.01,
+            source_offset: Some(lightcraft_geom::Point::new(0.6, 0.0)),
+            ..Default::default()
+        });
+        s.set_develop(id, d, "Spot").unwrap();
+        let win = PixelWindow { x: (w as f64 * 0.2) as usize - 100, y: h / 2 - 100, w: 400, h: 300 };
+        assert!(s.region_job(id, w, h, win, true).is_none());
+        // a window elsewhere is fine
+        assert!(s.region_job(id, w, h, PixelWindow { x: 5000, y: 5000, w: 400, h: 300 }, true).is_some());
+    }
+
+    // Issue #323: the Before side of a Before/After view at 1:1 is a window too, of the photo
+    // without its edits (the crop is kept), with a key of its own
+    #[test]
+    fn a_before_window_shows_the_unedited_look() {
+        use lightcraft_pipeline::PixelWindow;
+        let mut s = crate::Session::with_demo();
+        let id = s.active().unwrap();
+        let p = s.catalog.photo(id).unwrap().clone();
+        let (w, h) = (p.width as usize, p.height as usize);
+        let mut d = (*s.develop_of(id).unwrap()).clone();
+        d.light.exposure = 2.0;
+        s.set_develop(id, d, "Exposure").unwrap();
+        let win = PixelWindow { x: w / 3, y: h / 3, w: 200, h: 150 };
+        let after = s.region_job(id, w, h, win, true).unwrap();
+        let before = s.region_job_before(id, w, h, win, true).unwrap();
+        assert_ne!(after.key, before.key);
+        let (a, b) = (after.run().rendered.unwrap().image, before.run().rendered.unwrap().image);
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let mean = |i: &Rgba8| i.data.iter().map(|p| p[1] as f64).sum::<f64>() / i.data.len() as f64;
+        assert!(mean(&a) > mean(&b) + 10.0, "two stops brighter after: {} vs {}", mean(&a), mean(&b));
+    }
+
+    #[test]
+    fn has_source_follows_what_the_session_accepted() {
+        let mut s = crate::Session::with_demo();
+        let id = s.active().unwrap();
+        let p = s.catalog.photo(id).unwrap().clone();
+        let long = p.width.max(p.height) as usize;
+        assert!(!s.media.has_source(id, SourceLevel::Full));
+        let r = s.render_job(id, long, long, false, true).unwrap().run();
+        s.accept(&r);
+        assert!(s.media.has_source(id, SourceLevel::Full));
+        assert!(!s.media.has_source(id, SourceLevel::Preview));
+        assert!(!s.media.has_source(PhotoId(id.0 + 1), SourceLevel::Full));
     }
 
     #[test]

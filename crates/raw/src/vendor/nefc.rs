@@ -30,7 +30,13 @@
 //!   first two pixels of the previous row of the same parity, starting at the seeds of maker note `0x0096`.
 //! - Lossless (`0x0096` version `0x46`): the decoded values are the samples. Lossy (version `0x44`): they index a
 //!   curve. Type 1 (`0x44 0x10`) stores the full curve; type 2 (`0x44 0x20`, `0x44 0x40`) stores 257 points,
-//!   one every `2^bits / 256` codes, linearly interpolated.
+//!   one every `2^bits / 256` codes (`0x20`) or `2^bits / 1024` codes (`0x40`), linearly interpolated. The span
+//!   was established from the files: in every `0x20` file the first interval of the 257 points rises by
+//!   `2^bits / 256` (16 at 12 bit, 64 at 14 bit) and in every `0x40` file by `2^bits / 1024` (4 and 16), i.e.
+//!   the curve is the identity in the dark part, one code per sample. Read with a point every `2^bits / 256`
+//!   codes instead, the 12 `0x40` files that are not split decoded to values that never exceeded 255 (12 bit) or
+//!   1023 (14 bit) and whose darkest 0.01 % sat at a quarter of the black level of maker note `0x003d` (63 against
+//!   252 in 12-bit units); with the first-interval step they sit at that black level.
 //! - Values in the maker note are in the maker note's byte order (newer bodies write little-endian notes).
 //!
 //! Not supported (returned as [`RawError::Unsupported`], the embedded preview is used instead):
@@ -127,8 +133,10 @@ pub(crate) fn parse_table(t: &[u8], order: ByteOrder, bits: u32) -> Result<Decod
                         "Nikon \"lossy after split\" compressed NEF (split at row {split}) is not decoded yet"
                     )));
                 }
-                // type 2: `n` points, one every 2^bits / (n - 1) codes
-                let range = 1usize << bits;
+                // type 2: `n` points covering `range` codes, one every `range / (n - 1)`; the curve's first interval
+                // rises by exactly that step (identity in the dark part) and the table version sets the span:
+                // `0x20` covers all 2^bits codes, `0x40` the first quarter (see the module docs)
+                let range = if v1 == 0x40 { 1usize << (bits - 2) } else { 1usize << bits };
                 if n - 1 > range || !range.is_multiple_of(n - 1) {
                     return Err(RawError::Unsupported(format!("NEF: {n}-point lossy curve for {bits}-bit data")));
                 }
@@ -353,6 +361,60 @@ mod tests {
                 assert_eq!(out, img.iter().map(|&v| curve[v as usize]).collect::<Vec<_>>());
             }
         }
+    }
+
+    /// Maker note `0x0096` as bytes, written out by hand: version `0x44 <v1>`, four seeds, 257 points (little-endian
+    /// as newer bodies write it) of a curve whose first 256 points rise by `step` and whose last is the white
+    /// level, and a zero split value at offset 562.
+    fn hand_table(v1: u8, seed: u16, step: u16, white: u16) -> Vec<u8> {
+        let mut t = vec![0x44, v1];
+        for _ in 0..4 {
+            t.extend_from_slice(&seed.to_le_bytes());
+        }
+        t.extend_from_slice(&257u16.to_le_bytes());
+        for k in 0..256u16 {
+            t.extend_from_slice(&(k * step).to_le_bytes());
+        }
+        t.extend_from_slice(&white.to_le_bytes());
+        t.resize(624, 0);
+        t
+    }
+
+    /// Known answers for the `0x44 0x40` curve, from bytes and bit strings written by hand (nothing here uses the
+    /// decoder's span rule or the test encoder): the first interval of the points rises by `2^bits / 1024`, so
+    /// the curve is the identity for one code per sample and spans `2^bits / 4` codes. The `0x20` curve of the
+    /// same sizes keeps its span of all `2^bits` codes.
+    #[test]
+    fn lossy_type2_version_0x40_spans_a_quarter_of_the_range() {
+        // 12 bit: points 0, 4, 8 … 1020, 4095
+        let t = parse_table(&hand_table(0x40, 252, 4, 4095), ByteOrder::Little, 12).unwrap();
+        let Encoding::Lossy(curve) = &t.encoding else { panic!() };
+        assert_eq!(curve.len(), 1025);
+        assert_eq!(curve[0..6], [0, 1, 2, 3, 4, 5]);
+        assert_eq!((curve[252], curve[255], curve[1020]), (252, 255, 1020));
+        assert_eq!((curve[1021], curve[1022], curve[1023], curve[1024]), (1788, 2557, 3326, 4095));
+        // the pixels p0 = 252 + 4, p1 = 252, p2 = p0 - 1, p3 = p1, coded as 011 100 | 11110 | 1110 0 | 11110
+        // (LOSSY_12: category 3 = 011, 0 = 11110, 1 = 1110; extra bits 100 = +4, 0 = -1)
+        let out = decode(&[0x73, 0xdc, 0xf0], 4, 1, 12, &t).unwrap();
+        assert_eq!(out, [256, 252, 255, 252]);
+        // 14 bit: points 0, 16, 32 … 4080, 16383
+        let t = parse_table(&hand_table(0x40, 1008, 16, 16383), ByteOrder::Little, 14).unwrap();
+        let Encoding::Lossy(curve) = &t.encoding else { panic!() };
+        assert_eq!(curve.len(), 4097);
+        assert_eq!(curve[0..6], [0, 1, 2, 3, 4, 5]);
+        assert_eq!((curve[1008], curve[4080], curve[4096]), (1008, 4080, 16383));
+        // the same pixels coded as 1100 100 | 111110 | 11110 0 | 111110
+        // (LOSSY_14: category 3 = 1100, 0 = 111110, 1 = 11110)
+        let out = decode(&[0xc9, 0xf7, 0x9f, 0x00], 4, 1, 14, &t).unwrap();
+        assert_eq!(out, [1012, 1008, 1011, 1008]);
+        // version 0x20 with the same points is a curve over all 2^bits codes: the points are 16 codes apart
+        let t = parse_table(&hand_table(0x20, 252, 16, 4095), ByteOrder::Little, 12).unwrap();
+        let Encoding::Lossy(curve) = &t.encoding else { panic!() };
+        assert_eq!((curve.len(), curve[16], curve[17], curve[4095]), (4097, 16, 17, 4094));
+        // 200 points can't be spaced evenly over the 1024 codes of a 12-bit 0x40 table
+        let mut odd = hand_table(0x40, 252, 4, 4095);
+        odd[10..12].copy_from_slice(&200u16.to_le_bytes());
+        assert!(parse_table(&odd, ByteOrder::Little, 12).is_err());
     }
 
     #[test]

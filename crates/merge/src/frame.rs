@@ -111,9 +111,7 @@ pub fn load_frame(bytes: &[u8], max_edge: Option<usize>, orient: bool) -> Result
     if lightcraft_raw::probe(bytes).is_some() {
         let mut raw = lightcraft_raw::decode(bytes).map_err(|e| MergeError::Decode(e.to_string()))?;
         // geometric lens corrections stay with the develop settings ("profile corrections")
-        raw.opcodes
-            .list3
-            .retain(|op| !matches!(op, lightcraft_raw::Opcode::WarpRectilinear { .. } | lightcraft_raw::Opcode::FixVignetteRadial { .. }));
+        raw.opcodes.list3.retain(|op| !op.is_lens_correction());
         let small = max_edge.is_some_and(|m| m <= 1200);
         let method = if small { lightcraft_raw::Method::Bilinear } else { lightcraft_raw::Method::Ahd };
         let mut image = raw.develop(method).map_err(|e| MergeError::Decode(e.to_string()))?;

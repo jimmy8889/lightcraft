@@ -325,8 +325,11 @@ fn parse_header(d: &[u8]) -> Result<Header, RawError> {
                 }
                 h.predictor = seg[1 + 2 * ns];
                 h.pt = seg[3 + 2 * ns] & 15;
-                if !(0..=7).contains(&h.predictor) {
-                    return Err(err("bad predictor"));
+                if h.predictor > 7 {
+                    return Err(RawError::Unsupported(format!(
+                        "lossless JPEG scan with predictor selection value {} (T.81 defines 0 to 7)",
+                        h.predictor
+                    )));
                 }
                 if h.pt >= h.precision {
                     return Err(err("bad point transform"));
@@ -369,12 +372,25 @@ fn check_subsampled(h: &Header) -> Result<usize, RawError> {
     Ok(vertical)
 }
 
-/// Sony M/S tiles: horizontal prediction, no restart markers. Keep subsampled planes separate;
-/// expanding them into a mosaic would silently corrupt the existing CFA callers.
-pub(crate) fn frame_info_subsampled(d: &[u8]) -> Result<(usize, usize), RawError> {
+/// Sony M/S tiles and Canon sRAW / mRAW: horizontal prediction, no restart markers. Keep subsampled planes
+/// separate; expanding them into a mosaic would silently corrupt the existing CFA callers.
+/// Returns (width, height, vertical subsampling of the chroma planes).
+pub(crate) fn frame_info_subsampled(d: &[u8]) -> Result<(usize, usize, usize), RawError> {
     let h = parse_header(d)?;
-    check_subsampled(&h)?;
-    Ok((h.width, h.height))
+    let vertical = check_subsampled(&h)?;
+    Ok((h.width, h.height, vertical))
+}
+
+/// How the first-column prediction and the running predictor of a subsampled frame are chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Prediction {
+    /// Sony: the left neighbour in the plane; at the first column the sample above, except that a top luma
+    /// row of an MCU row reads the previous MCU row's top luma sample.
+    Geometric,
+    /// Canon: every component is its own one-dimensional chain in decoding order (the previous sample of the
+    /// same component, so the second luma row of a 4:2:0 MCU continues from the end of the first); the first
+    /// sample of each MCU row starts from the first sample of the previous MCU row.
+    Sequential,
 }
 
 pub(crate) struct FrameSubsampled {
@@ -385,11 +401,13 @@ pub(crate) struct FrameSubsampled {
     pub planes: [Vec<u16>; 3],
 }
 
-/// Sony's 4:2:0 / 4:2:2 LJ92 variants: T.81 MCU ordering and differences, modulo 2^16.
-/// At the first column, the top luma row predicts from the previous MCU row's top
+/// The 4:2:0 / 4:2:2 LJ92 variants of Sony (M/S ARW) and Canon (sRAW / mRAW): T.81 MCU ordering and differences,
+/// modulo 2^16. [`Prediction`] selects the predictor each maker uses.
+///
+/// Sony: at the first column, the top luma row predicts from the previous MCU row's top
 /// sample (two image rows above), and the bottom row from the current top sample.
 /// Observed black-box: using the immediately preceding image row introduces tile seams.
-pub(crate) fn decode_subsampled(d: &[u8], max_samples: usize) -> Result<FrameSubsampled, RawError> {
+pub(crate) fn decode_subsampled(d: &[u8], max_samples: usize, prediction: Prediction) -> Result<FrameSubsampled, RawError> {
     let h = parse_header(d)?;
     let vertical = check_subsampled(&h)?;
     let pixels = h.width.checked_mul(h.height).ok_or_else(|| err("frame too large"))?;
@@ -410,6 +428,9 @@ pub(crate) fn decode_subsampled(d: &[u8], max_samples: usize) -> Result<FrameSub
     let mut planes = [vec![0u16; pixels], vec![0u16; chroma], vec![0u16; chroma]];
     let mut br = BitReader::new(entropy);
     let init = 1i32 << (h.precision - h.pt - 1);
+    // Sequential prediction: the last sample of each component, and the first sample of its previous MCU row
+    let mut last = [init; 3];
+    let mut row_first = [init; 3];
     for my in 0..h.height / vertical {
         for mx in 0..h.width / 2 {
             for (c, plane) in planes.iter_mut().enumerate() {
@@ -420,20 +441,24 @@ pub(crate) fn decode_subsampled(d: &[u8], max_samples: usize) -> Result<FrameSub
                     for dx in 0..horizontal_factor {
                         let (x, y) = (mx * horizontal_factor + dx, my * vertical_factor + dy);
                         let i = y * width + x;
-                        let pred = if x > 0 {
-                            plane[i - 1] as i32
-                        } else if c == 0 && dy == 0 && y >= vertical {
-                            plane[i - vertical * width] as i32
-                        } else if y > 0 {
-                            plane[i - width] as i32
-                        } else {
-                            init
+                        let pred = match prediction {
+                            Prediction::Geometric if x > 0 => plane[i - 1] as i32,
+                            Prediction::Geometric if c == 0 && dy == 0 && y >= vertical => plane[i - vertical * width] as i32,
+                            Prediction::Geometric if y > 0 => plane[i - width] as i32,
+                            Prediction::Geometric => init,
+                            Prediction::Sequential if mx == 0 && dx == 0 && dy == 0 => row_first[c],
+                            Prediction::Sequential => last[c],
                         };
                         let ssss = tables[c].decode(&mut br)?;
                         if ssss > 16 {
                             return Err(err("invalid difference category"));
                         }
-                        plane[i] = ((pred + diff_value(&mut br, ssss)) & 0xffff) as u16;
+                        let value = ((pred + diff_value(&mut br, ssss)) & 0xffff) as u16;
+                        plane[i] = value;
+                        last[c] = i32::from(value);
+                        if mx == 0 && dx == 0 && dy == 0 {
+                            row_first[c] = i32::from(value);
+                        }
                     }
                 }
             }
@@ -816,11 +841,13 @@ pub(crate) mod tests {
 
     /// Independent 4×4, 16-bit Sony 4:2:0 stream. Hand-specified differences in MCU order.
     pub(crate) fn fixture_420() -> Vec<u8> {
-        fixture_subsampled(4, 0x22, &[-31768, 1, 1000, 1, -16384, -16284, 1, 1, 1, 1, 1, 2, 100, 1, 1000, 1, 100, 100, 1, 1, 1, 1, 1, 2])
+        fixture_subsampled(4, 4, 0x22, &[-31768, 1, 1000, 1, -16384, -16284, 1, 1, 1, 1, 1, 2, 100, 1, 1000, 1, 100, 100, 1, 1, 1, 1, 1, 2])
     }
 
-    fn fixture_subsampled(height: u8, sampling: u8, differences: &[i32]) -> Vec<u8> {
-        let mut out = vec![0xff, 0xd8, 0xff, 0xc3, 0, 17, 16, 0, height, 0, 4, 3, 1, sampling, 0, 2, 0x11, 0, 3, 0x11, 0];
+    /// A 16-bit three-component frame of `width × height` pixels with the given luma `sampling` (`0x21` / `0x22`)
+    /// and one shared 5-bit Huffman table, whose differences are written as given (MCU order).
+    pub(crate) fn fixture_subsampled(width: u8, height: u8, sampling: u8, differences: &[i32]) -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc3, 0, 17, 16, 0, height, 0, width, 3, 1, sampling, 0, 2, 0x11, 0, 3, 0x11, 0];
         out.extend_from_slice(&[0xff, 0xc4, 0, 36, 0]);
         let mut counts = [0; 16];
         counts[4] = 17;
@@ -844,28 +871,28 @@ pub(crate) mod tests {
     #[test]
     fn horizontal_only_subsampling_preserves_rows_and_chroma() {
         // Independent 4×2, 16-bit 4:2:2 stream: two luma samples, Cb, Cr per MCU.
-        let enc = fixture_subsampled(2, 0x21, &[-31768, 1, -16384, -16284, 1, 1, 1, 2, 100, 1, 100, 100, 1, 1, 1, 2]);
-        let frame = decode_subsampled(&enc, 16).unwrap();
+        let enc = fixture_subsampled(4, 2, 0x21, &[-31768, 1, -16384, -16284, 1, 1, 1, 2, 100, 1, 100, 100, 1, 1, 1, 2]);
+        let frame = decode_subsampled(&enc, 16, Prediction::Geometric).unwrap();
         assert_eq!((frame.width, frame.height, frame.vertical_subsampling), (4, 2, 1));
         assert_eq!(frame.planes[0], [1000, 1001, 1002, 1003, 1100, 1101, 1102, 1103]);
         assert_eq!(frame.planes[1], [16384, 16385, 16484, 16485]);
         assert_eq!(frame.planes[2], [16484, 16486, 16584, 16586]);
         assert!(decode(&enc, 24).is_err());
-        assert!(matches!(decode_subsampled(&enc, 15), Err(RawError::Limit(_))));
-        assert!(decode_subsampled(&enc[..enc.len() - 6], 16).is_err());
+        assert!(matches!(decode_subsampled(&enc, 15, Prediction::Geometric), Err(RawError::Limit(_))));
+        assert!(decode_subsampled(&enc[..enc.len() - 6], 16, Prediction::Geometric).is_err());
     }
 
     #[test]
     fn subsampled_mcu_order_preserves_each_plane() {
         let enc = fixture_420();
-        let frame = decode_subsampled(&enc, 24).unwrap();
+        let frame = decode_subsampled(&enc, 24, Prediction::Geometric).unwrap();
         assert_eq!((frame.width, frame.height), (4, 4));
         assert_eq!(frame.planes[0], [1000, 1001, 1002, 1003, 2000, 2001, 2002, 2003, 1100, 1101, 1102, 1103, 2100, 2101, 2102, 2103]);
         assert_eq!(frame.planes[1], [16384, 16385, 16484, 16485]);
         assert_eq!(frame.planes[2], [16484, 16486, 16584, 16586]);
         assert!(decode(&enc, 48).is_err()); // CFA API must keep rejecting subsampling.
-        assert!(matches!(decode_subsampled(&enc, 23), Err(RawError::Limit(_))));
-        assert!(decode_subsampled(&enc[..enc.len() - 6], 24).is_err());
+        assert!(matches!(decode_subsampled(&enc, 23, Prediction::Geometric), Err(RawError::Limit(_))));
+        assert!(decode_subsampled(&enc[..enc.len() - 6], 24, Prediction::Geometric).is_err());
         let mut bad = enc.clone();
         bad[10] = 3; // odd frame width
         assert!(frame_info_subsampled(&bad).is_err());
@@ -873,6 +900,25 @@ pub(crate) mod tests {
         bad = enc.clone();
         bad[sos + 11] = 2; // unsupported predictor
         assert!(frame_info_subsampled(&bad).is_err());
+    }
+
+    #[test]
+    fn sequential_prediction_chains_each_component_in_decoding_order() {
+        // Canon sRAW / mRAW: the same stream as `subsampled_mcu_order_preserves_each_plane`, but each component
+        // continues from its previous sample in decoding order (the second luma row of an MCU follows the first),
+        // and a new MCU row starts from the first sample of the previous one. Worked out by hand from init 32768.
+        let enc = fixture_420();
+        let frame = decode_subsampled(&enc, 24, Prediction::Sequential).unwrap();
+        assert_eq!((frame.width, frame.height, frame.vertical_subsampling), (4, 4, 2));
+        assert_eq!(frame.planes[0], [1000, 1001, 2003, 2004, 2001, 2002, 2005, 2006, 1100, 1101, 2103, 2104, 2101, 2102, 2105, 2106]);
+        assert_eq!(frame.planes[1], [16384, 16385, 16484, 16485]);
+        assert_eq!(frame.planes[2], [16484, 16486, 16584, 16586]);
+        // 4:2:2 has one luma row per MCU row, so both predictions agree
+        let enc = fixture_subsampled(4, 2, 0x21, &[-31768, 1, -16384, -16284, 1, 1, 1, 2, 100, 1, 100, 100, 1, 1, 1, 2]);
+        assert_eq!(
+            decode_subsampled(&enc, 16, Prediction::Sequential).unwrap().planes,
+            decode_subsampled(&enc, 16, Prediction::Geometric).unwrap().planes
+        );
     }
 
     fn noise(n: usize, bits: u32, seed: u64) -> Vec<u16> {

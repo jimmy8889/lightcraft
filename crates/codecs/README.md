@@ -14,6 +14,7 @@ let d: Decoded = decode(&bytes, DecodeOptions::default())?;
 let working: Rgb32f = to_working(&d);                    // linear Rec.2020 D65 (Bradford)
 let fast = decode(&bytes, DecodeOptions::fit(2048, 2048))?; // JPEG: DCT-domain 1/2..1/8 scaling
 let t: Thumbnail = decode_thumbnail(&bytes, 256)?;       // embedded EXIF/MPF preview or scaled decode
+let h: Header = read_header(&bytes)?;                    // stored width/height + orientation, no pixels decoded
 
 let icc = icc::write_named(NamedSpace::DisplayP3);       // or icc::write_matrix_trc(&space, &Trc::…)
 let meta = EncodeMeta { icc: Some(&icc), exif: Some(&exif), xmp: Some(&xmp) };
@@ -55,6 +56,10 @@ Decoders never guess silently; `SourceSpace::origin` says where the interpretati
 or CMYK profile converted by the CMS straight to linear Rec.2020), `Container` (PNG chunks, JXL enum,
 EXIF `R03` Adobe RGB hint), `Untagged` (assumed sRGB; untagged float data assumed linear),
 `IccUnsupported` (profile present but unusable → **sRGB fallback**), `Naive` (CMYK without profile).
+
+`decode_jpeg_with_fallback(bytes, opts, space)` lets an enclosing RAW container supply the colour
+space of a JPEG with no ICC or EXIF metadata. It applies the transfer curve before linear-light
+resizing; a JPEG carrying its own metadata retains its existing interpretation.
 
 ICC profiles are parsed with `moxcms` (v2/v4, `curv`/`para` TRCs, `chad`); sRGB, Display P3,
 Adobe RGB (1998), ProPhoto (ROMM) and Rec.2020 are recognised by colorants. `icc::write_matrix_trc`

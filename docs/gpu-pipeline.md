@@ -44,6 +44,17 @@ Overrides (read once at launch):
   the compute device always used Vulkan + DX12 (+ Metal).
 - `LIGHTCRAFT_GPU=0`: GPU rendering off for the process (the window is unaffected).
 
+**DX12 shader compiler (issue #471).** Every instance (window and compute) compiles DX12 shaders with
+FXC (`d3dcompiler_47.dll`, part of Windows; `lightcraft_gpu::backend::backend_options`). wgpu's
+default, `Auto`, loads whichever `dxcompiler.dll` the DLL search path finds first. LightCraft ships
+none, so that copy belongs to another program (a Windows SDK, a folder on `PATH`). An older copy without
+`dxil.dll` beside it (e.g. DXC 1.7) warns that the DXIL is unsigned, wgpu treats the warning as a
+compile error, its indirect-validation pipelines fail, the device is lost, and the window never opened
+(`WGPU error: Parent device is lost`). `WGPU_DX12_COMPILER=dxc | auto | fxc` (wgpu's variable) still
+chooses; with `dxc`, put `dxcompiler.dll` *and* `dxil.dll` (DXC ≥ 1.8.2502) next to `lightcraft.exe`.
+FXC builds the compute kernels somewhat slower than DXC (≈ 9 s vs 7.5 s for the GPU test suite on an
+RTX 4080), off the startup path.
+
 **Off the startup path.** The compute device is created on a background thread once the window is
 up (`gpu::warm_up` from the first frame's settings), and never while GPU rendering is off: with
 Settings ▸ Performance ▸ *Use the GPU for rendering* unchecked (applied before the window opens),
@@ -55,7 +66,9 @@ Settings ▸ Performance ▸ *Use the GPU for rendering* unchecked (applied befo
 returns, successfully or not. If the marker is still there at the next launch, the process died inside
 the driver: LightCraft starts with GPU rendering off (the preference is saved unchecked), removes the
 marker and says so in a notice. Checking *Use the GPU for rendering* again tries the GPU once more
-(and re-arms the sentinel). Not with `LIGHTCRAFT_NO_PREFS` (tests, scripts). Killing the app during
+(and re-arms the sentinel). Not with `LIGHTCRAFT_NO_PREFS` (tests, scripts), and not in a `--memory` session,
+which writes nothing: it neither arms the sentinel nor removes a marker it finds (it still starts with GPU
+rendering off when one is there, and the next ordinary launch reports and clears it). Killing the app during
 the ~0.3 s of device creation, or two instances starting at the same moment, can trip it falsely —
 harmless: rendering is then on the CPU until the box is checked again. The sentinel only covers the
 compute device; a crash while the window's renderer starts is avoided by the backend defaults above
@@ -66,6 +79,16 @@ with `set LIGHTCRAFT_GPU_BACKEND=dx12` (the default since #136), or `=off` to ke
 rendering; `set VK_LOADER_DRIVERS_DISABLE=*igvk64*` (Vulkan loader) hides a specific Vulkan driver
 from every program started with it. Help ▸ System Info and `app.gpu` show the adapter and backend in
 use (e.g. `Intel(R) UHD Graphics 630 (Dx12)`).
+
+**Window never appears, "not responding" (Windows, NVIDIA; issue #374).** With *Shader Cache Size*
+set to **Disabled** in NVIDIA Control Panel (Manage 3D settings → Global Settings), NVIDIA's driver
+walks the whole system drive while the window's GPU device is created (`D3D12CreateDevice` →
+`nvwgf2umx.dll` → `NvMemMapStoragex.dll!TotalDiskUsage`), before the first frame: a black,
+unresponsive window for minutes. The Vulkan driver shares that code, so another backend doesn't
+help. Set *Shader Cache Size* back to **Driver Default** (or any size); the setting is global, there
+is no per-program override. Other programs that create a DX12 or Vulkan device at startup hang the
+same way (PhotoCraft does). It is a driver issue: nothing in LightCraft itself
+walks the drive.
 
 ## Where it is used
 - `lightcraft_engine::media::develop` (called by every `RenderJob`): loupe / before / compare views,
@@ -169,7 +192,11 @@ bounds **mean |Δ| < 0.5 LSB and max |Δ| ≤ 3 LSB** per channel. Measured (App
 three mask sets incl. CPU-evaluated shapes, spots + defringe), all 8 orientations ± crop, embedded
 DNG lens data, display-referred sources, draft quality, full-size renders; the 24 MP export in
 `render_bench` also differs by max 1 LSB. Cached (slider-drag) GPU renders are bit-identical to
-fresh ones. The tests skip (pass with a note) when no adapter exists.
+fresh ones. `windows_match` runs the settings cases again as a window of a 3000 × 2000 frame
+(`RenderRequest::window`, the zoomed loupe, issue #323) plus a vignette in a corner and a spot reading
+from outside the window: the vignette geometry arrives as the `VIG_VIEW` parameter, the airlight and
+noise-reduction size come from the whole frame, and a window that spots or Auto Mask strokes grew is
+cut back after the readback. The tests skip (pass with a note) when no adapter exists.
 
 Remaining differences come from f32 vs f64 coordinate math, fast-math transcendental functions on
 Metal and running-sum order in the box filters — all far below one 8-bit step.
@@ -206,6 +233,7 @@ the device on their first GPU render. `lightcraft_gpu::ready()` asks without blo
   developed image in ~50 ms.
 
 ## Memory (M5.6)
+A view's stages keep an uploaded source only up to 96 MB (a Preview-level source); a bigger one (the original a zoom window is cut from) is kept once, outside the views' stages, for all views of the photo (the Before and After windows and every pan share it; the Before window of a Before/After waits at first open until the After's job has handed the original over, or each would decode and upload its own copy) and given back when the app idles (issue #323: kept per view it counted against the stage budget on every tick of a drag, and not kept every new window uploaded 288 MB again).
 - `library.memory` reports what the engine's caches hold (decoded thumbnail / preview / full-size
   sources, rendered previews) and the GPU renderer's device buffers (allocated, of which pooled
   and retired); `ui.inspect` → `memory` adds the loupe's stage caches (CPU images, GPU buffers)

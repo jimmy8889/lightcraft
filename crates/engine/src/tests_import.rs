@@ -545,12 +545,17 @@ fn cube_luts_become_profiles() {
     );
     s.execute("develop.profile", &json!({"id": id, "amount": 0})).unwrap();
     assert_eq!(s.render_now(photo, 48, 32).unwrap().image.data, base.data, "Amount 0 = the photo as it was");
+    assert_eq!(s.profile_info(&id), Some(("Warm Test", "Film Looks")));
+    s.execute("profile.favorite", &json!({"id": id})).unwrap();
+    assert!(s.profile_favorites.contains(&id));
     // the library keeps it
     drop(s);
     lightcraft_pipeline::lut::unregister(&id);
     let mut s = Session::new().with_fs();
     s.open_library(&lib, false).unwrap();
     assert!(s.lut_profiles.iter().any(|p| p.id == id));
+    assert!(s.profile_favorites.contains(&id), "imported LUT favorite survives reopen");
+    assert_eq!(s.profile_info(&id), Some(("Warm Test", "Film Looks")));
     assert!(lightcraft_pipeline::lut::get(&id).is_some(), "registered again on open");
     s.execute("profile.deleteImported", &json!({"id": id})).unwrap();
     assert!(lightcraft_pipeline::lut::get(&id).is_none());
@@ -857,4 +862,246 @@ fn missing_photos_skip_local_browse_records() {
     assert_eq!(s.execute("library.missing", &json!({})).unwrap().as_array().map(Vec::len), Some(4));
     s.execute("library.source", &json!({"kind": "missing"})).unwrap();
     assert_eq!(s.visible_cloned().len(), 4, "the view lists what the count counts");
+}
+
+/// Import a file that is in Recently Deleted (issue #298): by default it is skipped but the
+/// report says it is in the trash; `onDeleted: restore` brings it back with its edits;
+/// `onDeleted: fresh` replaces the trashed record with a new one.
+fn trashed_photo(tag: &str) -> (Session, std::path::PathBuf, u64) {
+    let src = temp_dir(tag);
+    write_png(&src.join("a.png"), 1);
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = r["imported"][0].as_u64().unwrap();
+    s.execute("photo.rate", &json!({"ids": [id], "rating": 4})).unwrap();
+    s.execute("photo.delete", &json!({"ids": [id]})).unwrap();
+    (s, src, id)
+}
+
+#[test]
+fn duplicate_in_recently_deleted_is_reported_as_such() {
+    let (mut s, src, id) = trashed_photo("trash-report");
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(ids(&r, "imported"), 0, "{r}");
+    assert_eq!(r["duplicates"][0]["existing"], id, "{r}");
+    assert_eq!(r["duplicates"][0]["existingDeleted"], true, "{r}");
+    assert!(s.catalog.photo(lightcraft_catalog::PhotoId(id)).unwrap().deleted, "default: left in the trash");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn import_can_restore_a_duplicate_from_recently_deleted() {
+    let (mut s, src, id) = trashed_photo("trash-restore");
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()], "onDeleted": "restore"})).unwrap();
+    assert_eq!(r["restored"], json!([id]), "{r}");
+    assert_eq!(ids(&r, "duplicates"), 0, "{r}");
+    let p = s.catalog.photo(lightcraft_catalog::PhotoId(id)).unwrap();
+    assert!(!p.deleted && p.rating == 4, "restored with its edits");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn import_can_replace_a_duplicate_from_recently_deleted() {
+    let (mut s, src, id) = trashed_photo("trash-fresh");
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()], "onDeleted": "fresh"})).unwrap();
+    assert_eq!(ids(&r, "imported"), 1, "{r}");
+    let new = r["imported"][0].as_u64().unwrap();
+    assert_ne!(new, id);
+    assert!(s.catalog.photo(lightcraft_catalog::PhotoId(id)).is_none(), "the trashed record is gone");
+    let p = s.catalog.photo(lightcraft_catalog::PhotoId(new)).unwrap();
+    assert!(!p.deleted && p.rating == 0, "a new photo without the old edits");
+    assert_eq!(s.catalog.len(), 1);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn unknown_on_deleted_is_an_error() {
+    let mut s = Session::new().with_fs();
+    let e = s.execute("library.import", &json!({"paths": [], "onDeleted": "bogus"})).unwrap_err().to_string();
+    assert!(e.contains("onDeleted"), "{e}");
+}
+
+#[test]
+fn empty_recently_deleted_removes_only_trashed_photos() {
+    let (mut s, src, id) = trashed_photo("trash-empty");
+    write_png(&src.join("b.png"), 2);
+    let r = s.execute("library.import", &json!({"paths": [src.join("b.png").to_string_lossy()]})).unwrap();
+    let keep = r["imported"][0].as_u64().unwrap();
+    let r = s.execute("library.emptyRecentlyDeleted", &json!({})).unwrap();
+    assert_eq!(r["deleted"], 1, "{r}");
+    assert!(s.catalog.photo(lightcraft_catalog::PhotoId(id)).is_none());
+    assert!(s.catalog.photo(lightcraft_catalog::PhotoId(keep)).is_some());
+    // nothing to empty is not an error
+    assert_eq!(s.execute("library.emptyRecentlyDeleted", &json!({})).unwrap()["deleted"], 0);
+    s.execute("edit.undo", &json!({})).unwrap();
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Two trashed photos that share an album and a two-photo stack: emptying (or permanently
+/// deleting) them together must not fail or leave dangling references.
+fn two_trashed_in_album_and_stack(tag: &str) -> (Session, std::path::PathBuf, [u64; 2], u64) {
+    let src = temp_dir(tag);
+    write_png(&src.join("a.png"), 1);
+    write_png(&src.join("b.png"), 2);
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let ids = [r["imported"][0].as_u64().unwrap(), r["imported"][1].as_u64().unwrap()];
+    let al = s.execute("album.create", &json!({"name": "Trip"})).unwrap()["id"].as_u64().unwrap();
+    s.execute("album.addPhotos", &json!({"id": al, "ids": ids})).unwrap();
+    s.execute("library.select", &json!({"ids": ids})).unwrap();
+    s.execute("stack.group", &json!({"ids": ids})).unwrap();
+    s.execute("photo.delete", &json!({"ids": ids})).unwrap();
+    (s, src, ids, al)
+}
+
+#[test]
+fn emptying_trashed_photos_of_one_album_and_stack_leaves_nothing_dangling() {
+    let (mut s, src, ids, al) = two_trashed_in_album_and_stack("trash-empty-refs");
+    let r = s.execute("library.emptyRecentlyDeleted", &json!({})).unwrap();
+    assert_eq!(r["deleted"], 2, "{r}");
+    assert_eq!(s.catalog.len(), 0);
+    assert!(s.catalog.album(lightcraft_catalog::AlbumId(al)).unwrap().photos.is_empty(), "album still lists a removed photo");
+    assert!(ids.iter().all(|i| s.catalog.stack_of(lightcraft_catalog::PhotoId(*i)).is_none()));
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.len(), 2, "one undo step brings both back");
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(al)).unwrap().photos.len(), 2);
+    assert!(s.catalog.stack_of(lightcraft_catalog::PhotoId(ids[0])).is_some());
+    assert!(s.catalog.photos().all(|p| p.deleted), "back in Recently Deleted");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn deleting_several_photos_permanently_leaves_nothing_dangling() {
+    let (mut s, src, ids, al) = two_trashed_in_album_and_stack("trash-perm-refs");
+    s.execute("library.select", &json!({"ids": ids})).unwrap();
+    s.execute("photo.deletePermanently", &json!({"ids": ids})).unwrap();
+    assert!(s.catalog.album(lightcraft_catalog::AlbumId(al)).unwrap().photos.is_empty());
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn fresh_import_of_two_trashed_photos_in_one_album_and_stack_works() {
+    let (mut s, src, ids, al) = two_trashed_in_album_and_stack("trash-fresh-refs");
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()], "onDeleted": "fresh"})).unwrap();
+    assert_eq!(ids_len(&r), 2, "{r}");
+    assert!(s.catalog.album(lightcraft_catalog::AlbumId(al)).unwrap().photos.is_empty());
+    assert!(ids.iter().all(|i| s.catalog.photo(lightcraft_catalog::PhotoId(*i)).is_none()));
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+fn ids_len(r: &Value) -> usize {
+    ids(r, "imported")
+}
+
+#[test]
+fn restore_import_applies_the_album_to_restored_photos() {
+    let (mut s, src, ids, _) = trashed_photo_ids("trash-restore-album");
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()], "onDeleted": "restore", "albumName": "Back"})).unwrap();
+    assert_eq!(r["restored"], json!(ids), "{r}");
+    let album = r["album"].as_u64().expect("album created for the restored photos");
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(album)).unwrap().photos.len(), 1);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+fn trashed_photo_ids(tag: &str) -> (Session, std::path::PathBuf, [u64; 1], u64) {
+    let (s, src, id) = trashed_photo(tag);
+    (s, src, [id], 0)
+}
+
+/// Issue #374: launch arguments never turn into a walk of a whole drive or home folder. An empty
+/// argument is ignored; `.`, `..` and (on Windows) `/` are resolved against the working folder a
+/// launcher picked, which is often a drive root; a root is replaced by its memory card's DCIM
+/// folder or refused, and so is the home folder.
+#[test]
+fn launch_paths_never_become_a_drive_root_or_the_home_folder() {
+    use crate::import::{LaunchPath, launch_path};
+    let root = if cfg!(windows) { Path::new("C:\\") } else { Path::new("/") };
+    let home = if cfg!(windows) { Path::new("C:\\Users\\me") } else { Path::new("/home/me") };
+    let none = |_: &Path| None;
+    let refused = |r: Option<LaunchPath>| matches!(r, Some(LaunchPath::Refused { .. }));
+    for empty in ["", "  "] {
+        assert_eq!(launch_path(empty, Some(root), Some(home), none), None, "{empty:?}");
+    }
+    // the working folder is the drive root: `.` (and `..`) name the whole drive
+    for arg in [".", "..", "./", ".\\..", "/"] {
+        let arg = if cfg!(windows) { arg.to_string() } else { arg.replace('\\', "/") };
+        assert!(refused(launch_path(&arg, Some(root), Some(home), none)), "{arg:?}");
+    }
+    assert!(refused(launch_path("..", Some(&home.join("Pictures")), Some(home), none)), "up to the home folder");
+    assert!(refused(launch_path(&home.to_string_lossy(), None, Some(home), none)));
+    assert!(refused(launch_path(".", None, Some(home), none)), "relative, no working folder");
+    // a memory card's root: its camera folder
+    let dcim = |r: &Path| Some(r.join("DCIM"));
+    assert_eq!(launch_path(".", Some(root), Some(home), dcim), Some(LaunchPath::Import(root.join("DCIM").to_string_lossy().to_string())));
+    // ordinary folders and files resolve to absolute paths
+    let pics = home.join("Pictures");
+    assert_eq!(launch_path("Pictures", Some(home), Some(home), none), Some(LaunchPath::Import(pics.to_string_lossy().to_string())));
+    assert_eq!(
+        launch_path(&pics.join("a.jpg").to_string_lossy(), None, Some(home), none),
+        Some(LaunchPath::Import(pics.join("a.jpg").to_string_lossy().to_string()))
+    );
+}
+
+/// Issue #374: a folder import is bounded — a tree deeper or larger than the limits is not walked
+/// to the end (it stops and says so), and what it found is still returned.
+#[test]
+fn expand_stops_at_the_walk_limits() {
+    let d = temp_dir("bounded");
+    let mut deep = d.clone();
+    for i in 0..8 {
+        deep = deep.join(format!("d{i}"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(format!("p{i}.jpg")), b"x").unwrap();
+    }
+    let top = [d.to_string_lossy().to_string()];
+    let (all, cut) = crate::import::expand_within(&top, None, crate::walk::Limits::default());
+    assert_eq!((all.len(), cut), (8, false));
+    let (some, cut) = crate::import::expand_within(&top, None, crate::walk::Limits { max_depth: 3, max_entries: 1000 });
+    assert_eq!((some.len(), cut), (2, true), "{some:?}");
+    let (few, cut) = crate::import::expand_within(&top, None, crate::walk::Limits { max_depth: 32, max_entries: 5 });
+    assert!(cut && few.len() < 8, "{few:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Raw containers LightCraft cannot decode but shows by their embedded JPEG are picked up from a folder
+/// (the extensions are in `import::EXTENSIONS`; the files differ so none is a duplicate) and import as preview only.
+#[test]
+fn folder_import_picks_up_undecodable_raw_containers_as_preview_only() {
+    use lightcraft_codecs::{ChromaSubsampling, EncodeImage, EncodeMeta, Samples, encode_jpeg};
+    let src = temp_dir("preview-only-exts");
+    let px: Vec<u8> = (0..40 * 30).flat_map(|i| [(i % 251) as u8, 128, 200]).collect();
+    let jpeg = encode_jpeg(&EncodeImage::new(40, 30, 3, Samples::U8(&px)), 90, ChromaSubsampling::S444, &EncodeMeta::default()).unwrap();
+    // CRW / MRW / X3F: their magic, then the JPEG. IIQ / KDC / MOS / ERF: a TIFF whose IFD0 only points at the JPEG.
+    let tiff = {
+        let off = 8 + 2 + 24 + 4;
+        let mut f = b"II*\0\x08\0\0\0\x02\0".to_vec();
+        for (tag, v) in [(513u16, off as u32), (514, jpeg.len() as u32)] {
+            f.extend_from_slice(&tag.to_le_bytes());
+            f.extend_from_slice(&[4, 0, 1, 0, 0, 0]);
+            f.extend_from_slice(&v.to_le_bytes());
+        }
+        f.extend_from_slice(&[0, 0, 0, 0]);
+        f.extend_from_slice(&jpeg);
+        f
+    };
+    let with_magic = |magic: &[u8]| [magic, &[0x11u8; 64][..], &jpeg].concat();
+    let files: [(&str, Vec<u8>); 7] = [
+        ("a.CRW", with_magic(b"II\x1a\0\0\0HEAPCCDR")),
+        ("b.mrw", with_magic(b"\0MRM\0\x01\0\0")),
+        ("c.x3f", with_magic(b"FOVb\x02\0\x02\0")),
+        ("d.iiq", [&tiff[..], b"d"].concat()),
+        ("e.kdc", [&tiff[..], b"e"].concat()),
+        ("f.mos", [&tiff[..], b"f"].concat()),
+        ("g.erf", [&tiff[..], b"g"].concat()),
+    ];
+    for (name, bytes) in &files {
+        std::fs::write(src.join(name), bytes).unwrap();
+    }
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(r["scanned"], 7, "{r}");
+    assert_eq!(ids(&r, "imported"), 7, "{r}");
+    assert_eq!(ids(&r, "failed"), 0, "{r}");
+    assert!(s.catalog.photos().all(|p| p.preview_only.is_some() && p.kind == lightcraft_catalog::MediaKind::Raw && (p.width, p.height) == (40, 30)));
+    let _ = std::fs::remove_dir_all(&src);
 }

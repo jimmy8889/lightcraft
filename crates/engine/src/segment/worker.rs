@@ -17,7 +17,10 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use lightcraft_develop::SegMask;
-use lightcraft_segment::{Encoded, Sam3};
+use lightcraft_segment::{
+    Encoded, Sam3,
+    remote::{self, Operation, Request, text_logits},
+};
 
 use super::{Input, Prompt, Tag};
 use crate::media::RenderJob;
@@ -175,6 +178,7 @@ impl Worker {
 struct State {
     model: Option<(PathBuf, Sam3)>,
     cache: Option<(u64, Encoded)>,
+    remote: Option<remote::Client>,
 }
 
 /// Whether `later` makes `job` pointless (it asks for the same selection again).
@@ -195,7 +199,7 @@ fn run(rx: &mpsc::Receiver<Job>, shared: &Shared, idle: Duration) {
             match rx.recv_timeout(idle) {
                 Ok(j) => queue.push_back(j),
                 Err(RecvTimeoutError::Timeout) => {
-                    if state.model.is_some() {
+                    if state.model.is_some() || state.remote.is_some() {
                         state = State::default();
                         shared.loaded.store(false, Ordering::SeqCst);
                         log::info!("SAM 3 unloaded after {} minutes without use", idle.as_secs() / 60);
@@ -210,8 +214,11 @@ fn run(rx: &mpsc::Receiver<Job>, shared: &Shared, idle: Duration) {
         }
         let Some(mut job) = queue.pop_front() else { continue };
         let is_detail = matches!(job.kind, Kind::Detail { .. });
-        let _done = Done(if is_detail { &shared.detail } else { &shared.pending });
+        // counts the job as pending until just before its reply goes out: a caller woken by the
+        // reply must not still see the worker busy with it
+        let done = Done(if is_detail { &shared.detail } else { &shared.pending });
         if queue.iter().any(|later| supersedes(later, &job)) {
+            drop(done);
             let _ = job.reply.send(Outcome { tag: job.tag, result: Ok(None), superseded: true });
             continue;
         }
@@ -228,7 +235,8 @@ fn run(rx: &mpsc::Receiver<Job>, shared: &Shared, idle: Duration) {
         if result.is_err() && !is_detail {
             state.cache = None;
         }
-        shared.loaded.store(state.model.is_some(), Ordering::SeqCst);
+        shared.loaded.store(state.model.is_some() || state.remote.is_some(), Ordering::SeqCst);
+        drop(done);
         let _ = job.reply.send(Outcome { tag: job.tag, result, superseded: false });
     }
 }
@@ -280,29 +288,68 @@ fn encoded<'a>(state: &'a mut State, shared: &Shared, job: &mut Job) -> Result<(
         log::info!("SAM 3 encoded {}×{} in {:?}", input.w, input.h, t.elapsed());
         state.cache = Some((job.key, enc));
     }
-    let State { model, cache } = state;
+    let State { model, cache, .. } = state;
     match (model.as_mut(), cache.as_mut()) {
         (Some((_, m)), Some((_, e))) => Ok((m, e)),
         _ => Err("the model is not ready".into()),
     }
 }
 
-/// Every phrase of `text` ("car, road"), merged (the per-pixel maximum); `None` when nothing
-/// matches.
-fn text_logits(model: &mut Sam3, enc: &mut Encoded, text: &str) -> Result<Option<Vec<f32>>, String> {
-    let mut merged: Option<Vec<f32>> = None;
-    for phrase in text.split([',', ';']).map(str::trim).filter(|p| !p.is_empty()) {
-        if let Some(p) = model.segment_text(enc, phrase, 0.5).map_err(|e| e.to_string())? {
-            merged = Some(match merged {
-                None => p.logits,
-                Some(m) => m.iter().zip(&p.logits).map(|(a, b)| a.max(*b)).collect(),
-            });
-        }
+fn remote_job(state: &mut State, shared: &Shared, job: &mut Job, endpoint: &str) -> Result<Option<SegMask>, String> {
+    let _busy = Flag::raise(&shared.encoding);
+    if state.remote.is_none() {
+        state.remote = Some(remote::Client::connect(endpoint)?);
     }
-    Ok(merged)
+    let client = state.remote.as_mut().ok_or("remote SAM unavailable")?;
+    let mut region = None;
+    let operation = match std::mem::replace(&mut job.kind, Kind::Prepare) {
+        Kind::Prepare => Operation::Prepare,
+        Kind::Text(text) => Operation::Text(text),
+        Kind::Clicks(clicks) => Operation::Clicks(clicks.iter().map(|c| [c.x, c.y, if c.positive { 1.0 } else { 0.0 }]).collect()),
+        Kind::Detail { prompt, region: r } => {
+            region = Some(r);
+            let (rw, rh) = (r[2] - r[0], r[3] - r[1]);
+            if !(rw > 0.0 && rh > 0.0) {
+                return Ok(None);
+            }
+            match prompt {
+                Prompt::Text(text) => Operation::Text(text),
+                Prompt::Clicks(clicks) => {
+                    let inside: Vec<_> = clicks
+                        .iter()
+                        .map(|c| [((c.at.x - r[0]) / rw) as f32, ((c.at.y - r[1]) / rh) as f32, if c.include { 1.0 } else { 0.0 }])
+                        .filter(|p| (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[1]))
+                        .collect();
+                    if !inside.iter().any(|p| p[2] == 1.0) {
+                        return Ok(None);
+                    }
+                    Operation::Clicks(inside)
+                }
+            }
+        }
+        #[cfg(test)]
+        Kind::Panic => return Err("test panic request".into()),
+    };
+    let input = if region.is_some() || client.key != Some(job.key) { render(job)? } else { Input { rgb: Vec::new(), w: 0, h: 0 } };
+    let request = Request { width: input.w, height: input.h, temporary: region.is_some(), operation };
+    let logits = client.request(&request, &input.rgb)?;
+    if region.is_none() {
+        client.key = Some(job.key);
+    }
+    Ok(logits.map(|l| match region {
+        Some(r) => SegMask::from_logits_in(lightcraft_segment::MASK_SIDE, &l, r),
+        None => SegMask::from_logits(lightcraft_segment::MASK_SIDE, &l),
+    }))
 }
 
 fn run_job(state: &mut State, shared: &Shared, job: &mut Job) -> Result<Option<SegMask>, String> {
+    if let Some(endpoint) = remote::configured() {
+        let result = remote_job(state, shared, job, &endpoint);
+        if result.is_err() {
+            state.remote = None;
+        }
+        return result.map_err(|e| format!("Remote SAM 3 failed: {e}. Check the worker and SSH tunnel, then retry."));
+    }
     let side = lightcraft_segment::MASK_SIDE;
     match std::mem::replace(&mut job.kind, Kind::Prepare) {
         Kind::Prepare => {

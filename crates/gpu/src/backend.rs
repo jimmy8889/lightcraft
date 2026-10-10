@@ -121,6 +121,30 @@ pub fn window_backends() -> Backends {
     resolve(choice, default, wgpu::Instance::enabled_backend_features()).unwrap_or(default)
 }
 
+/// The DX12 shader compiler: FXC (`d3dcompiler_47.dll`, part of Windows) unless
+/// `WGPU_DX12_COMPILER` (`wgpu`, wgpu's own variable: `fxc`, `dxc`, `auto`…) names another.
+///
+/// Issue #471: wgpu's default (`Auto`) loads whichever `dxcompiler.dll` the DLL search path finds
+/// first — LightCraft ships none, so it is some other program's (an SDK's, a folder on `PATH`). A
+/// copy without its `dxil.dll` beside it warns that the DXIL is unsigned; wgpu takes the warning for
+/// a compile error, its own validation pipelines fail, the device is lost and the window never
+/// opens. FXC is always there and compiles everything LightCraft's shaders need.
+pub fn dx12_compiler(env: Option<&str>) -> wgpu::Dx12Compiler {
+    let Some(v) = env else { return wgpu::Dx12Compiler::Fxc };
+    v.parse().unwrap_or_else(|e| {
+        log::warn!("gpu: WGPU_DX12_COMPILER={v} ignored: {e}");
+        wgpu::Dx12Compiler::Fxc
+    })
+}
+
+/// wgpu's backend options for every instance LightCraft creates — the window's and the compute
+/// devices': wgpu's environment variables, with the DX12 compiler from [`dx12_compiler`].
+pub fn backend_options() -> wgpu::BackendOptions {
+    let mut o = wgpu::BackendOptions::from_env_or_default();
+    o.dx12.shader_compiler = dx12_compiler(std::env::var("WGPU_DX12_COMPILER").ok().as_deref());
+    o
+}
+
 /// `LIGHTCRAFT_GPU_BACKEND=off`.
 pub(crate) fn env_off() -> bool {
     env_choice() == BackendChoice::Off
@@ -155,8 +179,16 @@ pub(crate) fn with_init_marker<T>(backends: Backends, f: impl FnOnce() -> T) -> 
 /// If the init marker `path` is present — the last process died while creating the GPU device —
 /// remove it and return what it recorded.
 pub fn take_init_marker(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_init_marker(path)?;
     let _ = std::fs::remove_file(path);
+    Some(text)
+}
+
+/// What the init marker `path` recorded, if it is present — without removing it. For sessions
+/// that must leave the disk as they found it (`--memory`, issues #164 and #169): GPU rendering
+/// still starts off, and the marker stays for the next ordinary launch to report and clear.
+pub fn read_init_marker(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
     Some(text.trim().to_string())
 }
 
@@ -203,6 +235,20 @@ mod tests {
         assert!(default_window_backends("linux").contains(Backends::VULKAN | Backends::GL));
     }
 
+    /// Issue #471: DX12 shaders compile with FXC, never a `dxcompiler.dll` found on the search path,
+    /// unless `WGPU_DX12_COMPILER` asks for it.
+    #[test]
+    fn dx12_compiles_with_fxc_unless_asked() {
+        assert!(matches!(dx12_compiler(None), wgpu::Dx12Compiler::Fxc));
+        assert!(matches!(dx12_compiler(Some("bogus")), wgpu::Dx12Compiler::Fxc));
+        assert!(matches!(dx12_compiler(Some("FXC")), wgpu::Dx12Compiler::Fxc));
+        assert!(matches!(dx12_compiler(Some("dxc")), wgpu::Dx12Compiler::DynamicDxc { .. }));
+        assert!(matches!(dx12_compiler(Some("auto")), wgpu::Dx12Compiler::Auto));
+        if std::env::var_os("WGPU_DX12_COMPILER").is_none() {
+            assert!(matches!(backend_options().dx12.shader_compiler, wgpu::Dx12Compiler::Fxc));
+        }
+    }
+
     #[test]
     fn resolves_against_the_build() {
         let compiled = Backends::DX12 | Backends::VULKAN;
@@ -225,10 +271,13 @@ mod tests {
         set_init_marker(None);
         assert!(seen, "the marker exists while the device is created");
         assert!(!m.exists(), "and is removed afterwards");
-        // a marker left behind by a crashed process is reported once
+        // a marker left behind by a crashed process is reported once; reading it leaves it in place
         std::fs::write(&m, "GPU device creation started (backends DX12)").unwrap();
+        assert!(read_init_marker(&m).unwrap().contains("DX12"));
+        assert!(m.exists(), "read_init_marker leaves the marker for the next launch");
         assert!(take_init_marker(&m).unwrap().contains("DX12"));
         assert_eq!(take_init_marker(&m), None);
+        assert_eq!(read_init_marker(&m), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

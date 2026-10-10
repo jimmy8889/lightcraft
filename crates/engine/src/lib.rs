@@ -10,25 +10,42 @@
 //! run them off the UI thread.
 #![forbid(unsafe_code)]
 
+// Model/cache types remain available without linking the optional inference crate.
+#[cfg(not(feature = "denoise"))]
+extern crate lightcraft_denoise_core as lightcraft_denoise;
+
 pub mod availability;
 mod camera_preview;
 pub mod camera_profiles;
 pub mod cmd;
+pub mod config;
 pub mod crs;
 pub mod crs_masks;
 pub mod culling;
 pub mod demo;
+pub mod denoise;
 pub mod devices;
 pub mod export;
+pub mod face_download;
+#[cfg(not(target_arch = "wasm32"))]
+mod faces_index;
+#[cfg(not(target_arch = "wasm32"))]
+mod faces_worker;
 pub mod files;
 pub mod fonts;
 pub mod guard;
 pub mod import;
 mod import_move;
 pub mod library;
+mod lightroom_archive;
+pub mod lightroom_catalog;
+pub mod lightroom_job;
+mod lightroom_sqlite;
+pub mod logging;
 pub mod media;
 pub mod memory;
 pub mod merge;
+mod model_download;
 pub mod originals;
 pub mod preset_import;
 pub mod preset_luminar;
@@ -39,6 +56,7 @@ pub mod sidecar;
 mod sidecar_guard;
 pub mod smart;
 mod view;
+pub mod walk;
 
 use std::sync::Arc;
 
@@ -48,7 +66,7 @@ use lightcraft_catalog::{Catalog, Filter, Op, PhotoId, Sort};
 use lightcraft_develop::DevelopSettings;
 pub use media::{RenderJob, SourceLevel};
 use serde_json::Value;
-pub use view::{Browse, FilterChip, LibrarySource, Selection, filter_chips};
+pub use view::{Browse, FilterChip, LibrarySource, Selection, SelectionState, filter_chips};
 pub use {lightcraft_catalog as catalog, lightcraft_develop as develop, lightcraft_gpu as gpu, lightcraft_pipeline as pipeline};
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +102,27 @@ pub struct UndoEntry {
     pub folder: Option<FolderMove>,
 }
 
+/// The one photo an undo step changes, when it changes exactly one through its edit, rating, flag,
+/// label, metadata or versions (`depth` bounds nested batches).
+fn single_photo(op: &Op, depth: usize) -> Option<PhotoId> {
+    match op {
+        Op::SetDevelop { id, .. }
+        | Op::SetRating { id, .. }
+        | Op::SetFlag { id, .. }
+        | Op::SetLabel { id, .. }
+        | Op::SetMeta { id, .. }
+        | Op::SetVersions { id, .. }
+        | Op::SetHistory { id, .. }
+        | Op::PushHistory { id, .. } => Some(*id),
+        Op::Batch { ops } if depth < 8 => {
+            let mut ids = ops.iter().map(|o| single_photo(o, depth + 1));
+            let first = ids.next()??;
+            ids.all(|id| id == Some(first)).then_some(first)
+        }
+        _ => None,
+    }
+}
+
 /// A folder renamed or moved on disk as part of an undo step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderMove {
@@ -107,8 +146,10 @@ pub struct Interaction {
 
 /// Source of [`Session::visible_shared`] generations (process-wide, so two sessions never share one).
 static VISIBLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static LIBRARY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub struct Session {
+    library_generation: u64,
     /// Auto Sync: edits to the active photo also change the other selected photos (the settings
     /// that changed, nothing else).
     pub auto_sync: bool,
@@ -132,10 +173,24 @@ pub struct Session {
     /// Set by a command whose change must not rewrite the photo's XMP sidecar even with auto-write on
     /// (a catalog-only edit of data the sidecar writer does not emit); consumed when the command ends.
     pub(crate) skip_auto_write: bool,
+    /// AI denoise: the model in use, the photos that have their picture and the work in progress.
+    pub(crate) denoise: denoise::State,
+    /// Where the host keeps face models (one folder each); `None` where there is no file system (the web).
+    pub face_models_dir: Option<std::path::PathBuf>,
+    /// Face model downloads started this session (the staged files wait in `<face_models_dir>/.downloads`).
+    pub face_downloads: face_download::Downloads,
+    /// The user's own list of models to download (`catalog.json` in the models folder), as last read.
+    pub(crate) face_catalog: lightcraft_faces::catalog::Catalog,
+    /// The loaded recognition model and the face embeddings made with it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) faces: faces_index::FacesState,
     /// Copied develop settings (partial JSON) for Paste.
     pub clipboard: Option<Value>,
     /// The folder on disk the [`LibrarySource::Folder`] view browses.
     pub browse: Option<Browse>,
+    /// The folder the [`LibrarySource::LibraryFolder`] view shows: the library's photos imported
+    /// from it and from the folders inside it.
+    pub library_folder: Option<String>,
     /// Copied metadata (`photo.copyMetadata`): photo.setMeta params.
     pub meta_clipboard: Option<Value>,
     /// The photo that was active before the current one (Paste Settings from Previous).
@@ -163,6 +218,8 @@ pub struct Session {
     pub active_spot: Option<usize>,
     /// The persistent library this session writes to (`None` = in-memory only).
     pub library: Option<library::Library>,
+    /// Identity of current library opening; refreshed only after a successful open.
+    pub(crate) library_identity: Arc<()>,
     /// XMP sidecar preferences (persisted with the library).
     pub xmp: sidecar::XmpPrefs,
     pub(crate) sidecars: std::sync::Mutex<sidecar_guard::State>,
@@ -218,8 +275,13 @@ impl Default for Session {
 }
 
 impl Session {
+    pub fn library_generation(&self) -> u64 {
+        self.library_generation
+    }
+
     pub fn new() -> Session {
         Session {
+            library_generation: LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             auto_sync: false,
             catalog: Catalog::new(),
             source: LibrarySource::All,
@@ -234,9 +296,16 @@ impl Session {
             redo: Vec::new(),
             interaction: None,
             skip_auto_write: false,
+            denoise: Default::default(),
+            face_models_dir: None,
+            face_downloads: Default::default(),
+            face_catalog: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            faces: Default::default(),
             clipboard: None,
             meta_clipboard: None,
             browse: None,
+            library_folder: None,
             previous_active: None,
             copy_groups: lightcraft_develop::SettingsGroup::default_copy(),
             presets: presets::builtin(),
@@ -251,6 +320,7 @@ impl Session {
             segmenter: segment::Segmenter::default(),
             active_spot: None,
             library: None,
+            library_identity: Arc::new(()),
             xmp: sidecar::XmpPrefs::default(),
             sidecars: sidecar_guard::new_state(),
             last_export: None,
@@ -392,6 +462,27 @@ impl Session {
         Ok(())
     }
 
+    /// The box to cut a face's picture from: the detector's, when the scan has looked at the face (every face is then shown
+    /// equally close, however loosely or tightly its own region was drawn), else the region's own box.
+    pub fn face_view(&self, id: PhotoId, rect: lightcraft_geom::Rect) -> lightcraft_geom::Rect {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(v) = self.faces.index.view(id.0, &rect) {
+            return v;
+        }
+        let _ = id;
+        rect
+    }
+
+    /// Apply an op that is LightCraft's own bookkeeping rather than something the user did (faces found by the background
+    /// scan): journaled like any op, but not an undo step, and it leaves the redo stack alone.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn apply_system(&mut self, op: Op) -> Result<()> {
+        let fwd = op.clone();
+        self.catalog.apply(op)?;
+        self.pending_log.push(fwd);
+        Ok(())
+    }
+
     /// Leaving photo `id` after editing it: keep its settings as an automatic version (when they
     /// differ from its latest version; at most [`AUTO_VERSIONS`] auto versions, oldest dropped).
     /// Saved with the library but not an undo step.
@@ -446,6 +537,7 @@ impl Session {
                 return Err(err);
             }
         };
+        self.show_undone(&e.op);
         self.pending_log.push(e.op);
         self.redo.push(UndoEntry { label: e.label.clone(), op: redo, folder: e.folder.as_ref().map(FolderMove::reversed) });
         Ok(e.label)
@@ -460,9 +552,28 @@ impl Session {
                 return Err(err);
             }
         };
+        self.show_undone(&e.op);
         self.pending_log.push(e.op);
         self.undo.push(UndoEntry { label: e.label.clone(), op: undo, folder: e.folder.as_ref().map(FolderMove::reversed) });
         Ok(e.label)
+    }
+
+    /// After an undo or redo that changed one photo (its edit, rating, flag, label, metadata or
+    /// versions), that photo becomes the active one, as in Lightroom Classic, so the change is on
+    /// screen (issue #293). It joins the selection if it isn't in it; nothing changes for steps
+    /// that touch several photos, albums or files, or for a photo not in the current view.
+    fn show_undone(&mut self, op: &Op) {
+        let Some(id) = single_photo(op, 0) else { return };
+        if self.selection.active == Some(id) || !self.visible().contains(&id) {
+            return;
+        }
+        if !self.selection.contains(id) {
+            self.selection = Selection { ids: vec![id], active: Some(id) };
+        } else {
+            self.selection.active = Some(id);
+        }
+        self.active_mask = None;
+        self.active_spot = None;
     }
 
     /// Apply an undo/redo op, first renaming the step's folder and moving the files its renames
@@ -613,7 +724,8 @@ impl Session {
 
     /// Photos shown in the grid/filmstrip for the current source, filter and sort.
     pub fn visible(&mut self) -> &[PhotoId] {
-        let mut key = (self.catalog.revision, format!("{:?}|{:?}|{:?}|{:?}", self.source, self.filter, self.sort, self.browse));
+        let mut key =
+            (self.catalog.revision, format!("{:?}|{:?}|{:?}|{:?}|{:?}", self.source, self.filter, self.sort, self.browse, self.library_folder));
         if self.source == LibrarySource::Missing && self.media.availability.is_background() {
             // the view fills in as the background checks find files gone
             key.1.push_str(&format!("|{}", self.media.availability.generation()));
@@ -628,9 +740,20 @@ impl Session {
                 f.folder = Some(b.path);
                 f.subfolders = b.subfolders;
             }
+            if self.source == LibrarySource::LibraryFolder {
+                // no folder chosen: nothing (`.` names no folder)
+                f.library_folder = Some(self.library_folder.clone().unwrap_or_else(|| ".".into()));
+            }
             let mut visible = self.catalog.query(&f, &self.sort);
             if self.source == LibrarySource::Folder {
                 visible.retain(|id| culling::in_folder_view(self, *id));
+            }
+            if visible.is_empty() && self.source == LibrarySource::LibraryFolder && !self.folder_holds_photos() {
+                // the shown folder lost its last photo (deleted, moved, removed): everything, not
+                // an empty grid under the name of a folder that is gone from the sidebar
+                self.source = LibrarySource::All;
+                self.library_folder = None;
+                return self.visible();
             }
             if matches!(self.source, LibrarySource::Album(_))
                 && self.sort.key == lightcraft_catalog::SortKey::CaptureDate
@@ -668,19 +791,29 @@ impl Session {
         &self.visible
     }
 
+    /// Whether the library still holds a photo imported from the folder a `LibraryFolder` source
+    /// shows.
+    fn folder_holds_photos(&self) -> bool {
+        let f = Filter { library_folder: self.library_folder.clone(), ..Default::default() };
+        self.library_folder.is_some() && !self.catalog.query(&f, &Sort::default()).is_empty()
+    }
+
     /// Photos in the current source (folder, album, …) before the filter bar and search narrow
     /// them; `None` where that is not a separate number (Missing Photos).
     pub fn source_total(&mut self) -> Option<usize> {
         if self.source == LibrarySource::Missing {
             return None;
         }
-        let key = (self.catalog.revision, format!("{:?}|{:?}", self.source, self.browse));
+        let key = (self.catalog.revision, format!("{:?}|{:?}|{:?}", self.source, self.browse, self.library_folder));
         if self.total.as_ref().map(|t| &t.0) != Some(&key) {
             let mut f = self.source.to_filter(&Filter::default(), &self.catalog);
             if self.source == LibrarySource::Folder {
                 let b = self.browse.clone().unwrap_or_default();
                 f.folder = Some(b.path);
                 f.subfolders = b.subfolders;
+            }
+            if self.source == LibrarySource::LibraryFolder {
+                f.library_folder = Some(self.library_folder.clone().unwrap_or_else(|| ".".into()));
             }
             let n = self
                 .catalog
@@ -736,9 +869,20 @@ pub fn json_delta(old: &Value, new: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_album_order;
+#[cfg(test)]
 mod tests_color;
 #[cfg(test)]
+mod tests_denoise;
+#[cfg(test)]
 mod tests_export;
+#[cfg(test)]
+mod tests_face_models;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_face_recognize;
+#[cfg(test)]
+mod tests_folders;
 #[cfg(test)]
 mod tests_forget_local;
 #[cfg(test)]

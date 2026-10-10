@@ -190,6 +190,8 @@ pub struct FinishParams {
     pub w: usize,
     pub h: usize,
     pub px_per_long: f64,
+    /// The window's offset and the whole output's size (pixels): `(0, 0, w, h)` unless windowed.
+    pub view: [f32; 4],
 }
 
 impl FinishParams {
@@ -255,6 +257,7 @@ impl FinishParams {
             w,
             h,
             px_per_long,
+            view: frame.view.map_or([0.0, 0.0, w as f32, h as f32], |v| [v.x as f32, v.y as f32, v.full_w as f32, v.full_h as f32]),
         }
     }
 }
@@ -344,7 +347,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
     let out_to_norm = fp.out_to_norm;
     let long = fp.ow.max(fp.oh);
-    let aspect = w as f32 / h as f32;
+    let [vx, vy, vw, vh] = fp.view;
+    // the vignette belongs to the whole output frame, not to the window being drawn
+    let aspect = vw / vh;
 
     let srgb = srgb_lut();
     let mut out = vec![T::default(); w * h];
@@ -502,8 +507,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
 
             // --- vignette (display linear, post-crop)
             if let Some(v) = vig {
-                let u = (x as f32 + 0.5) / w as f32 * 2.0 - 1.0;
-                let vv = (y as f32 + 0.5) / h as f32 * 2.0 - 1.0;
+                let u = (vx + x as f32 + 0.5) / vw * 2.0 - 1.0;
+                let vv = (vy + y as f32 + 0.5) / vh * 2.0 - 1.0;
                 let sx = 1.0 + (aspect - 1.0) * v.aspect_mix;
                 let sy = 1.0 + (1.0 / aspect - 1.0) * v.aspect_mix;
                 let (ax, ay) = ((u * sx.max(1.0) / sx.max(sy)).abs(), (vv * sy.max(1.0) / sx.max(sy)).abs());

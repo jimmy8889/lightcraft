@@ -41,22 +41,11 @@ fn cube_files(paths: &[String]) -> Vec<(String, String, Option<String>)> {
     for p in paths {
         let path = Path::new(p);
         if path.is_dir() {
-            let mut stack = vec![path.to_path_buf()];
-            while let Some(d) = stack.pop() {
-                let Ok(rd) = std::fs::read_dir(&d) else { continue };
-                for e in rd.flatten() {
-                    let ep = e.path();
-                    if ep.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
-                        continue;
-                    }
-                    if ep.is_dir() {
-                        stack.push(ep);
-                    } else if ep.extension().is_some_and(|x| x.eq_ignore_ascii_case("cube"))
-                        && let Ok(t) = std::fs::read_to_string(&ep)
-                    {
-                        let group = ep.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string());
-                        out.push((ep.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), t, group));
-                    }
+            let cube = |f: &Path| f.extension().is_some_and(|x| x.eq_ignore_ascii_case("cube"));
+            for ep in crate::walk::files_in(path, None, crate::walk::Limits::default(), cube).files {
+                if let Ok(t) = std::fs::read_to_string(&ep) {
+                    let group = ep.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string());
+                    out.push((ep.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), t, group));
                 }
             }
         } else if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("zip")) {

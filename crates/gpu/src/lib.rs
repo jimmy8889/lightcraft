@@ -29,6 +29,8 @@ use lightcraft_raster::Rgb32f;
 pub mod backend;
 #[cfg(not(target_arch = "wasm32"))]
 mod ctx;
+#[cfg(all(feature = "denoise", not(target_arch = "wasm32")))]
+pub mod nn;
 #[cfg(not(target_arch = "wasm32"))]
 mod params;
 #[cfg(not(target_arch = "wasm32"))]
@@ -143,6 +145,16 @@ pub fn set_enabled(on: bool) {
 /// Whether GPU rendering is allowed (environment, preference, no earlier failure).
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed) && !BROKEN.load(Ordering::Relaxed) && !env_disabled()
+}
+
+/// Why GPU compute that has a device of its own (denoise) is switched off by the user's settings, or `None`: the
+/// environment switches and the rendering preference, but not a render-device failure (the devices are separate).
+#[cfg(all(feature = "denoise", not(target_arch = "wasm32")))]
+pub(crate) fn switched_off() -> Option<String> {
+    if env_disabled() {
+        return Some(if backend::env_off() { "disabled by LIGHTCRAFT_GPU_BACKEND=off" } else { "disabled by LIGHTCRAFT_GPU=0" }.into());
+    }
+    (!ENABLED.load(Ordering::Relaxed)).then(|| "disabled by the GPU rendering preference (app.gpu)".into())
 }
 
 /// `LIGHTCRAFT_GPU=0` (or `LIGHTCRAFT_GPU_BACKEND=off`): no GPU for the whole process.
@@ -270,10 +282,37 @@ pub fn set_pool_limit(bytes: u64) {
 pub fn trim_pool(keep: u64) {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(g) = existing_device() {
+        if keep == 0 {
+            render::release_shared_source();
+        }
         g.trim(keep);
     }
     #[cfg(target_arch = "wasm32")]
     let _ = keep;
+}
+
+/// Device bytes of the one big source (a zoom window's original) shared by every view of the photo.
+pub fn shared_source_bytes() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        render::shared_source_bytes()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+}
+
+/// Big sources uploaded to the shared copy so far (a diagnostic: one big photo is uploaded once, not once per window).
+pub fn source_uploads() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        render::source_uploads()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
 }
 
 /// Device bytes held by a view's GPU stages (kept with its [`StageCache`]); 0 when it has none.
@@ -300,6 +339,9 @@ pub fn render(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &R
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // sections switched off with their eye render as if at their defaults (issue #316)
+        let effective = s.effective();
+        let s: &DevelopSettings = &effective;
         // the kernel writes 8-bit output: high-bit-depth exports (and soft proofs) render on the CPU
         if !enabled() || req.depth != lightcraft_pipeline::OutputDepth::U8 || req.proof.is_some() {
             return None;

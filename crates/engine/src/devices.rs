@@ -191,7 +191,7 @@ pub fn devices_in(parents: &[std::path::PathBuf], extra: Vec<std::path::PathBuf>
 
 /// The volume's `DCIM` folder: the usual spellings are checked directly, so a volume's root is
 /// only listed (other spellings on a case-sensitive volume) off Windows, whose drives aren't.
-fn dcim_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
+pub fn dcim_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Some(p) = ["DCIM", "dcim"].iter().map(|n| root.join(n)).find(|p| p.is_dir()) {
         return Some(p);
     }

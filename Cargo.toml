@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
@@ -11,7 +11,10 @@ repository = "https://github.com/storytold/lightcraft"
 
 [workspace.dependencies]
 # internal
+lightcraft-denoise-core = { path = "crates/denoise-core" }
+lightcraft-denoise = { path = "crates/denoise", default-features = false }
 lightcraft-geom = { path = "crates/geom" }
+lightcraft-faces = { path = "crates/faces" }
 lightcraft-sysmem = { path = "crates/sysmem" }
 lightcraft-color = { path = "crates/color" }
 lightcraft-raster = { path = "crates/raster" }
@@ -30,10 +33,12 @@ lightcraft-engine = { path = "crates/engine" }
 lightcraft-ui-egui = { path = "crates/ui-egui" }
 lightcraft-mcp = { path = "crates/mcp" }
 lightcraft-fetch = { path = "crates/fetch" }
+lightcraft-heif = { path = "crates/heif" }
 lightcraft-segment = { path = "crates/segment" }
 
 # foundation
 thiserror = "2"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
@@ -61,6 +66,7 @@ tiff = "0.11"
 image-webp = "0.2"
 moxcms = { version = "0.9", default-features = false, features = ["lut"] }
 jxl-oxide = { version = "0.12", default-features = false }
+zune-jpegxl = { version = "0.5", default-features = false, features = ["std"] } # MIT/Apache-2.0/Zlib lossless JXL encoder (test fixtures only)
 ravif = { version = "0.13", default-features = false, features = ["threading"] } # no "asm": it needs nasm (non-Rust)
 
 # gpu (crates/gpu; native backends only, no GL: everything stays pure Rust)

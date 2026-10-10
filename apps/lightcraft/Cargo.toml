@@ -9,6 +9,16 @@ default-run = "lightcraft"
 [lints]
 workspace = true
 
+[features]
+# Research CPU inference; external checkpoint and measured camera calibration required.
+pmrid = ["lightcraft-engine/pmrid", "lightcraft-ui-egui/pmrid"]
+default = ["denoise"]
+denoise = ["lightcraft-engine/denoise"]
+rawnind-model = ["denoise", "lightcraft-engine/rawnind-model"]
+# Open HEIC/HEIF photos (the optional lightcraft-heif crate). Not default so distributors choose
+# it (HEVC patents); build with `--features heif` to include it.
+heif = ["lightcraft-codecs/heif"]
+
 [dependencies]
 lightcraft-engine = { workspace = true, features = ["sam"] }
 lightcraft-sysmem = { workspace = true }
@@ -29,7 +39,3 @@ rfd = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { workspace = true }
-
-[features]
-# Research CPU inference; external checkpoint and measured camera calibration required.
-pmrid = ["lightcraft-engine/pmrid", "lightcraft-ui-egui/pmrid"]

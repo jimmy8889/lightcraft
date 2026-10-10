@@ -119,7 +119,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             ui.spacing_mut().item_spacing.x = 8.0;
             if text_button(ui, "auto", crate::i18n::tr("Auto"), false).clicked() {
                 let _ = app.run("develop.auto", json!({}));
-                app.toast(ui.ctx(), "Auto settings applied");
+                app.toast(ui.ctx(), crate::i18n::tr("Auto settings applied"));
             }
             let bw = crate::is_bw(&d);
             if text_button(ui, "bw", crate::i18n::tr("B&W"), bw).clicked() {
@@ -159,8 +159,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 14, bottom: 14 }).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(crate::i18n::tr("Profile")).font(t.font(13.0)).color(t.text_dim));
-            let name = lightcraft_engine::presets::profile(&d.profile.id).map(|p| p.name).unwrap_or("Color");
-            let r = crate::widgets::dropdown(ui, "profile", crate::i18n::tr(name), t.font(15.0), t.text_label);
+            let name = app.session.profile_info(&d.profile.id).map(|(name, _)| name).unwrap_or("Color");
+            let r = crate::widgets::dropdown(ui, "profile", crate::i18n::profile_label(&d.profile.id, name), t.font(15.0), t.text_label);
             egui::Popup::menu(&r).show(|ui| profile_menu(app, ui, &d));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if crate::widgets::icon_button(ui, "profileBrowser", Icon::ProfileGrid, vec2(28.0, 28.0), false, true, "Browse Profiles").clicked() {
@@ -172,6 +172,18 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     if d.profile.id != "lc.color" {
         control(app, ui, &d, "profile.amount", true);
         ui.add_space(6.0);
+    }
+    // a raw carrying its own local tone mapping (Apple ProRAW's gain table map): off renders it as
+    // Lightroom Classic does, on as the camera does
+    if app.session.source_info(id).local_tone.is_some() {
+        egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 0, bottom: 10 }).show(ui, |ui| {
+            let mut on = d.profile.camera_local_tone;
+            let r = ui.checkbox(&mut on, crate::i18n::tr("Camera local tone mapping"));
+            crate::widgets::register(ui.ctx(), "check:profile.cameraLocalTone", r.rect);
+            if r.on_hover_text(crate::i18n::tr("Apply the local tone mapping stored in the raw (Apple ProRAW), as the camera renders it")).changed() {
+                let _ = app.run("develop.merge", json!({"settings": {"profile": {"camera_local_tone": on}}, "label": "Camera Local Tone Mapping"}));
+            }
+        });
     }
     divider(ui);
 
@@ -292,6 +304,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         for c in ["detail.sharpenAmount", "detail.sharpenRadius", "detail.sharpenDetail", "detail.sharpenMasking"] {
             control(app, ui, d, c, c == "detail.sharpenAmount" || d.detail.sharpen_amount > 0.0);
         }
+        // AI Denoise is its own tool, apart from the manual noise reduction sliders below it
+        sub_title(ui, crate::i18n::tr("AI Denoise"));
+        // AI Denoise: how much of the photo's cleaned picture to mix in (raw files only), and what that picture is doing
+        let applicable = !matches!(app.session.denoise_photo_state(id), lightcraft_engine::denoise::PhotoState::NotApplicable);
+        let on = d.enhance.denoise_enabled();
+        super::denoise::detail_toggle(app, ui, id, on, applicable);
+        control(app, ui, d, "enhance.denoise", applicable && on);
+        super::denoise::detail_status(app, ui, id, if on { d.enhance.denoise } else { 0.0 });
         if app.session.catalog.photo(id).is_some_and(|p| p.develops_raw()) && controls::find("detail.rawDenoise").is_some() {
             sub_title(ui, crate::i18n::tr("RAW Denoise (Native)"));
             native_raw_control(app, ui, d, id);
@@ -382,36 +402,33 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
 /// The profile dropdown: Favorites, Recent, one submenu per group, then favourite toggle and
 /// Browse….
 fn profile_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings) {
-    use lightcraft_engine::presets::{PROFILES, profile, profile_groups};
+    use lightcraft_engine::presets::{PROFILES, profile_groups};
     let t = Tokens::get(ui.ctx());
     ui.set_min_width(200.0);
     let cur = d.profile.id.as_str();
     // (clicked, hovered)
-    let mut pick: (Option<&'static str>, Option<&'static str>) = (None, None);
-    let item = |ui: &mut egui::Ui,
-                key: &str,
-                p: &'static lightcraft_engine::presets::ProfileInfo,
-                pick: &mut (Option<&'static str>, Option<&'static str>)| {
-        let r = ui.selectable_label(p.id == cur, crate::i18n::tr(p.name));
-        register(ui.ctx(), format!("profileMenu:{key}:{}", p.id), r.rect);
+    let mut pick: (Option<String>, Option<String>) = (None, None);
+    let item = |ui: &mut egui::Ui, key: &str, id: &str, name: &str, pick: &mut (Option<String>, Option<String>)| {
+        let r = ui.selectable_label(id == cur, crate::i18n::profile_label(id, name));
+        register(ui.ctx(), format!("profileMenu:{key}:{id}"), r.rect);
         if r.clicked() {
-            pick.0 = Some(p.id);
+            pick.0 = Some(id.to_string());
         }
         if r.hovered() {
-            pick.1 = Some(p.id);
+            pick.1 = Some(id.to_string());
         }
     };
     let heading = |ui: &mut egui::Ui, s: &str| {
         ui.label(egui::RichText::new(crate::i18n::tr(s)).font(t.semibold(11.5)).color(t.text_dim));
     };
     for (title, key, ids) in [("Favorites", "fav", app.session.profile_favorites.clone()), ("Recent", "recent", app.session.profile_recent.clone())] {
-        let list: Vec<_> = ids.iter().filter_map(|id| profile(id)).collect();
+        let list: Vec<_> = ids.iter().filter_map(|id| app.session.profile_info(id).map(|(name, _)| (id.as_str(), name))).collect();
         if list.is_empty() {
             continue;
         }
         heading(ui, title);
-        for p in list {
-            item(ui, key, p, &mut pick);
+        for (id, name) in list {
+            item(ui, key, id, name, &mut pick);
         }
         ui.separator();
     }
@@ -419,23 +436,37 @@ fn profile_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
         let r = ui.menu_button(crate::i18n::tr(g), |ui| {
             ui.set_min_width(170.0);
             for p in PROFILES.iter().filter(|p| p.group == g) {
-                item(ui, "group", p, &mut pick);
+                item(ui, "group", p.id, p.name, &mut pick);
             }
         });
         register(ui.ctx(), format!("profileMenu:groupMenu:{g}"), r.response.rect);
     }
+    // imported LUT profile groups
+    let mut lut_groups: Vec<String> = app.session.lut_profiles.iter().map(|p| p.group.clone()).collect();
+    lut_groups.sort_unstable();
+    lut_groups.dedup();
+    for g in &lut_groups {
+        // a folder's name as it is, and its own widget id even when it matches a built-in group
+        let r = ui.menu_button(g.as_str(), |ui| {
+            ui.set_min_width(170.0);
+            for p in app.session.lut_profiles.iter().filter(|p| &p.group == g) {
+                item(ui, "group", &p.id, &p.name, &mut pick);
+            }
+        });
+        register(ui.ctx(), format!("profileMenu:lutGroupMenu:{g}"), r.response.rect);
+    }
     ui.separator();
-    if let Some(p) = profile(cur) {
-        let fav = app.session.profile_favorites.iter().any(|f| f == p.id);
+    if let Some((name, _)) = app.session.profile_info(cur) {
+        let fav = app.session.profile_favorites.iter().any(|f| f == cur);
         let label = if fav {
-            crate::i18n::tr_format!("Remove “{}” from Favorites", crate::i18n::tr(p.name))
+            crate::i18n::tr_format!("Remove “{}” from Favorites", crate::i18n::profile_label(cur, name))
         } else {
-            crate::i18n::tr_format!("Add “{}” to Favorites", crate::i18n::tr(p.name))
+            crate::i18n::tr_format!("Add “{}” to Favorites", crate::i18n::profile_label(cur, name))
         };
         let r = ui.button(label);
         register(ui.ctx(), "profileMenu:toggleFavorite", r.rect);
         if r.clicked() {
-            let _ = app.run("profile.favorite", json!({"id": p.id}));
+            let _ = app.run("profile.favorite", json!({"id": cur}));
         }
     }
     let r = ui.button(crate::i18n::tr("Browse…"));
@@ -444,13 +475,15 @@ fn profile_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
         let _ = app.run("panel.profiles", json!({}));
     }
     // resting on a profile previews it in the loupe
-    if let Some(p) = pick.1.and_then(profile)
-        && p.id != cur
+    if let Some(hovered_id) = &pick.1
+        && hovered_id != cur
+        && let Some((name, _)) = app.session.profile_info(hovered_id)
     {
         let mut s = d.clone();
-        s.profile.id = p.id.to_string();
+        s.profile.id = hovered_id.clone();
         s.profile.amount = 100.0;
-        app.hover_preview = Some(crate::HoverPreview { label: crate::i18n::tr_format!("Profile: {}", crate::i18n::tr(p.name)), settings: s });
+        app.hover_preview =
+            Some(crate::HoverPreview { label: crate::i18n::tr_format!("Profile: {}", crate::i18n::profile_label(hovered_id, name)), settings: s });
     }
     if let Some(id) = pick.0 {
         let _ = app.run("develop.profile", json!({"id": id}));
@@ -612,7 +645,7 @@ fn soft_proofing(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         if r.clicked() {
             let name = crate::i18n::tr_format!("Proof Copy ({})", app.ui.proof.space.label());
             if app.run("photo.virtualCopy", json!({"ids": [id.0], "name": name})).is_ok() {
-                app.toast(ui.ctx(), "Proof copy created");
+                app.toast(ui.ctx(), crate::i18n::tr("Proof copy created"));
             }
         }
     });
@@ -1168,7 +1201,9 @@ fn quick_develop(app: &mut LightcraftApp, ui: &mut egui::Ui, n: usize) {
                 for (txt, d) in [("◀◀", -big), ("◀", -small), ("▶", small), ("▶▶", big)] {
                     let r = ui.add(egui::Button::new(egui::RichText::new(txt).size(10.0)).min_size(egui::vec2(28.0, 18.0)));
                     crate::widgets::register(ui.ctx(), format!("button:quick-{ctl}-{txt}"), r.rect);
-                    if r.on_hover_text(crate::i18n::tr_format!("{label} {d:+} on every selected photo", d = d, label = label)).clicked() {
+                    if r.on_hover_text(crate::i18n::tr_format!("{label} {d:+} on every selected photo", d = d, label = crate::i18n::tr(label)))
+                        .clicked()
+                    {
                         let _ = app.run("develop.quickAdjust", json!({"control": ctl, "delta": d}));
                     }
                 }

@@ -47,6 +47,19 @@ fn v1_library_loads_and_is_upgraded() {
     assert_eq!((r.replayed, r.upgraded_from), (1, None));
 }
 
+/// A library saved before albums could be ordered by hand opens as it was and is rewritten as v3.
+#[test]
+fn v2_library_loads_and_is_upgraded() {
+    let (base, log, full) = legacy_parts();
+    let m = MemStore::new();
+    m.set(SNAPSHOT, format!("{{\"format\":\"lightcraft-catalog\",\"version\":2,\"seq\":2,\"catalog\":{}}}\n", base.to_snapshot()).into_bytes());
+    m.set(LOG, log.into_bytes());
+    let (_, c, r) = Journal::open(Box::new(m.clone())).unwrap();
+    assert_eq!(c.to_snapshot(), full.to_snapshot());
+    assert_eq!((r.replayed, r.upgraded_from), (1, Some(2)));
+    assert_eq!(snapshot_version(&m), 3);
+}
+
 #[test]
 fn versionless_log_only_library_is_upgraded() {
     let mut c = Catalog::new();
@@ -179,8 +192,9 @@ fn op_variants_are_versioned() {
             | Op::SetLabelName { .. }
             | Op::Batch { .. } => 1,
             Op::SetBrowsed { .. } => 2,
+            Op::SetAlbumOrder { .. } => 3,
         }
     }
-    let newest = since(&Op::SetBrowsed { folder: String::new(), at: None });
+    let newest = since(&Op::SetAlbumOrder { id: AlbumId(0), order: None });
     assert_eq!(newest, VERSION, "the newest op's version must be the current format version");
 }

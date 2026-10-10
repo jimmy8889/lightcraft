@@ -57,6 +57,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("VIG_POWER", 1),
     ("VIG_HL", 1),
     ("VIG_STYLE", 1),
+    // the window's offset in the whole output and the whole output's size (pixels)
+    ("VIG_VIEW", 4),
     ("GRAIN", 1),
     ("GRAIN_AMT", 1),
     ("GRAIN_SC", 1),
@@ -211,6 +213,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
         p.f("VIG_ASPECT_MIX", v.aspect_mix);
         p.f("VIG_POWER", v.power);
         p.f("VIG_HL", v.highlights);
+        p.fs("VIG_VIEW", &fp.view);
         p.u(
             "VIG_STYLE",
             match v.style {

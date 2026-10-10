@@ -181,7 +181,11 @@ pub struct CameraTransform {
 
 /// Camera transform for white `wb_xy`: `rec2020 = matrix · (wb ⊙ camera)`.
 pub fn camera_transform(raw: &RawImage, wb_xy: Xy) -> CameraTransform {
-    let color = &raw.color;
+    camera_transform_of(&raw.color, wb_xy)
+}
+
+/// [`camera_transform`] from the colour tags alone.
+pub fn camera_transform_of(color: &ColorData, wb_xy: Xy) -> CameraTransform {
     let fallback = !has_matrix(color);
     let wb = wb_multipliers(color, wb_xy);
     let to_d50 = camera_to_xyz_d50(color, wb_xy);
@@ -190,6 +194,34 @@ pub fn camera_transform(raw: &RawImage, wb_xy: Xy) -> CameraTransform {
     let k = (white[0] + white[1] + white[2]) / 3.0;
     let matrix = if k.abs() > 1e-12 { Mat3(m.0.map(|r| r.map(|v| v / k))) } else { m };
     CameraTransform { matrix, wb: wb.map(|v| v as f32), white_xy: wb_xy, matrix_is_fallback: fallback, baseline_exposure: color.baseline_exposure }
+}
+
+/// Linear Rec.2020 → linear Rec.2020 matrix that re-develops pixels developed with the camera
+/// transform for white `from` as if developed for white `to`: the camera's own colour model is
+/// evaluated at the new white (camera-space white balance, DNG spec ch. 6), as Lightroom does, so
+/// a neutral lit by `to` comes out neutral. `None` when the tags have no colour matrix or the
+/// transform is singular.
+pub fn rebalance(color: &ColorData, from: Xy, to: Xy) -> Option<Mat3> {
+    if !has_matrix(color) {
+        return None;
+    }
+    let (a, b) = (camera_transform_of(color, from), camera_transform_of(color, to));
+    let ratio = Mat3::diag(f64::from(b.wb[0] / a.wb[0]), f64::from(b.wb[1] / a.wb[1]), f64::from(b.wb[2] / a.wb[2]));
+    Some(b.matrix.mul(&ratio).mul(&a.matrix.inverse()?))
+}
+
+/// The white under which `rgb` (linear Rec.2020, developed with the camera transform for white
+/// `developed_for`) is a neutral: the white [`rebalance`] must re-develop for to make it neutral
+/// (white-balance picker, auto white balance). `None` without a colour matrix, or when `rgb` maps
+/// to a non-positive camera value.
+pub fn neutral_white(color: &ColorData, developed_for: Xy, rgb: [f64; 3]) -> Option<Xy> {
+    if !has_matrix(color) {
+        return None;
+    }
+    let a = camera_transform_of(color, developed_for);
+    let balanced = a.matrix.inverse()?.apply(rgb);
+    let camera: [f64; 3] = std::array::from_fn(|i| balanced[i] / f64::from(a.wb[i]));
+    camera.iter().all(|v| v.is_finite() && *v > 0.0).then(|| neutral_to_xy(color, camera))
 }
 
 /// `(matrix, multipliers)` with `rec2020 = matrix · (multipliers ⊙ camera)`, linear Rec.2020 D65.
@@ -371,6 +403,30 @@ mod tests {
         assert_eq!(illuminant_temperature(17), Some(2856.0));
         assert_eq!(illuminant_temperature(0), None);
         assert_eq!(illuminant_temperature(255), None);
+    }
+
+    /// Camera-space white balance: re-developing for another white turns a neutral lit by that
+    /// white neutral (the camera's own matrices, interpolated for the new white, say how); the same
+    /// white is the identity; without a colour matrix there is nothing to re-evaluate.
+    #[test]
+    fn rebalance_redevelops_for_the_new_white() {
+        let color = ColorData { illuminant: [17, 21], color_matrix: [Some(cam_a()), Some(cam_b())], ..Default::default() };
+        let (from, to) = (cct::temp_tint_to_xy(5500.0, 0.0), cct::temp_tint_to_xy(3200.0, 10.0));
+        let a = camera_transform_of(&color, from);
+        // a grey card lit by `to`, as the camera records it, developed for `from`: warm
+        let n = camera_neutral(&color, to);
+        let developed = a.matrix.apply(std::array::from_fn(|i| n[i] * a.wb[i] as f64));
+        assert!(developed[0] > 1.2 * developed[2], "{developed:?}");
+        let out = rebalance(&color, from, to).unwrap().apply(developed);
+        assert!(close(out.map(|v| v / out[1]), [1.0; 3], 1e-6), "{out:?}");
+        let same = rebalance(&color, from, from).unwrap();
+        assert!((0..3).all(|r| close(same.0[r], Mat3::IDENTITY.0[r], 1e-9)), "{same:?}");
+        assert!(rebalance(&ColorData::default(), from, to).is_none());
+        // and back: the developed grey card names the white it was lit by
+        let white = neutral_white(&color, from, developed).unwrap();
+        assert!((white.x - to.x).abs() < 1e-6 && (white.y - to.y).abs() < 1e-6, "{white:?} vs {to:?}");
+        assert!(neutral_white(&color, from, [-1.0, 0.5, 0.5]).is_none());
+        assert!(neutral_white(&ColorData::default(), from, developed).is_none());
     }
 
     #[test]

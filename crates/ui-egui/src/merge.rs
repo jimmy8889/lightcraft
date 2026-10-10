@@ -268,7 +268,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
             Err(_) => {
                 let (f, stage) = t.progress.lock().map(|g| g.clone()).unwrap_or_default();
                 let now = ctx.input(|i| i.time);
-                app.ui.toast = Some((crate::i18n::tr_format!("Merging… {stage} {:.0}%", f * 100.0, stage = stage), now + 0.5));
+                app.ui.toast = Some((crate::i18n::tr_format!("Merging… {stage} {:.0}%", f * 100.0, stage = stage), now + 0.5, None));
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
@@ -320,7 +320,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, opts: &mut MergeDialog) 
                 } else {
                     let ev: Vec<String> =
                         info["ev"].as_array().map(|a| a.iter().filter_map(Value::as_f64).map(|v| format!("{v:+.1}")).collect()).unwrap_or_default();
-                    format!("{} photos · exposures {} EV", ev.len(), ev.join(" / "))
+                    crate::i18n::tr_format!("{} photos · exposures {} EV", ev.len(), ev.join(" / "))
                 };
                 ui.label(egui::RichText::new(txt).color(t.text_dim));
             }

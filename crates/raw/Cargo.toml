@@ -8,10 +8,6 @@ description = "LightCraft RAW decoding, demosaicing and DNG colour model (L1)"
 [lints]
 workspace = true
 
-[features]
-default = []
-pmrid = ["dep:candle-core", "dep:candle-nn", "dep:sha2", "dep:zip"]
-
 [dependencies]
 lightcraft-tiff = { workspace = true }
 lightcraft-meta = { workspace = true }
@@ -24,12 +20,21 @@ rayon = { workspace = true }
 miniz_oxide = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-core = { workspace = true }
+jxl-oxide = { workspace = true, optional = true }
 
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 sha2 = { version = "=0.10.9", default-features = false, optional = true }
 zip = { version = "=7.2.0", default-features = false, optional = true }
 
+[features]
+default = ["jxl"]
+jxl = ["dep:jxl-oxide"]
+pmrid = ["dep:candle-core", "dep:candle-nn", "dep:sha2", "dep:zip"]
+
 [dev-dependencies]
 jpeg-encoder = { workspace = true }
 proptest = { workspace = true }
+zune-jpegxl = { workspace = true }
+# Pinned CC0 corpus identities; not a product dependency.
+sha2 = { version = "0.10", default-features = false, features = ["std"] }

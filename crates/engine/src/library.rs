@@ -102,6 +102,8 @@ struct PresetsFile {
 struct ViewFile {
     source: LibrarySource,
     browse: Option<crate::Browse>,
+    /// The folder a `libraryFolder` source shows.
+    library_folder: Option<String>,
     // No filter: a library opens unfiltered. A date, keyword or person left over from the last session
     // would silently hide photos, with only a small badge to say so.
     sort: lightcraft_catalog::Sort,
@@ -298,6 +300,12 @@ impl Session {
         {
             log::error!("library: {e}");
         }
+        // Photo ids belong to one library; denoise work must not carry into the next.
+        self.denoise.library_changed();
+        self.media.denoise.clear();
+        // what was learned about the old library's faces is saved, and none of it carries over (photo ids are per library)
+        #[cfg(not(target_arch = "wasm32"))]
+        self.faces.library_changed();
         let (mut journal, mut catalog, report) = Journal::open(catalog)?;
         // A loaded catalog counts revisions from 0, like every other one. Caches (sidebar counts,
         // keyword tree, the grid's list…) are keyed on the revision, so give each library loaded
@@ -306,31 +314,19 @@ impl Session {
         static LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         catalog.revision = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1) << 32;
         self.catalog = catalog;
+        self.library_generation = crate::LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.undo.clear();
         self.redo.clear();
         self.interaction = None;
         self.pending_log.clear();
         self.selection = Selection::default();
         self.source = LibrarySource::All;
+        self.library_folder = None;
         if report.created && seed_demo {
             crate::demo::load(self);
             journal.snapshot(&self.catalog)?;
         }
         let mut settings = SettingsLoad::default();
-        // presets
-        if let Some(f) = settings.read::<PresetsFile>(files.as_mut(), "presets.json") {
-            for p in &mut self.presets {
-                p.favorite = p.builtin && f.favorites.contains(&p.id) || (!p.builtin && p.favorite);
-            }
-            for u in f.user {
-                if !self.presets.iter().any(|p| p.id == u.id) {
-                    self.presets.push(u);
-                }
-            }
-            let known = |id: &String| crate::presets::profile(id).is_some();
-            self.profile_favorites = f.profile_favorites.into_iter().filter(known).collect();
-            self.profile_recent = f.profile_recent.into_iter().filter(known).take(crate::presets::RECENT_PROFILES).collect();
-        }
         // preferences
         let prefs = settings.read::<PrefsFile>(files.as_mut(), "prefs.json").unwrap_or_default();
         self.xmp = prefs.xmp;
@@ -354,10 +350,34 @@ impl Session {
         if let Some(d) = &self.smart_previews_dir {
             self.media.smart_dir = Some(d.clone());
         }
+        // presets
+        if let Some(f) = settings.read::<PresetsFile>(files.as_mut(), "presets.json") {
+            for p in &mut self.presets {
+                p.favorite = p.builtin && f.favorites.contains(&p.id) || (!p.builtin && p.favorite);
+            }
+            for u in f.user {
+                if !self.presets.iter().any(|p| p.id == u.id) {
+                    self.presets.push(u);
+                }
+            }
+            let known = |id: &String| crate::presets::profile(id).is_some() || self.lut_profiles.iter().any(|p| &p.id == id);
+            self.profile_favorites = f.profile_favorites.into_iter().filter(known).collect();
+            self.profile_recent = f.profile_recent.into_iter().filter(known).take(crate::presets::RECENT_PROFILES).collect();
+        }
         // view state
         if let Some(v) = settings.read::<ViewFile>(files.as_mut(), "view.json") {
             self.source = v.source;
             self.browse = v.browse;
+            self.library_folder = v.library_folder.filter(|f| !f.trim().is_empty());
+            if self.source == LibrarySource::LibraryFolder {
+                // a folder that is gone (or none): everything, not an empty grid
+                let f = lightcraft_catalog::Filter { library_folder: self.library_folder.clone(), ..Default::default() };
+                let any = self.library_folder.is_some() && !self.catalog.query(&f, &lightcraft_catalog::Sort::default()).is_empty();
+                if !any {
+                    self.source = LibrarySource::All;
+                    self.library_folder = None;
+                }
+            }
             self.sort = v.sort;
             self.selection = v.selection;
             self.selection.ids.retain(|id| self.catalog.photo(*id).is_some());
@@ -387,7 +407,7 @@ impl Session {
             forgot_local: None,
             presets_written,
             view_written,
-            settings_warnings: settings.warnings,
+            settings_warnings: unlocked_warning(lock.as_ref()).into_iter().chain(settings.warnings).collect(),
             warnings_reported: 0,
             blocked: settings.blocked,
             lock: lock.take(),
@@ -404,6 +424,7 @@ impl Session {
                 lib.forgot_local = Some(plan);
             }
         }
+        self.library_identity = std::sync::Arc::new(());
         Ok(())
     }
 
@@ -496,16 +517,27 @@ impl Session {
             lib.retry_at = None;
             lib.last_error = None;
         }
-        match (persisted, snapshot) {
+        let result = match (persisted, snapshot) {
             (_, Ok(())) => Ok(()),
             // neither the log nor the snapshot took the queued ops
             (Err(EngineError::NotSaved(e)), Err(s)) if lib.journal.seq() == before => Err(EngineError::NotSaved(format!("{e}; snapshot: {s}"))),
             (_, Err(s)) => Err(s.into()),
+        };
+        if result.is_ok() {
+            self.library_identity = std::sync::Arc::new(());
         }
+        result
     }
 
     fn view_json(&self) -> Vec<u8> {
-        let view = ViewFile { source: self.source, browse: self.browse.clone(), sort: self.sort, selection: self.selection.clone() };
+        let view = ViewFile {
+            source: self.source,
+            browse: self.browse.clone(),
+            // only while it is shown: a leftover would be a stale choice nobody made
+            library_folder: self.library_folder.clone().filter(|_| self.source == LibrarySource::LibraryFolder),
+            sort: self.sort,
+            selection: self.selection.clone(),
+        };
         serde_json::to_vec_pretty(&view).unwrap_or_default()
     }
 
@@ -557,7 +589,8 @@ impl Session {
         lib.files.write_atomic("prefs.json", &v).map_err(|e| EngineError::Other(format!("prefs: {e}")))
     }
 
-    /// Settings-file warnings of the open library not handed out yet (the UI shows each once).
+    /// Warnings about the open library not handed out yet: its settings files, and a lock that
+    /// couldn't be taken (the UI shows each once; the CLI and MCP print them on stderr).
     pub fn take_library_warnings(&mut self) -> Vec<String> {
         let Some(lib) = self.library.as_mut() else { return vec![] };
         let new = lib.settings_warnings[lib.warnings_reported..].to_vec();
@@ -611,4 +644,16 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// The warning for a library opened without its one-program-at-a-time lock (issue #171): its
+/// file system can't lock `catalog.lock` (some network shares). It opens anyway, as documented —
+/// refusing would lock the user out — but the user must learn that a second program could open it.
+fn unlocked_warning(lock: Option<&LibraryLock>) -> Option<String> {
+    lock.filter(|l| !l.held()).map(|_| {
+        "This library could not be locked (its catalog.lock file can't be locked where it is stored, e.g. on some network \
+         shares), so it is open without protection against a second program: use it in one LightCraft app or command at \
+         a time, or changes made in one of them can be lost."
+            .to_string()
+    })
 }

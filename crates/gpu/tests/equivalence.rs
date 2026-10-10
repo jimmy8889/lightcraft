@@ -639,3 +639,123 @@ fn output_spaces_match() {
         }
     }
 }
+
+#[test]
+fn tint_directions_match_cpu_for_raw_and_rendered_sources() {
+    if !gpu() {
+        return;
+    }
+    let src = Arc::new(Rgb32f::filled(64, 64, [0.18; 3]));
+    for info in [
+        SourceInfo::default(),
+        SourceInfo { raw: true, relative_wb: true, ..Default::default() },
+        SourceInfo { raw: true, as_shot_temp: 4200.0, as_shot_tint: 15.0, ..Default::default() },
+    ] {
+        for delta in [-50.0, 50.0] {
+            let mut s = DevelopSettings::default();
+            s.wb.mode = WbMode::Custom;
+            s.wb.temp = info.as_shot_temp;
+            s.wb.tint = info.as_shot_tint + delta;
+            check("tint direction", &src, &info, &s, &RenderRequest::fit(64, 64));
+        }
+    }
+}
+
+/// Issue #323: windows of a zoomed frame. The GPU renders the window like the CPU does: the
+/// vignette and airlight belong to the whole frame, spots grow the window they work on.
+#[test]
+fn windows_match() {
+    if !gpu() {
+        return;
+    }
+    use lightcraft_pipeline::PixelWindow;
+    let src = scene(1, 960, 640);
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let win = PixelWindow { x: 1200, y: 800, w: 640, h: 480 };
+    let req = RenderRequest { window: Some(win), ..RenderRequest::fit(3000, 2000) };
+    let mut cases = cases();
+    cases.push(("vignette at the corner", |s| {
+        s.vignette.amount = -80.0;
+        s.vignette.midpoint = 10.0;
+    }));
+    cases.push(("spot reading from outside", |s| {
+        s.spots.push(Spot {
+            points: vec![Point::new(0.45, 0.45)],
+            size: 0.03,
+            feather: 30.0,
+            opacity: 100.0,
+            source_offset: Some(Point::new(0.15, 0.0)),
+            ..Default::default()
+        });
+    }));
+    for (name, edit) in cases {
+        let mut s = DevelopSettings::default();
+        edit(&mut s);
+        let name = format!("window: {name}");
+        check(&name, &src, &info, &s, &req);
+    }
+    // the corner window (where the vignette is strong)
+    let mut s = DevelopSettings::default();
+    s.vignette.amount = -80.0;
+    s.vignette.midpoint = 10.0;
+    let corner = RenderRequest { window: Some(PixelWindow { x: 2360, y: 1520, w: 640, h: 480 }), ..RenderRequest::fit(3000, 2000) };
+    check("window: vignette corner", &src, &info, &s, &corner);
+}
+
+/// Issue #323: a window of a 24 MP photo is cut from a source of 288 MB on the device. Keeping that
+/// upload with the view's stages counted it against the stage budget on every tick of a drag and
+/// got the stages cleared, and the upload and resampling redone: the window's stages are its own
+/// pixels, not the photo's.
+// (these two share the process's one big source: a test lock keeps them from replacing each other's)
+static BIG_SOURCE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn a_window_does_not_keep_the_whole_source_on_the_device() {
+    let _lock = BIG_SOURCE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !gpu() {
+        return;
+    }
+    use lightcraft_pipeline::PixelWindow;
+    let src = scene(1, 6000, 4000);
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let stages = StageCache::default();
+    let s = DevelopSettings::default();
+    let req = RenderRequest { window: Some(PixelWindow { x: 2000, y: 1500, w: 640, h: 480 }), ..RenderRequest::fit(6000, 4000) };
+    let _ = lightcraft_gpu::render(&src, &info, &s, &req, Some(&stages)).expect("gpu render");
+    let held = lightcraft_gpu::stage_bytes(&stages);
+    assert!(held < 100 << 20, "the view's GPU stages hold {} MiB for a 640×480 window", held >> 20);
+    // …and the next tick of a drag reuses what is there
+    let mut s2 = s.clone();
+    s2.light.exposure = 0.5;
+    let again = lightcraft_gpu::render(&src, &info, &s2, &req, Some(&stages)).expect("gpu render");
+    assert_eq!((again.image.width, again.image.height), (640, 480));
+    assert!(lightcraft_gpu::stage_bytes(&stages) < 100 << 20);
+}
+
+/// …but the 288 MB is uploaded once for every window of every view of the photo, not once per
+/// window: panning at 1:1, and the Before and After windows, share one device copy of it, which
+/// goes when the app idles (`trim_pool(0)`).
+#[test]
+fn windows_of_a_big_photo_share_one_uploaded_source() {
+    let _lock = BIG_SOURCE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !gpu() {
+        return;
+    }
+    use lightcraft_pipeline::PixelWindow;
+    let src = scene(1, 6000, 4000);
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let s = DevelopSettings::default();
+    let (after, before) = (StageCache::default(), StageCache::default());
+    let at = |x: usize| RenderRequest { window: Some(PixelWindow { x, y: 1500, w: 640, h: 480 }), ..RenderRequest::fit(6000, 4000) };
+    let start = lightcraft_gpu::source_uploads();
+    for (cache, x) in [(&after, 1000), (&after, 1256), (&after, 1512), (&before, 1512), (&before, 1768)] {
+        lightcraft_gpu::render(&src, &info, &s, &at(x), Some(cache)).expect("gpu render");
+    }
+    assert_eq!(lightcraft_gpu::source_uploads() - start, 1, "one upload for five windows of two views");
+    assert!(lightcraft_gpu::shared_source_bytes() >= 280_000_000, "{}", lightcraft_gpu::shared_source_bytes());
+    assert!(lightcraft_gpu::stage_bytes(&after) < 100 << 20, "and it is not in the views' stages");
+    lightcraft_gpu::trim_pool(0);
+    assert_eq!(lightcraft_gpu::shared_source_bytes(), 0, "an idle app gives it back");
+    lightcraft_gpu::render(&src, &info, &s, &at(1000), Some(&after)).expect("gpu render");
+    assert_eq!(lightcraft_gpu::source_uploads() - start, 2);
+}

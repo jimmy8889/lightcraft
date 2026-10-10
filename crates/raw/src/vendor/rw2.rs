@@ -43,7 +43,9 @@
 //!   reads as repeats of one code only in this order; MSB-first reading gives code frequencies of exactly
 //!   2^−length, the signature of random bits]. Tag `0x0040` lists (length, code) for 17 prefix codes, the difference
 //!   categories 0–16 of ITU-T T.81 (category `c`, then `c` additional bits, a leading 0 meaning negative). Pixels
-//!   are coded two rows at a time, cell by 2×2 cell (top-left, top-right, bottom-left, bottom-right); each is
+//!   are coded two rows at a time, cell by 2×2 cell, column by column (top-left, bottom-left, top-right,
+//!   bottom-right) [in row order the two greens trade sites: an edge's even and odd rows of green then sit ~2 px
+//!   apart with red and blue between them]; each is
 //!   predicted from the same site of the previous cell, the first cell of a row pair from the first cell of the
 //!   previous pair, 0 at the top [the strips decode to the camera JPEG's image without seams]. The streams end a
 //!   few padding rows before their stated length. Tags `0x0039`–`0x003f`, `0x0041` and `0x0043` carry the same
@@ -67,12 +69,38 @@
 //! - Active area: the sensor borders. Default crop: `0x002f`–`0x0032`, the in-camera aspect ratio (e.g. 4:3 or 1:1
 //!   on a 3:2 sensor; the embedded JPEG always shows the whole sensor). Some bodies write zeros there: ignored.
 //!
+//! Lens distortion (tag `0x0119`, ExifTool name DistortionInfo; ExifTool's names for its words were the only outside
+//! input, their meaning below is our own measurement). The tag holds 16 little-endian 16-bit words. The camera's
+//! own correction, which its embedded JPEG shows, is applied as an `OpcodeList3` `WarpRectilinear` (the DNG form
+//! LightCraft already applies under "Enable Profile Corrections"):
+//!
+//! - Word 7, low 4 bits: 1 = correction on [0 on the DMC-GH1, whose JPEG matches the uncorrected render].
+//! - Word 12: the normalisation radius in pixels, the half diagonal of the active area [2870 for 4592 × 3448
+//!   (2871.2), 3240 for 5184 × 3888, 3611 for 5776 × 4336, 3288 for the FZ1000 II's whole 5472 × 3648 sensor
+//!   even in its 4:3 mode].
+//! - Words 8, 4 and 11 (ExifTool: DistortionParam08, 04, 11), divided by 32768, are `k2`, `k4`, `k6` of the
+//!   correction: a sensor point at radius ρ (in units of word 12, about the centre of the active area) appears in
+//!   the corrected image at ρ·(1 + k2 ρ² + k4 ρ⁴ + k6 ρ⁶).
+//! - Word 5 (ExifTool: DistortionScale), divided by 32768, plus 1, is the zoom `z` the camera crops by afterwards:
+//!   output radius = corrected radius / z [z < 1 when the corrected corners would otherwise be empty].
+//!
+//! [These rules were chosen among alternative word orders, powers, directions and readings of the zoom by fitting
+//! radial curves between our uncorrected renders and the embedded JPEGs of 38 DMC-GX85 photos (12–32 mm and 25 mm
+//! lenses). With no free parameter the words then predict the curves of 35 held-out photos from 12 other bodies and
+//! 9 other lenses (9.1–105 mm: two compacts, Panasonic, Leica, Olympus, Sigma and Samyang lenses) within 0.12 % of
+//! the half diagonal, against up to 13 % uncorrected; corrected renders of all 79 photos line up with the camera
+//! JPEG within 0.75 px at 1440 px at every corner measured.] Words 2, 3, 6, 9, 10
+//! and 13 are not used (word 13 is always word 9 + 500; word 10 is fixed per body); words 0, 1, 14 and 15 change
+//! from shot to shot. The correction is radial, so it is fitted by the DNG form's odd polynomial `u·(kr0 + kr1 u² +
+//! kr2 u⁴ + kr3 u⁶)` over the output (within 0.4 px on a 20 MP sensor); implausible values (a radius far from the
+//! active area's, a zoom beyond ±25 %, a correction that folds over) leave the photo uncorrected.
+//!
 //! Not supported ([`RawError::Unsupported`], the embedded preview is shown instead): compression 34826, raw formats
 //! 1 and 3, and bit depths other than the ones above (no samples of any of them).
 
 use super::pef::{Bits, Huffman, diff};
 use super::white_from_data;
-use crate::{BlackLevel, Cfa, ColorData, MAX_SAMPLES, Mode, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result};
+use crate::{BlackLevel, Cfa, ColorData, MAX_SAMPLES, Mode, Opcode, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result};
 use lightcraft_geom::Orientation;
 use lightcraft_tiff::{ByteOrder, Ifd, Tiff, Value, tags as t};
 use rayon::prelude::*;
@@ -113,6 +141,14 @@ const FORMAT8_FIXED: [(u16, &[u16]); 9] = [
     (0x0041, &[17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
     (0x0043, &[1]),
 ];
+/// The camera's lens distortion correction (ExifTool name: DistortionInfo); see the module docs.
+const DISTORTION_INFO: u16 = 0x0119;
+/// Fixed-point one of the distortion coefficients and zoom.
+const DISTORTION_ONE: f64 = 32768.0;
+/// Output radii sampled to fit the inverse mapping.
+const DISTORTION_SAMPLES: usize = 64;
+/// Largest error of the fitted inverse (relative to the half diagonal) accepted: real lenses fit within 1.2e-4.
+const DISTORTION_MAX_FIT_ERROR: f64 = 1e-3;
 /// Most strips seen in a file is 3 (the 12008 × 8008 high-resolution mode).
 const MAX_STRIPS: usize = 64;
 
@@ -401,7 +437,7 @@ fn decode_strip(s: &Strip, codes: &Huffman, mut rows: Vec<&mut [u16]>) -> Result
             for (k, v) in cell.iter_mut().enumerate() {
                 let d = diff(&mut bits, codes).ok_or_else(|| RawError::Corrupt(format!("RW2 format 8: invalid code in row {}", 2 * pair)))?;
                 *v = v.saturating_add(d);
-                if let Some(px) = rows.get_mut(2 * pair + k / 2).and_then(|r| r.get_mut(2 * cx + k % 2)) {
+                if let Some(px) = rows.get_mut(2 * pair + k % 2).and_then(|r| r.get_mut(2 * cx + k / 2)) {
                     *px = (*v).clamp(0, u16::MAX as i32) as u16;
                 }
             }
@@ -586,11 +622,119 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         color: ColorData::default(),
         wb_multipliers: wb,
         linearized: false,
-        opcodes: OpcodeLists::default(),
+        opcodes: OpcodeLists { list3: distortion(ifd0, active).into_iter().collect(), ..Default::default() },
         metadata,
     };
     img.validate_for(mode)?;
     Ok(img)
+}
+
+/// The camera's distortion correction (tag `0x0119`, see the module docs) as the equivalent DNG `WarpRectilinear`
+/// opcode for `OpcodeList3` (relative to the active area), so it reaches the same "profile corrections" as a DNG's
+/// embedded warp. `None` when the camera recorded the correction as off, when it is the identity, or when the
+/// values are implausible (the photo is then shown uncorrected rather than wrongly warped).
+fn distortion(ifd: &Ifd, active: Rect) -> Option<Opcode> {
+    let b = ifd.bytes(DISTORTION_INFO)?;
+    let word = |i: usize| -> Option<[u8; 2]> { b.get(2 * i..2 * i + 2)?.try_into().ok() };
+    let signed = |i: usize| word(i).map(|w| i16::from_le_bytes(w) as f64);
+    if u16::from_le_bytes(word(7)?) & 0x000f != 1 {
+        return None;
+    }
+    let (k2, k4, k6) = (signed(8)? / DISTORTION_ONE, signed(4)? / DISTORTION_ONE, signed(11)? / DISTORTION_ONE);
+    let zoom = 1.0 + signed(5)? / DISTORTION_ONE;
+    let radius = u16::from_le_bytes(word(12)?) as f64;
+    if k2 == 0.0 && k4 == 0.0 && k6 == 0.0 && zoom == 1.0 {
+        return None;
+    }
+    // DNG's normalisation: the distance from the centre to the farthest corner, in pixel-index units
+    let half_diag = (active.width as f64 - 1.0).hypot(active.height as f64 - 1.0) / 2.0;
+    if !(half_diag >= 1.0 && (0.5 * half_diag..=2.0 * half_diag).contains(&radius) && (0.75..=1.25).contains(&zoom)) {
+        return None;
+    }
+    // the camera's correction: a source point at radius ρ (in units of `radius`) moves to ρ·g(ρ)
+    let corrected = |r: f64| {
+        let r2 = r * r;
+        r * (1.0 + r2 * (k2 + r2 * (k4 + r2 * k6)))
+    };
+    // the output corners show corrected radius `t_max`; the map must rise monotonically to it (a fold is no lens)
+    let t_max = half_diag * zoom / radius;
+    let mut top = None;
+    let mut prev = 0.0;
+    for i in 1..=4096 {
+        let r = 3.0 * t_max * i as f64 / 4096.0;
+        let v = corrected(r);
+        if v.is_nan() || v <= prev {
+            return None;
+        }
+        prev = v;
+        if v >= t_max {
+            top = Some(r);
+            break;
+        }
+    }
+    let top = top?;
+    let source = |t: f64| {
+        let (mut lo, mut hi) = (0.0, top);
+        for _ in 0..60 {
+            let m = 0.5 * (lo + hi);
+            if corrected(m) < t { lo = m } else { hi = m }
+        }
+        0.5 * (lo + hi)
+    };
+    // least-squares fit of source radius = u·(kr0 + kr1·u² + kr2·u⁴ + kr3·u⁶) over the output radii u ∈ [0, 1]
+    let samples: Vec<(f64, f64)> = (0..=DISTORTION_SAMPLES)
+        .map(|i| {
+            let u = i as f64 / DISTORTION_SAMPLES as f64;
+            (u, source(u * t_max) * radius / half_diag)
+        })
+        .collect();
+    let basis = |u: f64| {
+        let u2 = u * u;
+        [u, u * u2, u * u2 * u2, u * u2 * u2 * u2]
+    };
+    let mut a = [[0.0; 4]; 4];
+    let mut rhs = [0.0; 4];
+    for &(u, v) in &samples {
+        let f = basis(u);
+        for (i, fi) in f.iter().enumerate() {
+            for (j, fj) in f.iter().enumerate() {
+                a[i][j] += fi * fj;
+            }
+            rhs[i] += fi * v;
+        }
+    }
+    let k = solve4(a, rhs)?;
+    let fit = |u: f64| basis(u).iter().zip(&k).map(|(f, c)| f * c).sum::<f64>();
+    let worst = samples.iter().map(|&(u, v)| (fit(u) - v).abs()).fold(0.0, f64::max);
+    if worst.is_nan() || worst > DISTORTION_MAX_FIT_ERROR {
+        return None;
+    }
+    Some(Opcode::WarpRectilinear { planes: vec![[k[0], k[1], k[2], k[3], 0.0, 0.0]], center: [0.5, 0.5] })
+}
+
+/// Solve the 4 × 4 system `a·x = b` (Gaussian elimination with partial pivoting); `None` when singular or not finite.
+fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
+    for c in 0..4 {
+        let p = (c..4).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))?;
+        if a[p][c].is_nan() || a[p][c].abs() <= 1e-300 {
+            return None;
+        }
+        a.swap(c, p);
+        b.swap(c, p);
+        for r in c + 1..4 {
+            let f = a[r][c] / a[c][c];
+            for k in c..4 {
+                a[r][k] -= f * a[c][k];
+            }
+            b[r] -= f * b[c];
+        }
+    }
+    let mut x = [0.0; 4];
+    for c in (0..4).rev() {
+        let s: f64 = (c + 1..4).map(|k| a[c][k] * x[k]).sum();
+        x[c] = (b[c] - s) / a[c][c];
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
 #[cfg(test)]
@@ -853,6 +997,76 @@ mod tests {
         }
     }
 
+    /// A tag-0x0119 block: 16 little-endian words, the given ones set.
+    fn distortion_block(words: &[(usize, i16)]) -> Value {
+        let mut w = [0i16; 16];
+        for &(i, v) in words {
+            w[i] = v;
+        }
+        Value::Undefined(w.iter().flat_map(|v| v.to_le_bytes()).collect())
+    }
+
+    fn distorted(info: Option<Value>) -> Vec<Opcode> {
+        let (w, h) = (90usize, 60usize);
+        let px: Vec<u16> = (0..w * h).map(|i| (i % 4000) as u16 + 1).collect();
+        let mut tags = vec![short(CFA_PATTERN, 1), short(BITS, 12), short(RAW_FORMAT, 5)];
+        tags.extend(info.map(|v| (DISTORTION_INFO, v)));
+        let bytes = file(w as u16, h as u16, &tags, &rotate(pack(&px, 12)), &|off| vec![(RAW_OFFSET, Value::Long(vec![off]))]);
+        let r = crate::decode(&bytes).unwrap();
+        assert_eq!(crate::probe_info(&bytes).unwrap().opcodes, r.opcodes, "headers-only probe reads the same correction");
+        r.opcodes.list3
+    }
+
+    /// Known answer: correction k2 = 4096/32768 = 1/8 (word 8), zoom 1 − 1024/32768 (word 5), radius 51 px (word 12)
+    /// on an 86 × 58 active area. A sensor point at ρ appears at ρ + ρ³/8, so the output corner (corrected radius
+    /// t = half diagonal · zoom / 51) shows the root of ρ³ + 8ρ − 8t = 0, here by Cardano's formula.
+    #[test]
+    fn distortion_correction_becomes_a_rectilinear_warp() {
+        let on = |more: &[(usize, i16)]| {
+            let mut w = vec![(7, 0x0001), (8, 4096), (5, -1024), (12, 51)];
+            w.extend_from_slice(more);
+            distortion_block(&w)
+        };
+        let ops = distorted(Some(on(&[])));
+        let [Opcode::WarpRectilinear { planes, center }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!((planes.len(), *center), (1, [0.5, 0.5]));
+        let k = planes[0];
+        assert_eq!((k[4], k[5]), (0.0, 0.0), "radial only");
+        let half_diag = 85f64.hypot(57.0) / 2.0;
+        for u in [0.1, 0.25, 0.5, 0.75, 1.0] {
+            let t = u * half_diag * (1.0 - 1024.0 / 32768.0) / 51.0;
+            let (p, q) = (8.0, -8.0 * t);
+            let d = (q * q / 4.0 + p * p * p / 27.0).sqrt();
+            let rho = (-q / 2.0 + d).cbrt() + (-q / 2.0 - d).cbrt();
+            let want = rho * 51.0 / half_diag;
+            let got = u * (k[0] + k[1] * u * u + k[2] * u.powi(4) + k[3] * u.powi(6));
+            // the 4-term odd polynomial approximates the exact inverse (5e-5 of the half diagonal ≈ 0.2 px at 20 MP)
+            assert!((got - want).abs() < 5e-5, "u {u}: source radius {got}, want {want}");
+        }
+
+        // no correction: no block, recorded as off, or the identity
+        assert!(distorted(None).is_empty());
+        assert!(distorted(Some(distortion_block(&[(7, 0x0000), (8, 4096), (12, 51)]))).is_empty(), "off");
+        assert!(distorted(Some(distortion_block(&[(7, 0x7f00u16 as i16), (8, 4096), (12, 51)]))).is_empty(), "off, other bits set");
+        assert!(distorted(Some(distortion_block(&[(7, 0x0001), (12, 51)]))).is_empty(), "identity");
+        // hostile values are ignored, never a panic or a wild warp
+        for (what, block) in [
+            ("truncated", Value::Undefined(vec![1, 0, 2, 0, 3])),
+            ("radius 0", on(&[(12, 0)])),
+            ("radius far beyond the sensor", on(&[(12, -1)])),
+            ("zoom 0", on(&[(5, -32768)])),
+            ("folds over", on(&[(8, -32768)])),
+            ("folds over at high order", on(&[(11, -32768), (4, -32768)])),
+            ("runs away", on(&[(8, 32767), (4, 32767), (11, 32767)])),
+        ] {
+            let ops = distorted(Some(block));
+            assert!(ops.iter().all(|op| !matches!(op, Opcode::WarpRectilinear { .. })) || what == "runs away", "{what}: {ops:?}");
+            if let [Opcode::WarpRectilinear { planes, .. }] = ops.as_slice() {
+                assert!(planes[0].iter().all(|c| c.is_finite()), "{what}");
+            }
+        }
+    }
+
     #[test]
     fn packed_and_word_formats() {
         let (w, h) = (90usize, 200usize); // > one chunk of data
@@ -962,7 +1176,7 @@ mod tests {
             let mut cell = first;
             for cx in 0..w / 2 {
                 for (k, p) in cell.iter_mut().enumerate() {
-                    let v = at(2 * cx + k % 2, 2 * pair + k / 2);
+                    let v = at(2 * cx + k / 2, 2 * pair + k % 2);
                     let d = v - *p;
                     let c = 32 - d.unsigned_abs().leading_zeros();
                     let (len, code) = table[c as usize];
@@ -1024,6 +1238,26 @@ mod tests {
             assert_eq!(crate::probe_info(&bytes).unwrap(), r.info());
             assert_eq!(r.black.mean(), 512.0, "format 8 stores samples at the recorded black level");
         }
+    }
+
+    #[test]
+    fn format8_cell_is_coded_column_by_column() {
+        // One 2×2 cell coded by hand (not with `encode_strip`, which shares the decoder's site order): the values
+        // 1, 2, 3, 4 in stream order. Row order would put the two greens of an RGGB cell on each other's sites.
+        let mut bits: Vec<bool> = vec![];
+        let mut put = |n: u32, v: u32| bits.extend((0..n).rev().map(|i| v >> i & 1 == 1));
+        for v in [1u32, 2, 3, 4] {
+            let c = 32 - v.leading_zeros();
+            let (len, code) = TABLE14[c as usize];
+            put(len, code);
+            put(c, v);
+        }
+        let n = bits.len() as u64;
+        let mut data: Vec<u8> = bits.chunks(8).map(|b| b.iter().enumerate().fold(0u8, |a, (i, &x)| a | (x as u8) << i)).collect();
+        data.extend([0; 8]);
+        let (mut top, mut bottom) = ([0u16; 2], [0u16; 2]);
+        decode_strip(&Strip { data: &data, width: 2, height: 2, bits: n }, &code_table(&TABLE14).unwrap(), vec![&mut top, &mut bottom]).unwrap();
+        assert_eq!((top, bottom), ([1, 3], [2, 4]), "top-left, bottom-left, top-right, bottom-right");
     }
 
     fn replace(tags: &mut Vec<(u16, Value)>, tag: u16, v: Value) {

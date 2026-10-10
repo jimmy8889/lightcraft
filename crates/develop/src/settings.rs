@@ -88,11 +88,16 @@ pub struct Profile {
     pub id: String,
     /// Creative profile amount 0..200 (%).
     pub amount: f64,
+    /// Render the raw's own local tone mapping (DNG `ProfileGainTableMap`, Apple ProRAW), as the
+    /// camera does. Off: rendered as Lightroom Classic does, without it. Omitted when off, so
+    /// settings without it keep their JSON (and hash).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub camera_local_tone: bool,
 }
 
 impl Default for Profile {
     fn default() -> Self {
-        Self { id: "lc.color".into(), amount: 100.0 }
+        Self { id: "lc.color".into(), amount: 100.0, camera_local_tone: false }
     }
 }
 
@@ -158,6 +163,7 @@ impl WbMode {
 pub struct WhiteBalance {
     pub mode: WbMode,
     pub temp: f64,
+    /// Correction direction: negative adds green, positive adds magenta.
     pub tint: f64,
 }
 
@@ -546,8 +552,9 @@ impl Default for Optics {
     }
 }
 
-/// Lens corrections embedded in a DNG file (`OpcodeList3`: `WarpRectilinear`, `FixVignetteRadial`), converted
-/// to the oriented, default-cropped image. This is camera/file data (stored on the photo record, not in the develop
+/// Lens corrections embedded in the file, converted to the oriented, default-cropped image: a DNG's `OpcodeList3`
+/// (`WarpRectilinear`, `FixVignetteRadial`), or a raw reader's equivalent of the camera's own correction (Panasonic /
+/// Leica RW2 distortion, `lightcraft_raw`'s `vendor/rw2.rs`). This is camera/file data (stored on the photo record, not in the develop
 /// settings); "Enable Profile Corrections" applies it, scaled by the profile distortion/vignetting amounts.
 /// LightCraft never uses Adobe LCP lens profiles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -920,6 +927,14 @@ pub struct LensBlur {
 #[serde(default)]
 pub struct Enhance {
     pub denoise: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denoise_on: Option<bool>,
     pub raw_details: bool,
     pub super_resolution: bool,
+}
+
+impl Enhance {
+    pub fn denoise_enabled(&self) -> bool {
+        self.denoise_on.unwrap_or(self.denoise > 0.0)
+    }
 }

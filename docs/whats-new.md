@@ -2,9 +2,87 @@
 
 ## October 2026
 
+### Masking
+- Drag anywhere inside the selected radial gradient's ellipse to move it, including rotated
+  ellipses and radial components in compound masks. Edge and rotation handles keep their existing
+  functions, and one Undo restores the entire drag.
+
+### Albums tree
+- Album folders fold with the same disclosure triangle as Local, By Date, Folders and Keywords.
+- Right-click a folder ▸ New ▸ Create Album… / Create Smart Album… / Create Smart Album from Filter… / Create Folder…
+  makes it inside that folder (`dialog.newAlbum`, `dialog.newFolder`, `dialog.smartAlbum`, `dialog.newSmartAlbum` take `parent`).
+- Drag an album or folder onto a folder to move it there (a closed folder opens after 0.6 s under the pointer; a
+  "Albums" header takes it back to the top level; Esc cancels; holding a dragged album or photos near the top or bottom edge of the sidebar scrolls it). Drop on the top or bottom half of another album,
+  or the edge of another folder, to place it before or after it: that folder is then ordered by hand. Right-click ▸
+  Sort Contents A–Z (or ＋ ▸ Sort Albums A–Z at the top level) goes back to by name. To put a folder after an open
+  folder, fold that folder first (the bottom of an open folder means "inside"). Agents use `album.reorder`
+  (`id`, `parent?`, `before?`) and `album.sort`.
+- The catalog format is now version 3 (`Album.order`, `Op::SetAlbumOrder`). Once this version has opened a library,
+  older versions refuse it, as with every format change.
+
+### AI RAW denoise
+- Detail has a per-photo AI Denoise switch and Amount. Bayer RAW photos use a disposable cache, with matching previews and exports and pure-Rust CPU/GPU inference.
+- Models are installed separately after accepting their terms; no weights are bundled. See [setup and limitations](denoise.md).
+
+### Library keyboard culling
+- Colour labels tint thumbnail surrounds in Square Grid and the Detail filmstrip, and a translucent footer along the bottom of the photo in Photo Grid. Label confirmations use a matching pale colour.
+- Setting or clearing a colour label shows a brief bottom confirmation, like rating a photo; custom label names appear in the message too.
+- On macOS, ratings `0–5`, labels `6–9` and pick/unflag `P/U` now reach the app even when shown in the native menu (issue #283; adapted from PR #261).
+- `Shift+6–9` labels and advances. `Shift+P` picks and advances in Photo Grid and Square Grid; it opens Presets in other views. With Auto Advance on, Shift still moves only once.
+- Help → Keyboard Shortcuts includes the number-key bindings. See [library shortcuts](library-shortcuts.md).
+
+### Keyboard shortcuts
+- Shortcuts are editable: Help ▸ Keyboard Shortcuts (⌘/) lists every command with a search box; click a shortcut and
+  press the new keys (Esc cancels), × removes it, ↺ restores the original, Reset All undoes every change. A key that
+  belonged to another command moves to the new one. Menus show the new keys; agents use `app.setShortcut`.
+
 ### RAW decoding
+- Samsung SRW files without compression now open as raws: NX5, NX10, NX11, NX20, NX200, NX210, NX1000, NX1100, EX1
+  and WB2000. The compressed ones (NX1, NX30, NX300, NX500, NX2000, NX3000, NX3300, NX mini) still open from their
+  camera JPEG. Photos already imported pick the change up on Reload.
+- Canon CR2 and Pentax PEF raws get the same starting look fitted to the camera's own JPEG as ARW, NEF, RW2, RAF
+  and CR3, instead of opening flat and desaturated (issue #310). Photos already imported pick it up when re-rendered.
+- JPEG XL compressed DNGs (DNG 1.7) now open: lossless tiles decode sample for sample (checked on synthetic files);
+  lossy tiles decode too, keeping the raw values above 1.0 instead of clipping them (checked on one real file). A tile that cannot be decoded makes the file open from its embedded
+  preview, with the reason, instead of showing a black tile. A JPEG XL preview stored in the DNG is used like an
+  embedded JPEG.
+- Apple ProRAW's gain table map (its local tone mapping, `ProfileGainTableMap`) is now read and kept when a photo is
+  exported or converted to DNG. It is not applied by default: Lightroom Classic renders ProRAW without it. To see a
+  ProRAW the way the iPhone renders it, turn on Profile ▸ Camera local tone mapping (shown for photos that carry the
+  map); the option is per photo, so presets and Copy Settings carry it.
+- iPhone ProRAW and other DNGs that carry their own segmentation mattes (DNG semantic masks) use them for the Select
+  Sky, Subject and Background masks instead of our heuristics, so the sky is selected where the camera found it
+  (checked on one CC0 iPhone 12 Pro ProRAW). Photos without mattes are unchanged.
+- Panasonic and Leica raws (RW2, RWL) are now corrected for lens distortion the way the camera corrects its own JPEG
+  (issue #256): the correction the camera records in the file is applied under Lens Corrections ▸ Enable Profile
+  Corrections, on by default for newly imported photos, with the same framing as the camera's JPEG. At 12 mm the
+  12–32 mm kit zoom was off by about 5 % of the image width at the corners before. Files shot with the correction off
+  are unchanged; photos imported before this change get it when imported again.
+- Canon CR3 raws now develop from their sensor data: lossless RAW and C-RAW, checked sample for sample on the EOS
+  M50, R100 and R8. CR3 files the decoder can't read yet still open from their embedded JPEG, as before.
+- Canon EOS R7 C-RAW files develop from their sensor data too, instead of opening from their embedded JPEG. For R7
+  C-RAWs imported earlier, Photo ▸ Reload from Disk picks up the raw data.
+- Canon CRW, Minolta MRW, Sigma X3F, Kodak KDC, Leaf MOS and Epson ERF files that LightCraft can't decode yet
+  now import as "preview only" with their embedded JPEG instead of failing. A raw whose data is damaged but whose
+  preview is intact does the same.
+- Raw files whose raw data sits in a private block of a TIFF (Phase One / Leaf IIQ, Canon EOS-1D / 1Ds and Kodak DCS
+  TIFFs) are no longer opened as a thumbnail-sized ordinary image. They are recognised as raws LightCraft can't decode
+  yet and import as "preview only", with the reason.
 - Sony ILCE-7M4 downsized lossless ARWs now decode subsampled YCbCr tiles into linear RGB,
   preserving RAW editing & full-resolution export instead of using embedded JPEG previews.
+- Sony A7R II (and other) raws whose camera JPEG is lens-corrected no longer open grey and too dark (issue #232): the
+  starting look is fitted to the camera JPEG away from edges when the misaligned edges spoil the fit on all pixels.
+
+### Lightroom Classic catalogs
+- File → Import Lightroom Catalog… opens `.lrcat` directly, with originals referenced in place.
+  Ratings, flags, labels, keywords, collections/sets, virtual copies and supported edits migrate;
+  existing LightCraft edits are preserved by default. Source settings/history are archived, unsupported
+  fields are reported, and the original Lightroom database stays read-only. Rendering is approximate.
+
+### Formats
+- HEIC / HEIF photos (iPhone and Mac) open now: the optional `lightcraft-heif` crate (heic-rs, pure Rust) behind
+  codecs' `heif` feature — 8- and 10-bit, alpha, grid tiles, the container's rotation/mirror/crop, ICC, EXIF and XMP.
+  Off by default (HEVC patents are the distributor's call, same as PhotoCraft); official builds pass `--features heif`.
 
 ### Presets and profiles
 - Import presets from other editors: XMP presets, classic `.lrtemplate` files, "DNG presets" from mobile apps and `.zip`
@@ -12,14 +90,81 @@
 - Luminar looks: `.lmp` files and `.mplumpack` collections import as presets (grouped by collection); the sliders
   with a counterpart here come along, the rest is listed.
 - 23 new built-in presets: Portrait, Landscape, Urban, Food, Seasons, Vintage and B&W toners.
+- Importing XMP presets no longer lists bookkeeping fields (`Cluster`, `SortName`, `SupportsAmount2`, the as-shot
+  white, empty Point Color slots…) as settings that couldn't be carried over.
+- A preset whose lens-profile switch is off no longer turns off the lens corrections built into a DNG (iPhone ProRAW
+  and other files with embedded distortion / vignetting corrections), matching what the preset does elsewhere.
+- A red / green / blue curve in an XMP preset without the master curve is ignored, as Lightroom ignores it.
+- Imported `.cube` LUT profiles appear in the Profile menu and the profile browser, grouped by their folder, and stay
+  favourites across restarts (issue #328).
+
+### Editing
+- The Tint slider works the right way round (issues #188, #321): left adds green, right adds magenta, as its track
+  shows and as in Lightroom, and Tint values in Lightroom XMP sidecars now render as they do there. A custom Tint
+  saved in an earlier version now shifts the other way; set it again (or re-run Auto / the white-balance picker).
+- White balance on DNGs (and other raws with a colour matrix) re-develops the photo for the new white through the
+  camera's own colour matrices, as Lightroom does, instead of shifting the colours of the as-shot rendering: a grey
+  lit by the chosen white comes out grey and saturated colours move as the camera records them. The eyedropper and
+  Auto use the same model. Custom white balances on these photos render slightly differently than before.
+- Crop (issue #295): a Lock toggle keeps the aspect ratio on every handle, Custom takes your own ratio (Apply), and
+  dragging a handle into the image edge stops there instead of pushing the crop out of shape.
+
+### Library and views
+- Trackpads: pinch to zoom around the pointer and scroll with two fingers to pan the photo; panning keeps the photo
+  inside the view. A plain mouse wheel over a zoomed photo pans it too.
+- A Folders section in the sidebar lists the folders your photos were imported from; choose one to see its photos.
+- Select All and multi-selection show every selected photo in the grid and filmstrip, not only the active one
+  (issues #187, #298). Importing files that are in Recently Deleted asks whether to leave them there, restore them
+  (with their edits) or import them as new; the trash view's Photo menu has Empty Recently Deleted.
+- The Import Photos review opens bigger and can be resized; its photo grid fills it (issue #337). Shift-click checks
+  or unchecks a range of photos (issue #338).
+- When a folder holds several file types, the Import Photos review has a toggle per type (`ARW · 120`, `JPG · 120`):
+  import only the raws and leave the JPEGs beside them (issue #344).
+
+### Languages
+- The interface is available in Spanish (issue #371), German and Russian (Edit ▸ Language), alongside English,
+  Chinese (Simplified and Traditional), Japanese and Brazilian Portuguese.
+
+### Editing
+- Type an exact value into any slider (issue #322): click the number next to its name, type (`1.5`, `-20`, `5600`)
+  and press Return; Esc keeps the old value.
+
+### Editing
+- The eye on the Light, Color and Detail section headers now hides their adjustments, as it already did for Effects,
+  Optics, Geometry and Calibration (issue #316).
+
+### Library
+- Choosing a date under By Date or a keyword under Keywords shows those photos from All Photos, as their counts
+  promise, instead of filtering whatever album or folder was open, which often showed nothing (issue #341).
+)
+)
 
 ### Reliability
+- If the desktop app can't open its window (for example when no graphics device can be used), it now says so in a
+  message box that names the log file, instead of quitting without a trace (issue #260).
+- On macOS, single-key shortcuts that appear in the menu bar now work: E, C, H, M, ⇧P, I, K, D, ratings 0–5,
+  labels 6–9, P / U and the rest did nothing, because macOS only passes ⌘ / ⌃ combinations and function keys
+  to the menu bar and the app ignored those keys, assuming the menu bar would handle them. Keys outside the menus
+  (Space, G, X, ⌫) and ⌘ shortcuts were not affected.
+- `--memory` sessions keep their promise to save nothing (issues #164, #169): UI changes made in one no longer
+  land in `ui.json` (where they replaced the saved settings), and the GPU crash sentinel no longer creates the
+  settings folder there. The same goes for the temporary session offered when the library can't be opened.
+- The desktop app keeps a log file: `logs/lightcraft.log` in its settings folder (Linux `~/.config/lightcraft/logs/`),
+  with the logs of the two previous runs beside it, so warnings and crashes of a run started from a desktop menu or the
+  Dock can be attached to a bug report. `LIGHTCRAFT_LOG` works as before; `RUST_LOG` takes env_logger-style
+  directives. See README → Quick start → Logs.
+- Help → Open Log Folder shows that log file in the file manager (Finder, Explorer, or the folder on Linux), so it
+  can be attached to a report without hunting for the settings folder (issue #260).
+- `lightcraft-cli` logs warnings on stderr too (issue #168); `LIGHTCRAFT_LOG` or `RUST_LOG` picks another level.
 - LightCraft no longer crashes at launch on Windows PCs whose Vulkan driver is broken (issue #136, e.g. some Intel UHD
   630 drivers): on Windows the window and GPU rendering use DirectX 12 only and never load the Vulkan driver unless
   asked to. `LIGHTCRAFT_GPU_BACKEND=dx12 | vulkan | metal | off` (or wgpu's `WGPU_BACKEND`, which GPU rendering
   ignored before) chooses the graphics backend; `off` renders on the CPU. The GPU now starts after the window
   is up, and only when Settings ▸ Performance ▸ Use the GPU for rendering is on; if LightCraft ever dies while
   starting the GPU, the next launch starts with GPU rendering off and says how to turn it back on.
+- The Windows app no longer quits at launch with "Parent device is lost" when another program's `dxcompiler.dll` is
+  on the DLL search path without its `dxil.dll` (issue #471): DirectX 12 shaders now always compile with the
+  compiler built into Windows (FXC). `WGPU_DX12_COMPILER=dxc` uses a `dxcompiler.dll` instead.
 - Exports and renders never write over a photo's original (issue #93): exporting into the photo's own folder with
   the same name and "Overwrite" (or Export with Previous repeating it), an exact output path from the control
   channel or MCP, a merge preview path or `lightcraft-cli render IMG.jpg -o IMG.jpg` is refused with a clear
@@ -135,6 +280,9 @@
   lost everything at quit; a temporary session shows a banner the whole time and never writes to your library.
 
 ### Editing
+- Optional remote SAM 3: keep the native editor local and run Object, Describe, and detail
+  inference on a Mac through SSH. Saved masks still render and export offline.
+  See [remote Metal inference](ai-masks.md#remote-metal-inference).
 - AI masks with SAM 3 (Object and Describe in the Masking panel): click an object to select it (⌥-click leaves a
   part out), or type what to select ("sky", "the red car", "car, road"); both combine with other masks, have an
   Edge setting, and get a sharper zoomed-in pass in the background. The model runs inside LightCraft in pure Rust

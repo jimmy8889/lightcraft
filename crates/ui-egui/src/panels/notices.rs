@@ -29,10 +29,12 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
     match app.session.unsaved() {
         None => true,
         Some((n, e)) => {
-            app.quit_prompt = Some(format!(
-                "{} couldn't be written to disk: {e}\nIf you quit now, {} lost.",
-                if n == 1 { "1 change".to_string() } else { format!("{n} changes") },
-                if n == 1 { "it is" } else { "they are" }
+            app.quit_prompt = Some(crate::i18n::tr_format!(
+                "{n} change{} couldn't be written to disk: {e}\nIf you quit now, {} lost.",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it is" } else { "they are" },
+                n = n,
+                e = e
             ));
             false
         }
@@ -55,7 +57,7 @@ fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, buttons: &[(&s
     });
     let mut chosen = None;
     let frame = egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::symmetric(18, 14));
-    egui::Window::new(title)
+    egui::Window::new(crate::i18n::tr(title))
         .id(egui::Id::new(id))
         .order(egui::Order::Foreground)
         .collapsible(false)
@@ -71,7 +73,7 @@ fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, buttons: &[(&s
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 for (i, (bid, label, _)) in buttons.iter().enumerate() {
-                    let r = ui.add(egui::Button::new(*label).min_size(vec2(0.0, 26.0)));
+                    let r = ui.add(egui::Button::new(crate::i18n::tr(label)).min_size(vec2(0.0, 26.0)));
                     register(ui.ctx(), format!("button:{bid}"), r.rect);
                     if r.clicked() {
                         chosen = Some(i);

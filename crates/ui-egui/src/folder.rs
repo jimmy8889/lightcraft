@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(lightcraft_engine::sidecar::parse_sidecar(&xmp, false).unwrap().rating, Some(5));
         assert_eq!(std::fs::read(folder.0.join("IMG_2.png")).unwrap(), original);
         h.request("ui.key", json!({"key": "Z"}), TIMEOUT);
-        assert_eq!(h.app.ui.zoom, Zoom::Percent(100));
+        assert_eq!(h.app.ui.zoom, Zoom::Percent(100.0));
         assert!(h.settle(TIMEOUT));
         screenshot(&mut h, "folder-culling.png");
         h.request("ui.key", json!({"key": "Z", "ctrl": true}), TIMEOUT);
@@ -386,8 +386,9 @@ mod tests {
     #[test]
     fn first_folder_batch_arrives_before_later_files_finish_probing() {
         let folder = Folder::new();
-        for i in 0..12 {
-            folder.photo(&format!("IMG_{i}.png"), i);
+        let total = lightcraft_engine::import::batch_size() + 4;
+        for i in 0..total {
+            folder.photo(&format!("IMG_{i}.png"), (i % 256) as u8);
         }
         let mut h = headless();
         let original_probe = h.app.session.media.file_probe.clone().unwrap();
@@ -396,14 +397,14 @@ mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let gate = std::sync::Mutex::new(gate);
         h.app.session.media.file_probe = Some(std::sync::Arc::new(move |path| {
-            if count.fetch_add(1, Ordering::Relaxed) == crate::import::BATCH {
+            if count.fetch_add(1, Ordering::Relaxed) == lightcraft_engine::import::batch_size() {
                 let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
             }
             original_probe(path)
         }));
         invoke(&mut h, "file.openFolder", json!({"path": folder.0.to_string_lossy()}));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while h.app.session.catalog.len() < crate::import::BATCH && std::time::Instant::now() < deadline {
+        while h.app.session.catalog.len() < lightcraft_engine::import::batch_size() && std::time::Instant::now() < deadline {
             h.step();
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -419,23 +420,23 @@ mod tests {
             invoke(&mut h, "edit.undo", json!({}));
         }
         let _ = release.send(());
-        assert_eq!(first_count, crate::import::BATCH, "first batch must be usable before later probes finish");
+        assert_eq!(first_count, lightcraft_engine::import::batch_size(), "first batch must be usable before later probes finish");
         assert_eq!(
             first_names,
-            (0..crate::import::BATCH).map(|i| format!("IMG_{i}.png")).collect::<Vec<_>>(),
+            (0..lightcraft_engine::import::batch_size()).map(|i| format!("IMG_{i}.png")).collect::<Vec<_>>(),
             "stream batches follow natural filename order"
         );
         assert!(first_active.is_some());
         assert!(still_importing);
         assert!(h.settle(TIMEOUT));
-        assert_eq!(h.app.session.catalog.len(), 12);
+        assert_eq!(h.app.session.catalog.len(), total);
         assert_eq!(discovery_undo, 0, "folder discoveries are not import undo steps");
         assert_eq!(h.app.session.redo.len(), 1, "later discoveries preserve the user's rating redo");
         invoke(&mut h, "edit.redo", json!({}));
         assert_eq!(h.app.session.catalog.photo(first_active.unwrap()).unwrap().rating, 4);
         h.request("ui.key", json!({"key": "Z", "ctrl": true}), TIMEOUT);
         assert_eq!(h.app.session.catalog.photo(first_active.unwrap()).unwrap().rating, 0);
-        assert_eq!(h.app.session.catalog.len(), 12, "rating undo never removes discovered photos");
+        assert_eq!(h.app.session.catalog.len(), total, "rating undo never removes discovered photos");
     }
 
     #[test]
@@ -457,11 +458,11 @@ mod tests {
             "file parent is available in Local"
         );
         invoke(&mut h, "folder.cullMode", json!({"enabled": false}));
-        h.app.ui.zoom = Zoom::Percent(100);
+        h.app.ui.zoom = Zoom::Percent(100.0);
         invoke(&mut h, "folder.refresh", json!({}));
         assert!(h.settle(TIMEOUT));
         assert_eq!(h.app.ui.right, RightPanel::Edit);
-        assert_eq!(h.app.ui.zoom, Zoom::Percent(100));
+        assert_eq!(h.app.ui.zoom, Zoom::Percent(100.0));
         assert_eq!(h.app.session.active(), Some(active));
     }
 
@@ -536,7 +537,7 @@ mod tests {
     fn physical_100_percent_is_independent_of_display_scale() {
         let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         for scale in [1.0, 1.5, 2.0] {
-            let rect = crate::panels::detail::fit_rect(area, 1.5, Zoom::Percent(100), [6000, 4000], scale, (0.5, 0.5));
+            let rect = crate::panels::detail::fit_rect(area, 1.5, Zoom::Percent(100.0), [6000, 4000], scale, (0.5, 0.5));
             assert!((rect.width() * scale - 6000.0).abs() < 0.1);
             assert!((rect.height() * scale - 4000.0).abs() < 0.1);
         }

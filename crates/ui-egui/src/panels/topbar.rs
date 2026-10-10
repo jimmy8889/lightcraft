@@ -8,6 +8,40 @@ use crate::icons::{Icon, paint};
 use crate::theme::Tokens;
 use crate::widgets::{icon_button, register};
 
+/// The bar doubles as the window's title bar: dragging its empty space moves the window and a
+/// double-click zooms or restores it. Registered before the bar's widgets so they win the click.
+fn window_handle(app: &LightcraftApp, ui: &mut egui::Ui, content: Rect, margin_left: f32, margin_right: f32) {
+    use crate::titlebar::{Gesture, WindowState, command_for};
+    let bar = Rect::from_min_max(pos2(content.left() - margin_left, content.top()), pos2(content.right() + margin_right, content.bottom()));
+    register(ui.ctx(), "region:titlebar", bar);
+    let handle = egui::Id::new("titlebar-handle");
+    let resp = ui.interact(bar, handle, Sense::click_and_drag());
+    // a press that began on a button or the search field is theirs: dragging off it must not move the window
+    // (while pressing, egui hovers every widget under the pointer; once the drag starts, only the dragged one)
+    let ctx = ui.ctx().clone();
+    let memo = egui::Id::new("titlebar-press-on-widget");
+    if resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_pressed()) {
+        let hovered = ctx.interaction_snapshot(|s| s.hovered.clone());
+        let on_widget =
+            hovered.iter().any(|id| *id != handle && ctx.read_response(*id).is_some_and(|r| r.sense.senses_click() || r.sense.senses_drag()));
+        ctx.data_mut(|d| d.insert_temp(memo, on_widget));
+    }
+    let on_widget = ctx.data(|d| d.get_temp::<bool>(memo)).unwrap_or(false);
+    let gesture = if resp.double_clicked_by(egui::PointerButton::Primary) {
+        Some(Gesture::DoubleClicked)
+    } else if resp.drag_started_by(egui::PointerButton::Primary) && !on_widget {
+        Some(Gesture::DragStarted)
+    } else {
+        None
+    };
+    if let Some(g) = gesture {
+        let window = WindowState { maximized: ui.input(|i| i.viewport().maximized).unwrap_or(false), fullscreen: app.window_is_fullscreen };
+        if let Some(cmd) = command_for(g, window) {
+            ui.ctx().send_viewport_cmd(cmd);
+        }
+    }
+}
+
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let left = if app.integrated_titlebar { 78 } else { 10 };
@@ -16,6 +50,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin { left, right: 12, top: 0, bottom: 0 }))
         .show(ui, |ui| {
             let full = ui.max_rect();
+            if app.integrated_titlebar {
+                window_handle(app, ui, full, left as f32, 12.0);
+            }
             let mut sw = 640.0f32.min(full.width() - 750.0).max(200.0);
             if !app.native_menu {
                 // leave room for the in-window menus left of the (centred) search field

@@ -122,7 +122,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
         }
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             app.export = None;
-            app.toast(ctx, "Export stopped unexpectedly");
+            app.toast(ctx, crate::i18n::tr("Export stopped unexpectedly"));
         }
     }
 }

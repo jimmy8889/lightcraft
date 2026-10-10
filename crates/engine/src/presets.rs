@@ -83,28 +83,22 @@ pub fn parse_preset_file(name: &str, bytes: &[u8]) -> Result<Vec<Preset>, String
     Ok(out)
 }
 
-/// Expand files/folders (recursively) into preset files (`.lcpreset`, `.xmp`).
+/// Expand files/folders (recursively, bounded: see [`crate::walk`]) into preset files
+/// (`.lcpreset`, `.xmp`).
 pub fn expand_preset_paths(paths: &[String]) -> Vec<String> {
-    fn walk(p: &Path, out: &mut Vec<String>, top: bool) {
-        if p.is_dir() {
-            let Ok(rd) = std::fs::read_dir(p) else { return };
-            let mut v: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-            v.sort();
-            for c in v {
-                if !c.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
-                    walk(&c, out, false);
-                }
-            }
-        } else {
-            let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            if top || ext == LCPRESET_EXT || ["xmp", "lrtemplate", "zip", "lmp", "mplumpack"].contains(&ext.as_str()) {
-                out.push(p.to_string_lossy().to_string());
-            }
-        }
-    }
+    let preset_file = |p: &Path| {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        ext == LCPRESET_EXT || ["xmp", "lrtemplate", "zip", "lmp", "mplumpack"].contains(&ext.as_str())
+    };
     let mut out = Vec::new();
     for p in paths {
-        walk(Path::new(p), &mut out, true);
+        let path = Path::new(p);
+        if path.is_dir() {
+            let w = crate::walk::files_in(path, None, crate::walk::Limits::default(), preset_file);
+            out.extend(w.files.into_iter().map(|f| f.to_string_lossy().to_string()));
+        } else {
+            out.push(p.clone());
+        }
     }
     out
 }
@@ -446,6 +440,14 @@ pub fn profile(id: &str) -> Option<&'static ProfileInfo> {
 pub const RECENT_PROFILES: usize = 5;
 
 impl Session {
+    /// A profile by id, looking up built-in profiles first and imported LUT profiles second.
+    pub fn profile_info(&self, id: &str) -> Option<(&str, &str)> {
+        if let Some(p) = profile(id) {
+            return Some((p.name, p.group));
+        }
+        self.lut_profiles.iter().find(|p| p.id == id).map(|p| (p.name.as_str(), p.group.as_str()))
+    }
+
     /// Remember `id` as the most recently applied profile.
     pub fn note_profile_used(&mut self, id: &str) {
         self.profile_recent.retain(|p| p != id);

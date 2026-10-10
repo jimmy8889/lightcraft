@@ -15,17 +15,22 @@
 //! - `SensorInfo` (maker note `0x00e0`): sensor width/height and the left/top/right/bottom borders of the image
 //!   area; the masked columns left of it give the black level.
 //! - `ColorBalance` (maker note `0x4001`): as-shot `RGGB` levels at a model-dependent offset; we probe the known
-//!   offsets and accept the first plausible quadruple.
-//! - sRAW / mRAW (YCbCr, subsampled) are not supported yet.
+//!   offsets and accept the first plausible quadruple. The array is 16-bit words; some models store it as UNDEFINED
+//!   bytes (ColorData versions -3 and -4), which are paired up in the maker note's byte order first.
+//! - sRAW / mRAW (raw IFD tag `0xc6c5` = 4) hold subsampled YCbCr instead of a mosaic: see [`sraw`].
+
+mod sraw;
 
 use super::{black_from_columns, white_from_data};
 use crate::{BlackLevel, Cfa, ColorData, Mode, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result, ljpeg};
 use lightcraft_geom::Orientation;
 use lightcraft_tiff::image::chunk_bytes;
-use lightcraft_tiff::{Ifd, Tiff, makernote, tags as t};
+use lightcraft_tiff::{ByteOrder, Ifd, Tiff, Value, makernote, tags as t};
 
 const CR2_SLICE: u16 = 0xc640;
 const SRAW_TYPE: u16 = 0xc6c5;
+/// `SRAW_TYPE` value of the YCbCr frames of sRAW / mRAW (IFD2's preview image carries 3).
+const SRAW_YCC: u32 = 4;
 const CR2_CFA_PATTERN: u16 = 0xc5e0;
 const SENSOR_INFO: u16 = 0x00e0;
 const COLOR_BALANCE: u16 = 0x4001;
@@ -44,6 +49,17 @@ fn cfa_from_tag(v: Option<u64>) -> Option<Cfa> {
         _ => return None,
     };
     Some(Cfa::bayer_static(name))
+}
+
+/// The 16-bit words of a maker-note array. Canon writes `ColorData` as SHORT in most models, but as UNDEFINED
+/// bytes (count = byte length, e.g. 5120) in the PowerShot / EOS M models with ColorData versions -3 and -4;
+/// those bytes are the same 16-bit words in the maker note's byte order, so they are paired up, not read one by
+/// one. Other types are returned value by value.
+fn words(v: &Value, order: ByteOrder) -> Vec<u64> {
+    match v {
+        Value::Byte(b) | Value::Undefined(b) => b.as_chunks::<2>().0.iter().map(|c| u64::from(order.u16(*c))).collect(),
+        _ => v.to_u64_vec(),
+    }
 }
 
 /// As-shot WB multipliers (R, G, B; G = 1) from the ColorBalance array.
@@ -67,8 +83,10 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     let tiff = Tiff::parse(bytes)?;
     let ifd0 = &tiff.ifds[0];
     let raw = raw_ifd(&tiff).ok_or_else(|| RawError::Corrupt("CR2 without raw IFD".into()))?;
-    if raw.u32(SRAW_TYPE).is_some_and(|v| v != 1) {
-        return Err(RawError::Unsupported("Canon sRAW/mRAW".into()));
+    match raw.u32(SRAW_TYPE) {
+        Some(SRAW_YCC) => return sraw::decode(bytes, &tiff, raw, mode),
+        Some(v) if v != 1 => return Err(RawError::Unsupported(format!("Canon raw type {v}"))),
+        _ => {}
     }
     let off = raw.u64(t::STRIP_OFFSETS).ok_or(RawError::Tiff(lightcraft_tiff::TiffError::MissingTag(t::STRIP_OFFSETS)))?;
     let len = raw.u64(t::STRIP_BYTE_COUNTS).unwrap_or(bytes.len() as u64 - off.min(bytes.len() as u64));
@@ -134,7 +152,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
             active = Rect::new(l, tp, r - l + 1, b - tp + 1);
         }
     }
-    let wb = mn.as_ref().and_then(|m| m.ifd.u64s(COLOR_BALANCE)).and_then(|v| wb_from_color_balance(&v));
+    let wb = mn.as_ref().and_then(|m| m.ifd.value(COLOR_BALANCE).map(|v| words(v, m.order))).and_then(|v| wb_from_color_balance(&v));
     let cfa = cfa_from_tag(raw.u64(CR2_CFA_PATTERN)).unwrap_or_else(|| Cfa::bayer_static("RGGB"));
     let black = if active.x >= 8 {
         black_from_columns(&data, width, 2..active.x - 2, active.y..active.y + active.height, active)
@@ -175,6 +193,11 @@ pub(crate) mod tests {
 
     /// Build a synthetic CR2: IFD0..IFD2 placeholders + IFD3 holding a sliced 2-component LJ92 frame.
     pub(crate) fn synthetic_cr2(w: usize, h: usize, slices: Option<[u16; 3]>) -> (Vec<u8>, Vec<u16>) {
+        synthetic_cr2_note(w, h, slices, None)
+    }
+
+    /// Like [`synthetic_cr2`], with `note` as the Exif maker note (bytes as stored).
+    fn synthetic_cr2_note(w: usize, h: usize, slices: Option<[u16; 3]>, note: Option<Vec<u8>>) -> (Vec<u8>, Vec<u16>) {
         let img: Vec<u16> = (0..w * h).map(|i| 1024 + ((i * 7919) % 12000) as u16).collect();
         let widths: Vec<usize> = match slices {
             Some([n, sw, last]) => {
@@ -200,6 +223,9 @@ pub(crate) mod tests {
         // maker note: SensorInfo + ColorBalance, plain IFD with offsets relative to the TIFF header
         let mut exif = IfdBuilder::new();
         exif.set(t::ISO_SPEED, Value::Short(vec![400]));
+        if let Some(n) = note {
+            exif.set(t::MAKER_NOTE, Value::Undefined(n));
+        }
         ifd0.set_child(t::EXIF_IFD, exif);
         let mut ifd3 = IfdBuilder::new();
         ifd3.set(t::COMPRESSION, Value::Short(vec![6]));
@@ -250,5 +276,63 @@ pub(crate) mod tests {
         let wb = wb_from_color_balance(&v).unwrap();
         assert!((wb[0] - 2000.0 / 1025.0).abs() < 1e-4 && (wb[2] - 1500.0 / 1025.0).abs() < 1e-4);
         assert!(wb_from_color_balance(&[0; 10]).is_none());
+    }
+
+    #[test]
+    fn wb_from_undefined_bytes() {
+        // hand-coded: ColorData of an S110-like file, UNDEFINED bytes, little-endian words; word 71.. = 1988 745 745 1641
+        let mut b = vec![0u8; 2 * 120];
+        b[0..2].copy_from_slice(&[0xfd, 0xff]); // version -3
+        b[142..150].copy_from_slice(&[0xc4, 0x07, 0xe9, 0x02, 0xe9, 0x02, 0x69, 0x06]);
+        let le = words(&Value::Undefined(b.clone()), ByteOrder::Little);
+        assert_eq!(&le[71..75], &[1988, 745, 745, 1641]);
+        let wb = wb_from_color_balance(&le).unwrap();
+        assert!((wb[0] - 1988.0 / 745.0).abs() < 1e-5 && wb[1] == 1.0 && (wb[2] - 1641.0 / 745.0).abs() < 1e-5);
+        // read as single bytes (the old behaviour) nothing is plausible
+        assert!(wb_from_color_balance(&b.iter().map(|&x| u64::from(x)).collect::<Vec<_>>()).is_none());
+        // big-endian note: same words, bytes swapped
+        let mut be = b.clone();
+        be.as_chunks_mut::<2>().0.iter_mut().for_each(|c| c.swap(0, 1));
+        assert_eq!(words(&Value::Undefined(be), ByteOrder::Big), le);
+        // SHORT values pass through, an odd trailing byte is ignored
+        assert_eq!(words(&Value::Short(vec![1, 2, 3]), ByteOrder::Little), vec![1, 2, 3]);
+        assert_eq!(words(&Value::Undefined(vec![1, 0, 2]), ByteOrder::Little), vec![1]);
+    }
+
+    /// A maker note holding only `ColorData` (`0x4001`) as `ty` (3 = SHORT, 7 = UNDEFINED) with `n` values, a plain
+    /// IFD whose value offset is relative to the TIFF header (patched once the note's position is known).
+    fn note_with_color_data(ty: u16, data: &[u8]) -> Vec<u8> {
+        let count = if ty == 3 { data.len() / 2 } else { data.len() } as u32;
+        let mut note = Vec::new();
+        note.extend_from_slice(&1u16.to_le_bytes());
+        note.extend_from_slice(&COLOR_BALANCE.to_le_bytes());
+        note.extend_from_slice(&ty.to_le_bytes());
+        note.extend_from_slice(&count.to_le_bytes());
+        note.extend_from_slice(&0u32.to_le_bytes()); // value offset, patched below
+        note.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+        note.extend_from_slice(data);
+        note
+    }
+
+    fn decode_with_color_data(ty: u16, data: &[u8]) -> RawImage {
+        let (mut bytes, _) = synthetic_cr2_note(64, 10, None, Some(note_with_color_data(ty, data)));
+        let tiff = Tiff::parse(&bytes).unwrap();
+        let e = tiff.exif().unwrap().get(t::MAKER_NOTE).unwrap();
+        let off = e.offset as usize;
+        bytes[off + 10..off + 14].copy_from_slice(&(e.offset as u32 + 18).to_le_bytes());
+        crate::decode(&bytes).unwrap()
+    }
+
+    /// `ColorData` stored as UNDEFINED bytes (versions -3 / -4: PowerShot, EOS M) gives the as-shot WB from word 71,
+    /// exactly as the same words stored as SHORT do.
+    #[test]
+    fn color_data_stored_as_bytes() {
+        let mut bytes = vec![0u8; 2 * 120];
+        bytes[0..2].copy_from_slice(&[0xfd, 0xff]); // version -3
+        bytes[142..150].copy_from_slice(&[0xc4, 0x07, 0xe9, 0x02, 0xe9, 0x02, 0x69, 0x06]); // 1988 745 745 1641
+        for ty in [7, 3] {
+            let wb = decode_with_color_data(ty, &bytes).wb_multipliers.unwrap_or_else(|| panic!("type {ty}: no WB"));
+            assert!((wb[0] - 1988.0 / 745.0).abs() < 1e-5 && wb[1] == 1.0 && (wb[2] - 1641.0 / 745.0).abs() < 1e-5, "type {ty}: {wb:?}");
+        }
     }
 }

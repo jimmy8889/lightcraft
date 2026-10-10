@@ -295,6 +295,7 @@ impl Op {
             Op::RemoveAlbum { .. }
             | Op::RenameAlbum { .. }
             | Op::MoveAlbum { .. }
+            | Op::SetAlbumOrder { .. }
             | Op::SetAlbumRules { .. }
             | Op::RemoveStack { .. }
             | Op::SetLabelName { .. }

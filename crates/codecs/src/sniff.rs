@@ -66,7 +66,8 @@ impl Format {
     pub fn can_decode(self) -> bool {
         match self {
             Format::Jxl => cfg!(feature = "jxl"),
-            Format::Avif | Format::Heif | Format::RawTiffLike | Format::RawOther => false,
+            Format::Heif => cfg!(feature = "heif"),
+            Format::Avif | Format::RawTiffLike | Format::RawOther => false,
             _ => true,
         }
     }

@@ -53,6 +53,9 @@ pub struct WireJob {
     /// The request's diagnostic overlay (`Overlay::to_parts`).
     #[serde(default)]
     pub overlay: (u8, f64),
+    /// Render only this window `[x, y, w, h]` of the output `max_w × max_h` describes (a zoomed view).
+    #[serde(default)]
+    pub window: Option<[usize; 4]>,
 }
 
 impl WireJob {
@@ -83,6 +86,7 @@ impl WireJob {
             thumb_cached,
             stages: job.stages.is_some().then(|| view.to_string()),
             overlay: job.request.overlay.to_parts(),
+            window: job.request.window.map(|w| [w.x, w.y, w.w, w.h]),
         }
     }
 
@@ -108,6 +112,7 @@ impl WireJob {
             space: lightcraft_engine::pipeline::OutputSpace::Srgb,
             depth: lightcraft_engine::pipeline::OutputDepth::U8,
             proof: None,
+            window: self.window.map(|[x, y, w, h]| lightcraft_engine::pipeline::PixelWindow { x, y, w, h }),
         }
     }
 
@@ -348,6 +353,40 @@ mod tests {
         assert!(reopened.contains(&new));
     }
 
+    // Issue #323: a worker given a zoomed view's window renders that window, not the whole frame
+    #[test]
+    fn a_window_job_crosses_the_wire_and_renders_the_same_window() {
+        use lightcraft_engine::pipeline::PixelWindow;
+        let mut s = Session::with_demo();
+        let id = s.visible_cloned()[0];
+        let win = PixelWindow { x: 300, y: 200, w: 160, h: 120 };
+        let job = s.region_job(id, 1920, 1280, win, true).unwrap();
+        let wire = WireJob::from_job(&job, false, "Region");
+        let wire: WireJob = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        assert_eq!(wire.request().window, Some(win));
+        let mut core = WorkerCore::default();
+        let a = core.render(&wire, None).unwrap();
+        let b = job.run().rendered.unwrap();
+        assert_eq!((a.image.width, a.image.height), (160, 120));
+        assert_eq!((b.image.width, b.image.height), (160, 120));
+        // the worker renders on the CPU; the engine job uses a GPU when the machine has one, which
+        // stays within docs/gpu-pipeline.md's bound (≤ 3 LSB per channel) rather than bit-exact
+        let max = a.image.data.iter().zip(&b.image.data).flat_map(|(p, q)| (0..3).map(move |c| p[c].abs_diff(q[c]))).max();
+        assert!(max.is_some_and(|m| m <= 3), "max channel difference {max:?}");
+    }
+
+    // a job from before windows existed has none
+    #[test]
+    fn a_job_without_a_window_field_has_no_window() {
+        let mut s = Session::with_demo();
+        let id = s.visible_cloned()[0];
+        let wire = WireJob::from_job(&s.thumb_job(id, 128).unwrap(), false, "Thumb");
+        let mut v = serde_json::to_value(&wire).unwrap();
+        v.as_object_mut().unwrap().remove("window");
+        let old: WireJob = serde_json::from_value(v).unwrap();
+        assert_eq!(old.request().window, None);
+    }
+
     #[test]
     fn wire_job_renders_like_the_engine() {
         let mut s = Session::with_demo();
@@ -393,6 +432,7 @@ mod tests {
             thumb_cached: false,
             stages: Some("Main".into()),
             overlay: (0, 0.0),
+            window: None,
         };
         let mut core = WorkerCore::default();
         assert_eq!(core.needs_original(&job).as_deref(), Some(hash.as_str()));

@@ -51,6 +51,14 @@ pub fn mirrors(env: Option<&str>, file: Option<&Path>) -> Vec<String> {
     lightcraft_fetch::mirrors(env, file, DEFAULT_MIRRORS)
 }
 
+/// Download settings for SAM 3: the defaults, plus [`TOKEN_ENV`] for a gated mirror.
+pub fn options() -> Options {
+    Options { token_env: Some(TOKEN_ENV), ..Options::default() }
+}
+
+/// Environment variable with a bearer token for the SAM 3 mirror's own host (a gated Hugging Face repository).
+pub const TOKEN_ENV: &str = "LIGHTCRAFT_SAM3_TOKEN";
+
 /// What to tell the user when there is no mirror for the SAM 3 model.
 pub fn no_mirrors_message() -> String {
     format!(

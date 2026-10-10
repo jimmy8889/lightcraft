@@ -2,9 +2,10 @@
 
 The interface ships in the language it is written in (English) plus every language in the table in
 `crates/ui-egui/src/i18n.rs`. Today that is English, Simplified Chinese (`zh-hans`), Traditional
-Chinese (`zh-hant`, Taiwan), Japanese (`ja`) and Brazilian Portuguese (`pt-br`). This file is the reference for **adding or maintaining a language**; the per-language notes
+Chinese (`zh-hant`, Taiwan), Japanese (`ja`), Brazilian Portuguese (`pt-br`), Spanish (`es`), German (`de`) and Russian (`ru`). This file is the reference for **adding or maintaining a language**; the per-language notes
 are in [`localization-zh-hans.md`](localization-zh-hans.md), [`localization-zh-hant.md`](localization-zh-hant.md),
-[`localization-ja.md`](localization-ja.md) and [`localization-pt-br.md`](localization-pt-br.md).
+[`localization-ja.md`](localization-ja.md), [`localization-pt-br.md`](localization-pt-br.md), [`localization-es.md`](localization-es.md),
+[`localization-de.md`](localization-de.md) and [`localization-ru.md`](localization-ru.md).
 
 ## Adding a language
 
@@ -13,7 +14,8 @@ are in [`localization-zh-hans.md`](localization-zh-hans.md), [`localization-zh-h
    English source strings and must stay byte-for-byte identical. The plain catalog may grow at its
    own pace: a message it lacks shows in English, and `cargo test -p lightcraft-ui-egui i18n::tests
    -- --nocapture` lists the gaps (it fails on an empty entry or mismatched placeholders). The
-   formats catalog must carry every message (the build fails otherwise), including the date
+   formats catalog must carry every message (the build fails otherwise; a message copied in English,
+   value equal to its key, is an untranslated placeholder until someone translates it), including the date
    patterns (`{year}`, `{month} {year}`, `{weekday}, {day} {month} {year}`…) that date headings and
    capture times use in every language but English; weekday names go in the plain catalog.
 2. **Add the table entry** in `crates/ui-egui/src/i18n.rs`:
@@ -25,6 +27,8 @@ are in [`localization-zh-hans.md`](localization-zh-hans.md), [`localization-zh-h
        ZhHant, "zh-hant", "繁體中文（台灣）", "Hant", include_str!("../locales/zh-hant.json");
        Ja, "ja", "日本語", "Jpan", include_str!("../locales/ja.json");
        PtBr, "pt-br", "Português (Brasil)", "Latn", include_str!("../locales/pt-br.json");
+       De, "de", "Deutsch", "Latn", include_str!("../locales/de.json");
+       Ru, "ru", "Русский", "Cyrl", include_str!("../locales/ru.json");
    }
    ```
 
@@ -85,3 +89,11 @@ The settings file stores the BCP-47 code, never the Rust variant name, so a lang
 in code without invalidating anyone's saved preference. `LIGHTCRAFT_LANGUAGE` accepts what a system
 locale looks like (`zh_Hans`, `zh-CN`, `en_US`, `ja_JP.UTF-8`) and falls back to the base language
 when a region has no dedicated entry.
+
+## Release notes
+
+Help ▸ What's New shows `docs/whats-new.md`, and each of its lines (a heading, or one wrapped line of a
+bullet, without the `- ` or `### `) is looked up like any message, so a catalog can translate the notes
+line by line (German does). A line that is re-wrapped or edited no longer matches its translation and
+shows in English until the catalog is updated; untranslated lines are reported by
+`display_label_gaps_are_reported`, never failed.
