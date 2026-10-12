@@ -276,7 +276,7 @@ mod tests {
         session.execute("photo.rate", &json!({"rating": 3})).unwrap();
         let packet = std::fs::read_to_string(&fixture.xmp).unwrap();
         assert!(packet.contains("foreign:marker=\"keep-me-byte-for-byte\""));
-        assert_eq!(crate::sidecar::parse_sidecar(&packet, false).unwrap().rating, Some(3));
+        assert_eq!(crate::sidecar::parse_sidecar(&packet, crate::crs::Target::Rendered).unwrap().rating, Some(3));
         assert!(session.sidecar_errors().is_empty());
     }
 

@@ -88,9 +88,13 @@ fn start(app: &mut LightcraftApp, params: &Value) -> Result<Value, String> {
     let progress = Arc::new(Mutex::new((0, total)));
     let worker_progress = progress.clone();
     let worker_cancel = cancel.clone();
+    let activity = app.session.activity.start("rawProcessing", LABEL, lightcraft_engine::activity::Cancel::Flag(cancel.clone()));
+    activity.progress(0, total as u64);
+    let worker_activity = activity;
     crate::tasks::spawn(
         app,
         LABEL,
+        None,
         move || {
             let mut results = Vec::<Result<ProcessedDngResult, String>>::new();
             for job in jobs {
@@ -100,6 +104,7 @@ fn start(app: &mut LightcraftApp, params: &Value) -> Result<Value, String> {
                 results.push(job.run());
                 if let Ok(mut counts) = worker_progress.lock() {
                     counts.0 += 1;
+                    worker_activity.progress(counts.0 as u64, total as u64);
                 }
             }
             (results, worker_cancel.load(Ordering::Relaxed))
@@ -377,7 +382,16 @@ mod tests {
             let response = app.run(command, json!({})).unwrap();
             assert_eq!(response["running"], true, "{command} must return background status");
             assert!(app.tasks.is_running(LABEL));
-            app.run("folder.cancelProcessedDng", json!({})).unwrap();
+            assert!(!crate::panels::notices::may_close(&mut app), "quitting must ask before cutting off a cleaned-DNG job");
+            assert!(matches!(app.quit_prompt, Some(crate::QuitPrompt::Tasks(_))));
+            let activity = app.session.activity.list();
+            assert_eq!(activity.len(), 1);
+            if i == 0 {
+                app.session.activity.cancel(activity[0].id).unwrap();
+            } else {
+                app.run("folder.cancelProcessedDng", json!({})).unwrap();
+            }
+            assert_eq!(status(&app)["running"]["stopping"], true);
             let _ = release.send(());
             let ctx = egui::Context::default();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -386,6 +400,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert!(!app.tasks.is_running(LABEL));
+            assert!(app.session.activity.list().is_empty(), "finished jobs leave no activity row");
             assert_eq!(app.processed_raw.last.as_ref().unwrap()["cancelled"], true);
             assert_eq!(std::fs::read(&source).unwrap(), b"mock source");
             assert!(!root.join("Processed/source-Clean.dng").exists());

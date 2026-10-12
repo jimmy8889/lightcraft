@@ -368,7 +368,7 @@ mod tests {
         h.request("ui.key", json!({"key": "5"}), TIMEOUT);
         assert_eq!(h.app.session.catalog.photo(visible[1]).unwrap().rating, 5);
         let xmp = std::fs::read_to_string(folder.0.join("IMG_2.xmp")).unwrap();
-        assert_eq!(lightcraft_engine::sidecar::parse_sidecar(&xmp, false).unwrap().rating, Some(5));
+        assert_eq!(lightcraft_engine::sidecar::parse_sidecar(&xmp, lightcraft_engine::crs::Target::Rendered).unwrap().rating, Some(5));
         assert_eq!(std::fs::read(folder.0.join("IMG_2.png")).unwrap(), original);
         h.request("ui.key", json!({"key": "Z"}), TIMEOUT);
         assert_eq!(h.app.ui.zoom, Zoom::Percent(100.0));

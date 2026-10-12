@@ -10,8 +10,8 @@ base. Do not replace upstream source trees with vendored copies or rewrite histo
 From a clean custom checkout with Python 3.11 or newer:
 
 ```sh
-python3 scripts/upstream-update.py --ref v0.5.0 --plan
-python3 scripts/upstream-update.py --ref v0.5.0
+python3 scripts/upstream-update.py --ref v0.6.0 --plan
+python3 scripts/upstream-update.py --ref v0.6.0
 ```
 
 Use an actual newer release tag when one is available, or `main` to test the
@@ -69,3 +69,9 @@ Keep feature commits small, isolate custom modules, and preserve existing
 command and file formats. Reusable fixes may be contributed upstream separately;
 personal workflow defaults can remain in the custom fork. This reduces future
 merge conflicts without promising that arbitrary future changes merge cleanly.
+
+ArtCraft Launcher tracks stock upstream releases. Keep its automatic updates off
+for a desktop that uses this custom LightCraft build: installing the stock
+LightCraft release through the launcher would replace the custom executable.
+Update this fork through a reviewed candidate and install a build of the validated
+custom commit, while using the launcher to check the other Craft applications.

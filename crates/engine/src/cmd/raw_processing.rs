@@ -60,7 +60,7 @@ impl SourceInterpretation {
 }
 
 /// Obtain exactly the same interpretation for live development and cleaned-DNG readback.
-pub(crate) fn source_interpretation(raw: &RawImage, bytes: &[u8]) -> SourceInterpretation {
+pub(crate) fn source_interpretation(raw: &mut RawImage, bytes: &[u8]) -> SourceInterpretation {
     if raw.format == lightcraft_raw::RawFormat::Dng
         && let Some(packet) = lightcraft_raw::embedded_xmp(bytes)
         && packet.len() <= 16 << 20
@@ -72,14 +72,9 @@ pub(crate) fn source_interpretation(raw: &RawImage, bytes: &[u8]) -> SourceInter
     {
         return interpretation;
     }
-    let xy = lightcraft_raw::color::as_shot_white_xy(raw);
-    let transform = lightcraft_raw::color::camera_transform(raw, xy);
-    SourceInterpretation {
-        version: 1,
-        look: crate::camera_preview::fit_preview(raw, bytes, &transform),
-        relative_wb: crate::camera_preview::file_local_look(raw.format) && transform.matrix_is_fallback,
-        transform,
-    }
+    let own_matrix = lightcraft_raw::color::has_matrix(&raw.color);
+    let (_, transform, look) = crate::camera_preview::starting_colour(raw, bytes);
+    SourceInterpretation { version: 1, look, relative_wb: crate::camera_preview::file_local_look(raw.format) && !own_matrix, transform }
 }
 
 /// A processed DNG re-export retains its original source interpretation and provenance.
@@ -403,7 +398,7 @@ impl ProcessedDngJob {
         crate::files::preflight_raw_processing(&bytes)?;
         let embedded_packet = lightcraft_raw::embedded_xmp(&bytes);
         let mut raw = lightcraft_raw::decode(&bytes).map_err(|e| e.to_string())?;
-        let interpretation = source_interpretation(&raw, &bytes);
+        let interpretation = source_interpretation(&mut raw, &bytes);
         drop(bytes);
         let (report, ai_details): (Report, Option<Value>) = match &self.processor {
             Processor::Native => (lightcraft_raw::denoise::process(&mut raw, self.options, &self.cancel).map_err(|e| e.to_string())?, None),
@@ -652,7 +647,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("Shot.dng")).unwrap(), bytes);
         assert!(!dir.join("Processed").exists());
         let packet = crate::sidecar::sidecar_packet(s.catalog.photo(id).unwrap(), &s.catalog);
-        let sc = crate::sidecar::parse_sidecar(&packet, true).unwrap();
+        let sc = crate::sidecar::parse_sidecar(&packet, crate::crs::Target::RawAbsolute).unwrap();
         let Some(crate::sidecar::DevelopPatch::Full(settings)) = sc.develop else { panic!("settings missing") };
         assert_eq!(settings.detail.raw_denoise, 70.0);
         s.execute("edit.undo", &json!({})).unwrap();
@@ -711,7 +706,7 @@ mod tests {
         assert_eq!(cleaned.white, original.white);
         assert_eq!(std::fs::read(dir.join("Shot.dng")).unwrap(), bytes);
         let packet = lightcraft_raw::embedded_xmp(&output).unwrap();
-        let sc = crate::sidecar::parse_sidecar(&packet, true).unwrap();
+        let sc = crate::sidecar::parse_sidecar(&packet, crate::crs::Target::RawAbsolute).unwrap();
         let Some(crate::sidecar::DevelopPatch::Full(settings)) = sc.develop else { panic!("settings missing") };
         assert_eq!(settings.detail.raw_denoise, 0.0, "cannot double process on reimport");
         assert!(prepare_processed_dng(&s, id, None).err().unwrap().contains("already exists"));
@@ -741,14 +736,14 @@ mod tests {
     #[test]
     fn invalid_private_interpretation_is_ignored() {
         let (s, id, dir, bytes) = setup("malformed-look");
-        let raw = lightcraft_raw::decode(&bytes).unwrap();
-        let mut interpretation = source_interpretation(&raw, &bytes);
+        let mut raw = lightcraft_raw::decode(&bytes).unwrap();
+        let mut interpretation = source_interpretation(&mut raw, &bytes);
         interpretation.transform.wb[0] = -1.0;
         assert!(!interpretation.valid());
         let record = serde_json::to_string(&interpretation).unwrap();
         let packet = lightcraft_meta::write_xmp_lc(&raw.metadata, &[("rawSourceInterpretation", &record)]);
         let encoded = lightcraft_raw::write_dng(&raw, &lightcraft_raw::DngWriteOptions { xmp: Some(packet), ..Default::default() }).unwrap();
-        let back = source_interpretation(&raw, &encoded);
+        let back = source_interpretation(&mut raw, &encoded);
         assert!(back.valid());
         assert_eq!(s.catalog.photo(id).unwrap().develop.detail.raw_denoise, 0.0);
         std::fs::remove_dir_all(dir).unwrap();
@@ -801,7 +796,7 @@ mod tests {
         assert_eq!(prepared.options.strength, 85.0);
         let result = prepared.run().unwrap();
         let packet = lightcraft_raw::embedded_xmp(&std::fs::read(result.path).unwrap()).unwrap();
-        let sc = crate::sidecar::parse_sidecar(&packet, true).unwrap();
+        let sc = crate::sidecar::parse_sidecar(&packet, crate::crs::Target::RawAbsolute).unwrap();
         let Some(crate::sidecar::DevelopPatch::Full(d)) = sc.develop else { panic!("settings missing") };
         assert_eq!(d.detail.raw_denoise, 0.0);
         assert_eq!(d.light.exposure, 0.7);
@@ -813,8 +808,8 @@ mod tests {
     #[test]
     fn malformed_private_tone_is_rejected_during_deserialization() {
         let (s, id, dir, bytes) = setup("invalid-tone");
-        let raw = lightcraft_raw::decode(&bytes).unwrap();
-        let mut record = source_interpretation(&raw, &bytes);
+        let mut raw = lightcraft_raw::decode(&bytes).unwrap();
+        let mut record = source_interpretation(&mut raw, &bytes);
         record.look = Some(crate::camera_preview::CameraLook {
             matrix: lightcraft_color::Mat3::IDENTITY,
             tone: lightcraft_pipeline::tone::CameraTone::new(std::array::from_fn(|i| [0.01 * (i + 1) as f32, 0.01 * (i + 1) as f32])).unwrap(),
