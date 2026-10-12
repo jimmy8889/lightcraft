@@ -454,6 +454,7 @@ fn overlapping_pending_transactions_are_refused_before_any_move() {
 
 #[cfg(windows)]
 #[test]
+#[allow(clippy::permissions_set_readonly_false)] // Windows-only: clear a disposable fixture's read-only attribute.
 fn windows_read_only_original_is_refused_before_link_without_changing_attributes() {
     let f = Fixture::new();
     f.write("A.ARW", b"raw");
